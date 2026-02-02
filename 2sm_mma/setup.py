@@ -33,8 +33,8 @@ nvcc_flags = [
     "-lineinfo",
     # SM100 架构
     "-gencode=arch=compute_100a,code=sm_100a",
-    # 并行编译线程数
-    "--threads", os.getenv("NVCC_THREADS", "32"),
+    # 并行编译线程数 (max_jobs=192)
+    "--threads", os.getenv("NVCC_THREADS", "192"),
 ]
 
 # C++ 编译参数

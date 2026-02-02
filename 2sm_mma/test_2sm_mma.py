@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Test script for utcmma_ss (SM100 2x1SM SS MMA)
-Tests the CUDA kernel against PyTorch reference implementation.
+Tests the CUDA kernel matrix multiplication against PyTorch reference implementation.
 """
 
 import torch
@@ -9,121 +9,83 @@ import test_2sm_mma_cuda  # 编译后的模块
 
 
 def test_utcmma_ss():
-    """Test utcmma_ss precision against PyTorch matmul"""
+    """Test utcmma_ss matrix multiplication precision"""
     print("=" * 60)
-    print("Testing utcmma_ss (SM100 2x1SM SS MMA)")
+    print("Testing utcmma_ss Matrix Multiplication (SM100 2x1SM SS)")
     print("=" * 60)
     
     # 矩阵规格
-    M, N, K = 128, 128, 256
-    print(f"Q shape: [{M}, {K}]")
-    print(f"K shape: [{N}, {K}]")
-    print(f"P shape: [{M}, {N}] = Q @ K.T")
+    M, N, K_DIM = 128, 128, 256
+    print(f"Q shape: [{M}, {K_DIM}]")
+    print(f"K shape: [{N}, {K_DIM}]")
+    print(f"Expected P shape: [{M}, {N}] = Q @ K^T")
     print()
     
     # 生成输入数据
     torch.manual_seed(42)
-    Q = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
-    K_mat = torch.randn(N, K, dtype=torch.bfloat16, device='cuda')
+    Q = torch.randn(M, K_DIM, dtype=torch.bfloat16, device='cuda')
+    K_mat = torch.randn(N, K_DIM, dtype=torch.bfloat16, device='cuda')
     
     print(f"Q dtype: {Q.dtype}, device: {Q.device}")
     print(f"K dtype: {K_mat.dtype}, device: {K_mat.device}")
     print()
     
-    # CUDA kernel 计算（带调试输出）
-    print("Running CUDA kernel...")
-    P_cuda, Q_out, K_out = test_2sm_mma_cuda.utcmma_ss_debug(Q, K_mat)
-    torch.cuda.synchronize()
-    print(f"P_cuda shape: {P_cuda.shape}, dtype: {P_cuda.dtype}")
-    print(f"Q_out shape: {Q_out.shape}, dtype: {Q_out.dtype}")
-    print(f"K_out shape: {K_out.shape}, dtype: {K_out.dtype}")
-    
-    # PyTorch 参考计算
-    print("Running PyTorch reference...")
-    P_ref = torch.matmul(Q.float(), K_mat.float().T)
+    # PyTorch 参考实现: P = Q @ K^T
+    print("Computing reference with PyTorch...")
+    P_ref = torch.matmul(Q.float(), K_mat.transpose(-2, -1).float())
     print(f"P_ref shape: {P_ref.shape}, dtype: {P_ref.dtype}")
     print()
     
-    # 精度校验：Q_out 和 K_out 应该与输入 Q 和 K 匹配
-    print("=" * 60)
-    print("SMEM Debug Output Validation:")
-    print("=" * 60)
-    Q_diff = (Q_out.float() - Q.float()).abs()
-    K_diff = (K_out.float() - K_mat.float()).abs()
-    Q_max_diff = Q_diff.max().item()
-    Q_mean_diff = Q_diff.mean().item()
-    K_max_diff = K_diff.max().item()
-    K_mean_diff = K_diff.mean().item()
-    
-    print(f"Q_out vs Q:")
-    print(f"  Max absolute diff:  {Q_max_diff:.6e}")
-    print(f"  Mean absolute diff: {Q_mean_diff:.6e}")
-    print(f"K_out vs K:")
-    print(f"  Max absolute diff:  {K_max_diff:.6e}")
-    print(f"  Mean absolute diff: {K_mean_diff:.6e}")
+    # CUDA kernel 计算
+    print("Running CUDA kernel...")
+    P_cuda = test_2sm_mma_cuda.utcmma_ss_debug(Q, K_mat)
+    torch.cuda.synchronize()
+    print(f"P_cuda shape: {P_cuda.shape}, dtype: {P_cuda.dtype}")
     print()
+
+    before_64_col = (P_cuda[:, :64] - P_ref[:, :64]).abs().max().item()
+    after_64_col = (P_cuda[:, 64:] - P_ref[:, 64:]).abs().max().item()
+    print(f"before_64_col: {before_64_col}, after_64_col: {after_64_col}")
     
-    # 打印部分 Q_out 和 Q 用于调试
-    print("Sample Q_out vs Q (first 5x5 block):")
-    print("Q_out:")
-    print(Q_out[:5, :5])
-    print("Q (original):")
-    print(Q[:5, :5])
-    print()
-    
-    # 打印部分 K_out 和 K 用于调试
-    print("Sample K_out vs K (first 5x5 block):")
-    print("K_out:")
-    print(K_out[:5, :5])
-    print("K (original):")
-    print(K_mat[:5, :5])
-    print()
-    
-    # 精度对比
-    diff = (P_cuda - P_ref).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    
-    # 相对误差
-    rel_diff = diff / (P_ref.abs() + 1e-6)
-    max_rel_diff = rel_diff.max().item()
-    mean_rel_diff = rel_diff.mean().item()
-    
+    # 精度校验：比较 CUDA 结果和 PyTorch 结果
     print("=" * 60)
-    print("Precision Results:")
+    print("Matrix Multiplication Precision Validation:")
     print("=" * 60)
-    print(f"Max absolute diff:  {max_diff:.6e}")
-    print(f"Mean absolute diff: {mean_diff:.6e}")
-    print(f"Max relative diff:  {max_rel_diff:.6e}")
-    print(f"Mean relative diff: {mean_rel_diff:.6e}")
+    P_diff = (P_cuda - P_ref).abs()
+    P_max_diff = P_diff.max().item()
+    P_mean_diff = P_diff.mean().item()
+    P_relative_diff = (P_diff / (P_ref.abs() + 1e-8)).max().item()
+    
+    print(f"P_cuda vs P_ref (PyTorch):")
+    print(f"  Max absolute diff:     {P_max_diff:.6e}")
+    print(f"  Mean absolute diff:    {P_mean_diff:.6e}")
+    print(f"  Max relative diff:     {P_relative_diff:.6e}")
     print()
     
     # 打印部分结果用于调试
-    print("Sample values (first 5x5 block):")
-    print("CUDA result:")
+    print("Sample P_cuda vs P_ref (first 5x5 block):")
+    print("P_cuda:")
     print(P_cuda[:5, :5])
-    print("Reference result:")
+    print("P_ref (PyTorch):")
     print(P_ref[:5, :5])
+    print("Difference:")
+    print(P_diff[:5, :5])
     print()
     
     # 断言精度在合理范围内
-    # bf16 输入、float 累加，允许的误差范围
-    threshold = 1e-2
-    smem_threshold = 1e-3  # SMEM 输出应该与输入完全匹配（允许 bf16 精度误差）
+    # 对于 bfloat16 输入和 float32 输出，允许一定的数值误差
+    max_diff_threshold = 1e-2  # 允许的最大绝对误差
+    relative_diff_threshold = 1e-1  # 允许的最大相对误差
     
-    smem_passed = True
-    if Q_max_diff < smem_threshold and K_max_diff < smem_threshold:
-        print(f"✓ SMEM debug output PASSED! (Q_max_diff={Q_max_diff:.6e}, K_max_diff={K_max_diff:.6e} < {smem_threshold})")
+    if P_max_diff < max_diff_threshold and P_relative_diff < relative_diff_threshold:
+        print(f"✓ Matrix multiplication test PASSED!")
+        print(f"  (max_diff={P_max_diff:.6e} < {max_diff_threshold}, "
+              f"relative_diff={P_relative_diff:.6e} < {relative_diff_threshold})")
+        return True
     else:
-        print(f"✗ SMEM debug output FAILED! (Q_max_diff={Q_max_diff:.6e}, K_max_diff={K_max_diff:.6e} >= {smem_threshold})")
-        smem_passed = False
-    
-    print()
-    if max_diff < threshold:
-        print(f"✓ P output test PASSED! (max_diff={max_diff:.6e} < {threshold})")
-        return smem_passed  # 只有 SMEM 和 P 都通过才算通过
-    else:
-        print(f"✗ P output test FAILED! (max_diff={max_diff:.6e} >= {threshold})")
+        print(f"✗ Matrix multiplication test FAILED!")
+        print(f"  (max_diff={P_max_diff:.6e} >= {max_diff_threshold} or "
+              f"relative_diff={P_relative_diff:.6e} >= {relative_diff_threshold})")
         return False
 
 
@@ -133,12 +95,12 @@ def test_different_inputs():
     print("Testing with different input patterns")
     print("=" * 60)
     
-    M, N, K = 128, 128, 256
+    M, N, K_DIM = 128, 128, 256
     test_cases = [
         ("All ones", torch.ones, torch.ones),
         ("All zeros", torch.zeros, torch.zeros),
-        ("Identity-like", lambda *args, **kwargs: torch.eye(M, K, **kwargs), 
-                          lambda *args, **kwargs: torch.eye(N, K, **kwargs)),
+        ("Identity-like", lambda *args, **kwargs: torch.eye(M, K_DIM, **kwargs), 
+                          lambda *args, **kwargs: torch.eye(N, K_DIM, **kwargs)),
         ("Random uniform", lambda *args, **kwargs: torch.rand(*args, **kwargs) * 2 - 1,
                           lambda *args, **kwargs: torch.rand(*args, **kwargs) * 2 - 1),
     ]
@@ -146,22 +108,26 @@ def test_different_inputs():
     all_passed = True
     for name, q_gen, k_gen in test_cases:
         try:
-            Q = q_gen(M, K, dtype=torch.bfloat16, device='cuda')
-            K_mat = k_gen(N, K, dtype=torch.bfloat16, device='cuda')
+            Q = q_gen(M, K_DIM, dtype=torch.bfloat16, device='cuda')
+            K_mat = k_gen(N, K_DIM, dtype=torch.bfloat16, device='cuda')
             
-            P_cuda, Q_out, K_out = test_2sm_mma_cuda.utcmma_ss_debug(Q, K_mat)
-            P_ref = torch.matmul(Q.float(), K_mat.float().T)
+            # PyTorch reference
+            P_ref = torch.matmul(Q.float(), K_mat.transpose(-2, -1).float())
             
-            max_diff = (P_cuda - P_ref).abs().max().item()
-            Q_max_diff = (Q_out.float() - Q.float()).abs().max().item()
-            K_max_diff = (K_out.float() - K_mat.float()).abs().max().item()
+            # CUDA kernel
+            P_cuda = test_2sm_mma_cuda.utcmma_ss_debug(Q, K_mat)
             
-            smem_ok = Q_max_diff < 1e-3 and K_max_diff < 1e-3
-            p_ok = max_diff < 1e-2
-            status = "✓" if (smem_ok and p_ok) else "✗"
-            print(f"{status} {name}: P_max_diff={max_diff:.6e}, Q_max_diff={Q_max_diff:.6e}, K_max_diff={K_max_diff:.6e}")
+            P_max_diff = (P_cuda - P_ref).abs().max().item()
+            P_relative_diff = ((P_cuda - P_ref).abs() / (P_ref.abs() + 1e-8)).max().item()
             
-            if not (smem_ok and p_ok):
+            max_diff_threshold = 1e-2
+            relative_diff_threshold = 1e-1
+            test_ok = P_max_diff < max_diff_threshold and P_relative_diff < relative_diff_threshold
+            
+            status = "✓" if test_ok else "✗"
+            print(f"{status} {name}: max_diff={P_max_diff:.6e}, relative_diff={P_relative_diff:.6e}")
+            
+            if not test_ok:
                 all_passed = False
         except Exception as e:
             print(f"✗ {name}: ERROR - {e}")
