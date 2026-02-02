@@ -1,0 +1,15 @@
+对ku::utcmma_ss(tiled_mma_P_sQ, sQl, sKl, tP, true);生成测试
+
+要求：
+1.生成.cuh文件
+    1.1/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/fwd/head128/config.h，将需要的SMEM和TMEM配置copy过来
+    1.2使用TiledMMA_P_sQ(SM100_MMA_F16BF16_2x1SM_SS_NOELECT)进行矩阵乘
+    1.3输入从test_2sm_mma.py生成，就是矩阵q和矩阵k，读取后直接用寄存器存入到smem，然后通过utcmma_ss进行矩阵乘输出到tmem，读取tmem结果存到全局内存
+2.生成test_2sm_mma.py精度对比脚本
+    2.1生成的q_shape:[128, 256]；k_shape:[128, 256]
+    2.2对比cuda的结果和torch的matmul结果精度误差
+3.生成set_up安装脚本
+4.编译生成.o文件，编译时max_jobs=128
+5.执行test_2sm_mma.py进行精度测试
+
+注：所有生成的文件都在/home/users/chenquanlin/workspace/operator/test/2sm_mma 目录下
