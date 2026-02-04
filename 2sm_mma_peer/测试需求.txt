@@ -1,0 +1,30 @@
+对SM100_MMA_F16BF16_WS_SS_NOELECT生成测试
+参考/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/gemm.cuh
+
+要求：
+1.生成.cuh\.cu文件
+    1.1/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/fwd/head64/config.h，将需要的SMEM和TMEM配置copy过来
+    1.2使用TiledMMA_O(SM100_MMA_F16BF16_WS_SS_NOELECT)进行矩阵乘
+    1.3输入从test_2sm_mma.py生成，就是矩阵q和矩阵k，读取后直接用寄存器存入到smem
+        注意读取时，q全部读取，k每个cta读取一半，cta0读取前[64,256]，cta1读取后[64,256]
+        读取并写入smem后，cta0根据/Users/chenql/Desktop/workspace/operator/docs/CTA之间交换SMEM数据.md，获取cta1中smem k的地址
+        cta0将自己的SMEM中的q、k以及cta1中smem k读取并写出到全局内存
+        然后cta0一共进行2次utcmma_ss乘积
+            第一次mma
+            A：[64,64]（前64维）
+            B: smem.k [64,256]
+            第二次mma
+            A：[64,64]（后64维）
+            B: peer_smem.k [64,256]
+            形式：累加
+        最终输出到tmem，读取tmem结果存到全局内存
+    1.4对.cu文件分块添加finish打印，从finish 1 到finish n，方便debug代码卡在哪里，打印时添加if (cta_idx==0 and blockidx.x==0 and tid==0)的条件
+2.生成test_2sm_mma_peer.py精度对比脚本
+    2.1生成的q_shape:[64, 128]；k_shape:[128, 256]
+    2.2对比q、k精度误差
+    2.3对比cuda的结果和torch的matmul(q@k)结果精度误差
+3.生成setup安装脚本
+4.编译生成.o文件，编译时max_jobs=192
+5.执行test_2sm_mma_ksplit.py进行精度测试
+
+注：所有生成的文件都在/test_operator/2sm_mma_peer 目录下

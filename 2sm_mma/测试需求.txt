@@ -9,7 +9,7 @@
     2.1生成的q_shape:[128, 256]；k_shape:[128, 256]
     2.2对比cuda的结果和torch的matmul结果精度误差
 3.生成set_up安装脚本
-4.编译生成.o文件，编译时max_jobs=128
+4.编译生成.o文件，编译时max_jobs=192
 5.执行test_2sm_mma.py进行精度测试
 
 注：所有生成的文件都在/home/users/chenquanlin/workspace/operator/test/2sm_mma 目录下

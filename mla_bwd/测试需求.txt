@@ -1,0 +1,36 @@
+要求：
+1.生成.cuh\.cu文件(cu文件命名mla_bwd.cu)
+    1.1其中/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh，cuh文件大部分已经写好，还需要更改输入输出配置
+        输入：q、kv、dO
+        输出：q_out、kv_out、dO_out、P、dP
+    1.2输入从test_mla_bwd.py生成
+        每个cta从全局内存读取输入的规则
+        Q：cta0读取前[B_H/2, D_Q]，cta1读取后[B_H/2, D_Q]
+        KV：cta0读取前[B_TOPK/2, D_K]，cta1读取后[B_TOPK/2, D_K]
+        dO：cta0读取前[B_H/2, D_V]，cta1读取后[B_H/2, D_V]
+        从全局内存读取后，直接用寄存器写入到SMEM
+        然后cta0和cta1将自己的SMEM中的Q、KV、dO读取并写出到全局内存
+    1.3使用TiledMMA_P计算P
+        矩阵A：plan.u.q_kv.q
+        矩阵B：plan.u.q_kv.kv
+        矩阵C：tmem_cols.P
+        注意：对tmem_cols.P执行clear_accum
+    1.4使用TiledMMA_dP计算dP
+        矩阵A：plan.dO
+        矩阵B：plan.u.q_kv.kv中的v部分
+        矩阵C：tmem_cols.dP
+        注意：对tmem_cols.dP执行clear_accum
+    1.5mma计算完成后，读取tmem结果，将P和dP存到全局内存
+    1.6对.cu文件分块添加finish打印，打印时添加if (cta_idx==0 and blockidx.x==0 and tid==0)的条件，从finish 1 到finish n，方便debug代码卡在哪里
+2.生成test_mla_bwd.py精度对比脚本
+    2.1生成输入数据
+        q_shape:[128, 576]
+        kv_shape:[64, 576]
+        do_shape:[128, 512]
+    2.2对比Q\K\dO精度误差
+    2.3对比cuda的结果和torch的matmul计算的P和dP精度误差
+3.生成setup安装脚本
+4.编译生成.o文件，编译时max_jobs=192
+5.执行test_mla_bwd.py进行精度测试
+
+注：所有生成的文件都在/test_operator/mla_bwd 目录下
