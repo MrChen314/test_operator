@@ -245,18 +245,18 @@ __global__ void test_mla_bwd_kernel(
             printf("[WG0] finish 3: P loaded from TMEM\n");
         }
 
-        plan.bar_k_valid_ready.wait(0);
-        uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
-        float* p_float = (float*)p;
-        CUTE_UNROLL
-        for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-            if (!(is_k_valid_lo >> i & 1))
-                p_float[i] = -CUDART_INF_F;
-        }
+        // plan.bar_k_valid_ready.wait(0);
+        // uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+        // float* p_float = (float*)p;
+        // CUTE_UNROLL
+        // for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+        //     if (!(is_k_valid_lo >> i & 1))
+        //         p_float[i] = -CUDART_INF_F;
+        // }
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 4: k valid mask loaded from SMEM\n");
-        }
+        // if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+        //     printf("[WG0] finish 4: k valid mask loaded from SMEM\n");
+        // }
 
         // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
         // Compute softmax values: s = exp2(P*scale - LSE)
@@ -685,34 +685,35 @@ __global__ void test_mla_bwd_kernel(
             // Wait for WG0 to compute ds
             // plan.bar_ds_ready.wait(0);
             ku::tcgen05_after_thread_sync();
-        } else if (warp_idx == 13) {
-            // KV valid loading warp
-            // Note: B_TOPK is 64 for this test, but the mask logic supports it
-            if (lane_idx < 8) {
-                // CUTE_NO_UNROLL
-                // for (int k = 0; k < num_k_blocks; ++k) {
-                // int cur_buf = k%NUM_BUFS;
-                int32x8_t indices = ldg_256_indices((void*)(gIndices + lane_idx*8));
-                auto is_valid = [&](int rel_pos_in_lane, int index) -> char {
-                    int abs_pos = lane_idx*8 + rel_pos_in_lane;
-                    return index >= 0 && index < s_kv && abs_pos < topk_length;
-                };
-                char is_ks_valid_mask = \
-                    is_valid(7, indices.a7) << 7 | 
-                    is_valid(6, indices.a6) << 6 | 
-                    is_valid(5, indices.a5) << 5 |
-                    is_valid(4, indices.a4) << 4 |
-                    is_valid(3, indices.a3) << 3 |
-                    is_valid(2, indices.a2) << 2 |
-                    is_valid(1, indices.a1) << 1 |
-                    is_valid(0, indices.a0) << 0;
+        } 
+        // else if (warp_idx == 13) {
+        //     // KV valid loading warp
+        //     // Note: B_TOPK is 64 for this test, but the mask logic supports it
+        //     if (lane_idx < 8) {
+        //         // CUTE_NO_UNROLL
+        //         // for (int k = 0; k < num_k_blocks; ++k) {
+        //         // int cur_buf = k%NUM_BUFS;
+        //         int32x8_t indices = ldg_256_indices(gIndices + lane_idx*8);
+        //         auto is_valid = [&](int rel_pos_in_lane, int index) -> char {
+        //             int abs_pos = lane_idx*8 + rel_pos_in_lane;
+        //             return index >= 0 && index < s_kv && abs_pos < topk_length;
+        //         };
+        //         char is_ks_valid_mask = \
+        //             is_valid(7, indices.a7) << 7 | 
+        //             is_valid(6, indices.a6) << 6 | 
+        //             is_valid(5, indices.a5) << 5 |
+        //             is_valid(4, indices.a4) << 4 |
+        //             is_valid(3, indices.a3) << 3 |
+        //             is_valid(2, indices.a2) << 2 |
+        //             is_valid(1, indices.a1) << 1 |
+        //             is_valid(0, indices.a0) << 0;
 
-                // plan.bar_k_valid_free.wait(0);
-                plan.is_k_valid[lane_idx] = is_ks_valid_mask;
-                plan.bar_k_valid_ready.arrive();
-                // }
-            }
-        }
+        //         // plan.bar_k_valid_free.wait(0);
+        //         plan.is_k_valid[lane_idx] = is_ks_valid_mask;
+        //         plan.bar_k_valid_ready.arrive();
+        //         // }
+        //     }
+        // }
     }
 
     // All threads must sync before proceeding
