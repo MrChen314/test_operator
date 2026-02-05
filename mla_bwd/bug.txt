@@ -1,4 +1,16 @@
 root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(154): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(158): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
 /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
                   module.to(detail::py_object_to_dtype(dtype), non_blocking);
                   ^
@@ -11,43 +23,31 @@ root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_
                   module.to(
                   ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(360): error: "FLOAT2_PER_ROW" has already been declared in the current scope
-      constexpr int FLOAT2_PER_ROW = dP_COLS / 2 / 2;
-                    ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(749): error: expected a ";"
+  ) {
+    ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(362): error: "cta_row_offset" has already been declared in the current scope
-      int cta_row_offset = cta_idx * dP_ROWS;
-          ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(795): warning #12-D: parsing restarts here after previous syntax error
+      memset(&config, 0, sizeof(config));
+                                        ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(363): error: "logical_row" has already been declared in the current scope
-      int logical_row = tid % dP_ROWS + cta_row_offset;
-          ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(796): error: identifier "config" is undefined
+      config.gridDim = grid;
+      ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(364): error: "col_offset" has already been declared in the current scope
-      int col_offset = tid / dP_ROWS;
-          ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(796): error: identifier "grid" is undefined
+      config.gridDim = grid;
+                       ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(367): error: "tmem_base" has already been declared in the current scope
-      uint32_t tmem_base = plan.tmem_start_addr.data()[0];
-               ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(799): error: identifier "stream" is undefined
+      config.stream = stream;
+                      ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(368): error: "tmem_lane" has already been declared in the current scope
-      uint32_t tmem_lane = logical_row;
-               ^
+/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(886): error: identifier "launch_preprocess_delta" is undefined
+      launch_preprocess_delta(O_ptr, dO_ptr, delta_ptr, stream);
+      ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(369): error: "tmem_col" has already been declared in the current scope
-      uint32_t tmem_col = tmem_cols::dP;
-               ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(372): error: "tmem_addr" has already been declared in the current scope
-      uint32_t tmem_addr = tmem_base + (tmem_lane << 16) + tmem_col;
-               ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(30): warning #177-D: variable "lane_idx" was declared but never referenced
-      const int lane_idx = tid % 32;
-                ^
-
-8 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu".
+5 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu".
 ninja: build stopped: subcommand failed.
 Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build

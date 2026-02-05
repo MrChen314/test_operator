@@ -1,4 +1,4 @@
-要求：
+要求1：
 1.生成.cuh\.cu文件(cu文件命名mla_bwd.cu)
     1.1其中/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh，cuh文件大部分已经写好，还需要更改输入输出配置
         输入：q、kv、dO
@@ -32,5 +32,37 @@
 3.生成setup安装脚本
 4.编译生成.o文件，编译时max_jobs=192
 5.执行test_mla_bwd.py进行精度测试
+
+
+要求2：
+以下代码先不考虑mask
+1.kernel新增输入、输出、barrier
+    输入：lse、O
+    输出：s、ds
+    barrier
+        WG3计算好P后，通知WG0
+        WG3计算好dP后，通知WG0
+        WG0存好s后，告知WG3
+        WG0存好ds后，告知WG3
+2.预计算delta：使用/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/preprocess_delta.cuh
+    可参考/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/phase1.cuh 中的run_bwd_preprocess_delta_kernel<D_QK>(params);
+3.将mla_bwd.cuh中现有的mma操作的代码包在WG3(warpgroup3)中
+4.tilelang反向流程：/Users/chenql/Desktop/workspace/operator/tilelang/examples/deepseek_v32/sparse_mla_bwd.py
+    理解tilelang反向中acc_p和acc_dp的计算公式
+5.新增WG0计算acc_p和acc_dp
+    2.1WG3计算好P后，通知WG0；WG3计算好dP后，通知WG0
+    2.2等待WG3计算好p
+    2.3使用ku::tmem_ld_32dp32bNx指令将tmem_cols.p读取到寄存器，然后计算softmax(p) -> 通过exp2(P*scale - LSE)获得softmax值s(fp32)
+    2.4将s存到plan.s_ds.s，存入的是bf16格式。存好后，告知WG3信息：s已经准备好
+    2.5cta0和cta1将自己的SMEM中的s写出到全局内存
+    2.6从全局内存读取需要的delta
+    2.7等待WG3计算好dp
+    2.8计算ds，ds = s * (dp - delta) * scale；注意公式里的s用2.3中算好的fp32格式的值，而不是存到SMEM里面的bf16格式
+    2.9.将ds从fp32转换到bf16，存储ds到plan.s_ds.ds，存好后，告知WG3信息：ds已经准备好
+    2.10cta0和cta1将自己的SMEM中的ds写出到全局内存
+6.test_mla_bwd.py添加精度测试
+    6.1生成lse和O的随机输入
+    6.2torch先计算delta，然后生成torch版本的计算s和ds的代码
+    6.3添加torch版s和ds与cuda输出的s和ds的精度对比
 
 注：所有生成的文件都在/test_operator/mla_bwd 目录下
