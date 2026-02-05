@@ -172,7 +172,7 @@ struct alignas(128) SharedMemoryPlan {
     } s_ds;
     
     // KV 有效性掩码
-    char is_kv_valid[B_TOPK/8];
+    char is_k_valid[B_TOPK/8];
 
     // ========================================================================
     // 同步屏障 (2CTA 同步)
