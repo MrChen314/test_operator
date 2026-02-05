@@ -25,6 +25,10 @@ struct bf16x8 {
     __nv_bfloat162 a67;
 };
 
+struct int32x8_t {
+    int a0, a1, a2, a3, a4, a5, a6, a7;
+};
+
 CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
     int32x8_t val;
     asm volatile("ld.global.nc.L1::evict_normal.L2::evict_normal.L2::256B.v8.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
