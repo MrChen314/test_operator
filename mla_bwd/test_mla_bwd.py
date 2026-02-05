@@ -34,9 +34,20 @@ def test_mla_bwd():
     kv = torch.randn(B_TOPK, D_K, dtype=torch.bfloat16, device='cuda')
     dO = torch.randn(B_H, D_V, dtype=torch.bfloat16, device='cuda')
     
+    # Generate indices for sparse attention
+    # For test purposes: B=1, S=1, HKV=1, topk=B_TOPK
+    # Reference: sparse_mla_bwd.py:295-301
+    S_KV = B_TOPK  # KV sequence length
+    indices = torch.full((B_TOPK,), S_KV, dtype=torch.int32, device='cuda')
+    # Generate random valid indices (0 to S_KV-1)
+    valid_indices = torch.randperm(S_KV, device='cuda')[:B_TOPK]
+    indices[:len(valid_indices)] = valid_indices
+    
     print(f"q dtype: {q.dtype}, device: {q.device}")
     print(f"kv dtype: {kv.dtype}, device: {kv.device}")
     print(f"dO dtype: {dO.dtype}, device: {dO.device}")
+    print(f"indices shape: {indices.shape}, dtype: {indices.dtype}")
+    print(f"indices range: [{indices.min().item()}, {indices.max().item()}]")
     print()
     
     # Extract K and V from KV
@@ -52,6 +63,18 @@ def test_mla_bwd():
     # PyTorch reference implementation: P = Q @ K^T
     print("Computing reference with PyTorch...")
     P_ref = torch.matmul(q.float(), k.transpose(-2, -1))  # [128, 576] @ [576, 64] = [128, 64]
+    
+    # Apply mask logic: set invalid positions to -inf
+    # Reference: sparse_mla_bwd.py:175-183
+    # A position is valid if: index >= 0 && index < s_kv && position < topk_length
+    s_kv = S_KV
+    topk_length = B_TOPK
+    mask = (indices >= 0) & (indices < s_kv) & (torch.arange(B_TOPK, device='cuda') < topk_length)
+    # Expand mask to [B_H, B_TOPK] for broadcasting
+    mask_expanded = mask.unsqueeze(0).expand(B_H, B_TOPK)  # [128, 64]
+    # Set invalid positions to -inf
+    P_ref = torch.where(mask_expanded, P_ref, torch.tensor(float('-inf'), device='cuda', dtype=torch.float32))
+    
     print(f"P_ref shape: {P_ref.shape}, dtype: {P_ref.dtype}")
     
     # PyTorch reference implementation: dP = dO @ V^T
@@ -84,7 +107,7 @@ def test_mla_bwd():
     
     # CUDA kernel computation
     print("Running CUDA kernel...")
-    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O)
+    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
     torch.cuda.synchronize()
     print(f"q_out shape: {q_out.shape}, dtype: {q_out.dtype}")
     print(f"kv_out shape: {kv_out.shape}, dtype: {kv_out.dtype}")
@@ -367,10 +390,24 @@ def test_different_inputs():
             kv = kv_gen(B_TOPK, D_K, dtype=torch.bfloat16, device='cuda')
             dO = dO_gen(B_H, D_V, dtype=torch.bfloat16, device='cuda')
             
+            # Generate indices for sparse attention
+            S_KV = B_TOPK
+            indices = torch.full((B_TOPK,), S_KV, dtype=torch.int32, device='cuda')
+            valid_indices = torch.randperm(S_KV, device='cuda')[:B_TOPK]
+            indices[:len(valid_indices)] = valid_indices
+            
             # PyTorch reference
             k = kv[:, :D_K].float()
             v = kv[:, :D_V].float()
             P_ref = torch.matmul(q.float(), k.transpose(-2, -1))
+            
+            # Apply mask logic: set invalid positions to -inf
+            s_kv = S_KV
+            topk_length = B_TOPK
+            mask = (indices >= 0) & (indices < s_kv) & (torch.arange(B_TOPK, device='cuda') < topk_length)
+            mask_expanded = mask.unsqueeze(0).expand(B_H, B_TOPK)
+            P_ref = torch.where(mask_expanded, P_ref, torch.tensor(float('-inf'), device='cuda', dtype=torch.float32))
+            
             dP_ref = torch.matmul(dO.float(), v.transpose(-2, -1))
             
             # Generate lse and O
@@ -378,7 +415,7 @@ def test_different_inputs():
             O = torch.randn(B_H, D_V, dtype=torch.bfloat16, device='cuda')
             
             # CUDA kernel
-            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O)
+            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
             
             P_max_diff = (P_cuda - P_ref).abs().max().item()
             P_relative_diff = ((P_cuda - P_ref).abs() / (P_ref.abs() + 1e-8)).max().item()

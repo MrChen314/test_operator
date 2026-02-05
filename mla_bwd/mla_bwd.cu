@@ -25,6 +25,16 @@ struct bf16x8 {
     __nv_bfloat162 a67;
 };
 
+CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
+    int32x8_t val;
+    asm volatile("ld.global.nc.L1::evict_normal.L2::evict_normal.L2::256B.v8.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=r"(val.a0), "=r"(val.a1), "=r"(val.a2), "=r"(val.a3),
+          "=r"(val.a4), "=r"(val.a5), "=r"(val.a6), "=r"(val.a7)
+        : "l"(src_ptr)
+    );
+    return val;
+}
+
 // Preprocess delta kernel: compute delta = sum(O * dO, dim=-1)
 __global__ void preprocess_delta_kernel(
     const bf16* __restrict__ O,      // [B_H, D_V] = [128, 512]
@@ -76,6 +86,9 @@ __global__ void test_mla_bwd_kernel(
     const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
     const float* __restrict__ lse,   // [B_H] = [128] (log-sum-exp for softmax)
     const bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
+    const int32_t* __restrict__ gIndices,  // [B_TOPK] = [64] (indices for sparse attention)
+    int s_kv,                        // KV sequence length
+    int topk_length,                 // TopK length
     bf16* __restrict__ q_out,        // [B_H, D_Q] = [128, 576] (output Q from SMEM)
     bf16* __restrict__ kv_out,       // [B_TOPK, D_K] = [64, 576] (output KV from SMEM)
     bf16* __restrict__ dO_out,       // [B_H, D_V] = [128, 512] (output dO from SMEM)
@@ -95,6 +108,7 @@ __global__ void test_mla_bwd_kernel(
     const int cta_idx = blockIdx.x % 2;  // 0 or 1
     const int tid = threadIdx.x;
     const int warp_idx = cutlass::canonical_warp_idx_sync();  // Global warp index
+    const int lane_idx = threadIdx.x % 32;
     
     // Determine warpgroup: 4 warpgroups, 128 threads each
     // WG0: threads 0-127 (warpgroup_idx = 0, warp_idx = 0-3)
@@ -129,6 +143,8 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dp_ready.init(1);       // WG3通知WG0 dp已准备好 (2CTA sync)
         plan.bar_s_ready.init(128*2);        // WG0通知WG3 s已准备好 (2CTA sync)
         plan.bar_ds_ready.init(128*2);       // WG0通知WG3 ds已准备好 (2CTA sync)
+        plan.bar_k_valid_free.init(128);
+        plan.bar_k_valid_ready.init(8);
         fence_barrier_init();
     }
     
@@ -224,7 +240,20 @@ __global__ void test_mla_bwd_kernel(
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
             printf("[WG0] finish 3: P loaded from TMEM\n");
         }
-        
+
+        plan.bar_k_valid_ready.wait(0);
+        uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+        float* p_float = (float*)p;
+        CUTE_UNROLL
+        for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+            if (!(is_k_valid_lo >> i & 1))
+                p_float[i] = -CUDART_INF_F;
+        }
+
+        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+            printf("[WG0] finish 4: k valid mask loaded from SMEM\n");
+        }
+
         // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
         // Compute softmax values: s = exp2(P*scale - LSE)
         float2 s_fp32[(B_TOPK/2)/2];
@@ -256,7 +285,7 @@ __global__ void test_mla_bwd_kernel(
 
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 4: softmax computed and s stored to SMEM\n");
+            printf("[WG0] finish 5: softmax computed and s stored to SMEM\n");
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -277,7 +306,7 @@ __global__ void test_mla_bwd_kernel(
         
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 5: s written to global memory\n");
+            printf("[WG0] finish 6: s written to global memory\n");
         }
         
         // Step 6: Load delta from global memory
@@ -285,7 +314,7 @@ __global__ void test_mla_bwd_kernel(
         delta_val = __ldg(delta + global_row_idx);
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 6: delta loaded from global memory\n");
+            printf("[WG0] finish 7: delta loaded from global memory\n");
         }
         
         // Step 7: Wait for WG3 to compute dp
@@ -293,7 +322,7 @@ __global__ void test_mla_bwd_kernel(
         ku::tcgen05_after_thread_sync();
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 7: dP is ready, computing ds\n");
+            printf("[WG0] finish 8: dP is ready, computing ds\n");
         }
 
         // Read dP from TMEM and write to global memory
@@ -336,7 +365,7 @@ __global__ void test_mla_bwd_kernel(
         ku::tcgen05_before_thread_sync();
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 8: dp loaded from TMEM\n");
+            printf("[WG0] finish 9: dp loaded from TMEM\n");
         }
         
         // Step 9: Compute ds = s * (dp - delta) * sm_scale
@@ -373,7 +402,7 @@ __global__ void test_mla_bwd_kernel(
 
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 9: ds computed and stored to SMEM\n");
+            printf("[WG0] finish 10: ds computed and stored to SMEM\n");
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -393,7 +422,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_ds_ready.arrive(0u);
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 10: ds written to global memory\n");
+            printf("[WG0] finish 11: ds written to global memory\n");
         }
     }
     
@@ -652,6 +681,33 @@ __global__ void test_mla_bwd_kernel(
             // Wait for WG0 to compute ds
             // plan.bar_ds_ready.wait(0);
             ku::tcgen05_after_thread_sync();
+        } else if (warp_idx == 13) {
+            // KV valid loading warp
+            // Note: B_TOPK is 64 for this test, but the mask logic supports it
+            if (lane_idx < 8) {
+                // CUTE_NO_UNROLL
+                // for (int k = 0; k < num_k_blocks; ++k) {
+                // int cur_buf = k%NUM_BUFS;
+                int32x8_t indices = ldg_256_indices((void*)(gIndices + lane_idx*8));
+                auto is_valid = [&](int rel_pos_in_lane, int index) -> char {
+                    int abs_pos = lane_idx*8 + rel_pos_in_lane;
+                    return index >= 0 && index < s_kv && abs_pos < topk_length;
+                };
+                char is_ks_valid_mask = \
+                    is_valid(7, indices.a7) << 7 | 
+                    is_valid(6, indices.a6) << 6 | 
+                    is_valid(5, indices.a5) << 5 |
+                    is_valid(4, indices.a4) << 4 |
+                    is_valid(3, indices.a3) << 3 |
+                    is_valid(2, indices.a2) << 2 |
+                    is_valid(1, indices.a1) << 1 |
+                    is_valid(0, indices.a0) << 0;
+
+                // plan.bar_k_valid_free.wait(0);
+                plan.is_k_valid[lane_idx] = is_ks_valid_mask;
+                plan.bar_k_valid_ready.arrive();
+                // }
+            }
         }
     }
 
@@ -697,6 +753,9 @@ void launch_test_mla_bwd(
     const bf16* dO,
     const float* lse,
     const bf16* O,
+    const int32_t* gIndices,
+    int s_kv,
+    int topk_length,
     bf16* q_out,
     bf16* kv_out,
     bf16* dO_out,
@@ -739,7 +798,7 @@ void launch_test_mla_bwd(
     
     printf("finish 0: Launching kernel...\n");
     cudaError_t err = cudaLaunchKernelEx(&config, test_mla_bwd_kernel, 
-        q, kv, dO, lse, O, q_out, kv_out, dO_out, P, dP, s, ds, delta);
+        q, kv, dO, lse, O, gIndices, s_kv, topk_length, q_out, kv_out, dO_out, P, dP, s, ds, delta);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
         return;
@@ -749,18 +808,20 @@ void launch_test_mla_bwd(
 
 // Python binding
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mla_bwd_forward(
-    torch::Tensor q, torch::Tensor kv, torch::Tensor dO, torch::Tensor lse, torch::Tensor O) {
+    torch::Tensor q, torch::Tensor kv, torch::Tensor dO, torch::Tensor lse, torch::Tensor O, torch::Tensor indices) {
     // Check inputs
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
     TORCH_CHECK(kv.is_cuda(), "kv must be a CUDA tensor");
     TORCH_CHECK(dO.is_cuda(), "dO must be a CUDA tensor");
     TORCH_CHECK(lse.is_cuda(), "lse must be a CUDA tensor");
     TORCH_CHECK(O.is_cuda(), "O must be a CUDA tensor");
+    TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(kv.dtype() == torch::kBFloat16, "kv must be bfloat16");
     TORCH_CHECK(dO.dtype() == torch::kBFloat16, "dO must be bfloat16");
     TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
     TORCH_CHECK(O.dtype() == torch::kBFloat16, "O must be bfloat16");
+    TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
     TORCH_CHECK(q.dim() == 2 && q.size(0) == B_H && q.size(1) == D_Q, 
                 "q shape must be [128, 576]");
     TORCH_CHECK(kv.dim() == 2 && kv.size(0) == B_TOPK && kv.size(1) == D_K,
@@ -771,11 +832,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
                 "lse shape must be [128]");
     TORCH_CHECK(O.dim() == 2 && O.size(0) == B_H && O.size(1) == D_V,
                 "O shape must be [128, 512]");
+    TORCH_CHECK(indices.dim() == 1 && indices.size(0) == B_TOPK,
+                "indices shape must be [64]");
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     TORCH_CHECK(kv.is_contiguous(), "kv must be contiguous");
     TORCH_CHECK(dO.is_contiguous(), "dO must be contiguous");
     TORCH_CHECK(lse.is_contiguous(), "lse must be contiguous");
     TORCH_CHECK(O.is_contiguous(), "O must be contiguous");
+    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
     
     // Create output tensors
     auto options_f32 = torch::TensorOptions()
@@ -800,6 +864,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const bf16* dO_ptr = reinterpret_cast<const bf16*>(dO.data_ptr<at::BFloat16>());
     const float* lse_ptr = lse.data_ptr<float>();
     const bf16* O_ptr = reinterpret_cast<const bf16*>(O.data_ptr<at::BFloat16>());
+    const int32_t* indices_ptr = indices.data_ptr<int32_t>();
     bf16* q_out_ptr = reinterpret_cast<bf16*>(q_out.data_ptr<at::BFloat16>());
     bf16* kv_out_ptr = reinterpret_cast<bf16*>(kv_out.data_ptr<at::BFloat16>());
     bf16* dO_out_ptr = reinterpret_cast<bf16*>(dO_out.data_ptr<at::BFloat16>());
@@ -820,9 +885,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         TORCH_CHECK(false, "Delta preprocessing failed: ", cudaGetErrorString(err));
     }
     
+    // Determine s_kv and topk_length from indices
+    // For test purposes, s_kv is the maximum valid KV index + 1
+    // topk_length is the actual number of valid indices (B_TOPK for this test)
+    int s_kv = B_TOPK;  // Default to B_TOPK, can be adjusted based on actual usage
+    int topk_length = B_TOPK;
+    
     // Call kernel
     printf("finish -1: Starting kernel launch from Python binding\n");
-    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, 
+    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv, topk_length,
         q_out_ptr, kv_out_ptr, dO_out_ptr, P_ptr, dP_ptr, s_ptr, ds_ptr, delta_ptr, stream);
     
     // Synchronize and wait for kernel completion

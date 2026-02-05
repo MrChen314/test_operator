@@ -184,6 +184,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dp_ready;                 // WG3通知WG0 dp已准备好 (2CTA sync)
     transac_bar_t bar_s_ready;                  // WG0通知WG3 s已准备好 (2CTA sync)
     transac_bar_t bar_ds_ready;                 // WG0通知WG3 ds已准备好 (2CTA sync)
+    transac_bar_t bar_k_valid_free;             
+    transac_bar_t bar_k_valid_ready;            // WG3通知WG0 k有效性掩码已加载到SMEM
 
     // TMEM 起始地址
     array_aligned<uint32_t, 1> tmem_start_addr;
@@ -207,6 +209,9 @@ __global__ void test_mla_bwd_kernel(
     const test_operator::mla_bwd::bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
     const float* __restrict__ lse,     // [B_H] = [128] (log-sum-exp for softmax)
     const test_operator::mla_bwd::bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
+    const int32_t* __restrict__ gIndices,  // [B_TOPK] = [64] (indices for sparse attention)
+    int s_kv,                        // KV sequence length
+    int topk_length,                 // TopK length
     test_operator::mla_bwd::bf16* __restrict__ q_out,        // [B_H, D_Q] = [128, 576] (output Q from SMEM)
     test_operator::mla_bwd::bf16* __restrict__ kv_out,       // [B_TOPK, D_K] = [64, 576] (output KV from SMEM)
     test_operator::mla_bwd::bf16* __restrict__ dO_out,       // [B_H, D_V] = [128, 512] (output dO from SMEM)
@@ -224,6 +229,9 @@ void launch_test_mla_bwd(
     const test_operator::mla_bwd::bf16* dO,
     const float* lse,
     const test_operator::mla_bwd::bf16* O,
+    const int32_t* gIndices,
+    int s_kv,
+    int topk_length,
     test_operator::mla_bwd::bf16* q_out,
     test_operator::mla_bwd::bf16* kv_out,
     test_operator::mla_bwd::bf16* dO_out,
