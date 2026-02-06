@@ -703,7 +703,11 @@ __global__ void test_mla_bwd_kernel(
         }
 
         // ---- Step 3.3: Notify WG3 that dKV_part0 transfer is done ----
-        plan.bar_dkv_part0_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part0_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part0_done.arrive(1u);
+        }
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG2 CTA%d] finish 4: dKV_part0 transferred\n", cta_idx);
@@ -742,7 +746,11 @@ __global__ void test_mla_bwd_kernel(
         }
 
         // ---- Step 3.6: Notify WG3 that dKV_part1 transfer is done ----
-        plan.bar_dkv_part1_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part1_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part1_done.arrive(1u);
+        }
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG2 CTA%d] finish 5: dKV_part1 transferred\n", cta_idx);
@@ -774,7 +782,11 @@ __global__ void test_mla_bwd_kernel(
         }
 
         // ---- Step 3.9: Notify WG3 that dKV_part2 transfer is done ----
-        plan.bar_dkv_part2_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part2_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part2_done.arrive(1u);
+        }
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG2 CTA%d] finish 6: dKV_part2 (RoPE) transferred, all done\n", cta_idx);
