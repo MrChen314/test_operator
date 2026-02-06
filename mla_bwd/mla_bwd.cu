@@ -448,7 +448,7 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Load Q, KV, dO from global memory and write back
     // ========================================
     if (is_wg1) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_dealloc<96>();
         
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
             printf("[WG1] finish 1: start loading Q from global memory\n");
@@ -645,7 +645,7 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_dealloc<96>();
 
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
@@ -757,7 +757,7 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Compute P, dP, and dKV
     // ========================================
     if (is_wg3) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_alloc<168>();
         
         // Allocate TMEM tensors for P and dP
         TiledMMA_P tiled_mma_P{};
