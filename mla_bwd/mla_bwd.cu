@@ -317,7 +317,11 @@ __global__ void test_mla_bwd_kernel(
         }
         
         // Notify WG3 that s is ready
-        plan.bar_s_ready.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_s_ready.arrive(0u);
+        } else {
+            plan.bar_s_ready.arrive(1u);
+        }
         
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
@@ -436,8 +440,12 @@ __global__ void test_mla_bwd_kernel(
         }
         
         // Notify WG3 that ds is ready
-        plan.bar_ds_ready.arrive(0u);
-        
+        if (cta_idx == 0) {
+            plan.bar_ds_ready.arrive(0u);
+        } else {
+            plan.bar_ds_ready.arrive(1u);
+        }
+
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG0 CTA%d] finish 11: ds written to global memory\n", cta_idx);
         }
@@ -659,6 +667,10 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part0_ready.wait(0);
         ku::tcgen05_after_thread_sync();
 
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 2: dKV_part0 ready\n", cta_idx);
+        }
+
         // ---- Step 3.2: Transfer dKV_part0 to global memory (dims 0-255) ----
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
@@ -669,6 +681,9 @@ __global__ void test_mla_bwd_kernel(
             // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
+                if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                    printf("[WG2 CTA%d] finish 3: dKV_part0 loaded from TMEM chunk %d\n", cta_idx, chunk);
+                }
                 float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
                 uint32_t tmem_addr = tmem_base_addr + chunk * CHUNK_SIZE;
                 ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_addr, dkv_data);
@@ -691,7 +706,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part0_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2 CTA%d] finish 2: dKV_part0 transferred\n", cta_idx);
+            printf("[WG2 CTA%d] finish 4: dKV_part0 transferred\n", cta_idx);
         }
 
         // ---- Step 3.4: Wait for WG3 to compute dKV_part1 ----
@@ -730,7 +745,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part1_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2 CTA%d] finish 3: dKV_part1 transferred\n", cta_idx);
+            printf("[WG2 CTA%d] finish 5: dKV_part1 transferred\n", cta_idx);
         }
 
         // ---- Step 3.7: Wait for WG3 to compute dKV_part2 ----
@@ -762,7 +777,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part2_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2 CTA%d] finish 4: dKV_part2 (RoPE) transferred, all done\n", cta_idx);
+            printf("[WG2 CTA%d] finish 6: dKV_part2 (RoPE) transferred, all done\n", cta_idx);
         }
     }
 
@@ -829,7 +844,7 @@ __global__ void test_mla_bwd_kernel(
             // Wait for WG0 to compute s
             plan.bar_s_ready.wait(0);
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 4: s and ds ready, starting dKV computation\n", cta_idx);
             }
 
@@ -858,9 +873,13 @@ __global__ void test_mla_bwd_kernel(
             
             // ---- Step 2.4: Notify WG2 that dKV_part0 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part0_ready.arrive(0u);
+            if (cta_idx == 0) {
+                plan.bar_dkv_part0_ready.arrive(0u);
+            } else {
+                plan.bar_dkv_part0_ready.arrive(1u);
+            }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 5: dKV_part0 computed, waiting for WG2 transfer\n", cta_idx);
             }
 
@@ -875,9 +894,13 @@ __global__ void test_mla_bwd_kernel(
 
             // ---- Step 2.8: Notify WG2 that dKV_part1 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part1_ready.arrive(0u);
+            if (cta_idx == 0) {
+                plan.bar_dkv_part1_ready.arrive(0u);
+            } else {
+                plan.bar_dkv_part1_ready.arrive(1u);
+            }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 6: dKV_part1 computed, waiting for WG2 transfer\n", cta_idx);
             }
 
@@ -890,16 +913,20 @@ __global__ void test_mla_bwd_kernel(
 
             // ---- Step 2.11: Notify WG2 that dKV_part2 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part2_ready.arrive(0u);
+            if (cta_idx == 0) {
+                plan.bar_dkv_part2_ready.arrive(0u);
+            } else {
+                plan.bar_dkv_part2_ready.arrive(1u);
+            }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 7: dKV_part2 (RoPE) computed, waiting for WG2 transfer\n", cta_idx);
             }
 
             // ---- Step 2.12: Wait for WG2 to finish dKV_part2 transfer ----
             plan.bar_dkv_part2_done.wait(0);
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 8: All dKV parts transferred\n", cta_idx);
             }
         }
@@ -914,7 +941,7 @@ __global__ void test_mla_bwd_kernel(
         TMEM::Allocator2Sm().free(plan.tmem_start_addr.data()[0], 512);
     }
     
-    if (tid == 0 && cta_idx == 0 && blockIdx.x == 0) {
+    if (tid == 0 && blockIdx.x < 2) {
         printf("[CTA %d] finish 16: TMEM freed, kernel completed\n", cta_idx);
     }
 
