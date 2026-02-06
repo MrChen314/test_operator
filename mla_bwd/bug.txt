@@ -1,101 +1,57 @@
-root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(171): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_device(device), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(173): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-            module->_forward_populate_default_args(std::move(arguments)));
-            ^
-
-Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-    module.attr(name) = wrapper_class;
-    ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(154): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                module.to(
-                ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(158): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                module.to(detail::py_object_to_dtype(object), non_blocking);
-                ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(171): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_device(device), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(173): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(
-                  ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(116): warning #177-D: variable "lane_idx" was declared but never referenced
-      const int lane_idx = threadIdx.x % 32;
-                ^
-
-ptxas fatal   : (C7602) Insufficient registers (128) to compile instruction at line 13311 in function _Z19test_mla_bwd_kernelPKN7cutlass10bfloat16_tES2_S2_PKfS2_PKiiiPS0_S7_S7_PfS8_S7_S7_S4_S8_. Try to compile with register target of 146 or higher.
-ptxas fatal   : Ptx assembly aborted due to errors
-ninja: build stopped: subcommand failed.
+Running CUDA kernel...
+finish -2: Computing delta...
+finish -1: Starting kernel launch from Python binding
+finish 0: Launching kernel...
+[CTA 0] finish 1: Kernel started
+[CTA 0] finish 2: TMEM allocated
+[WG2 CTA1] finish 1: WG2 started
+[WG3 CTA1] finish 1: TMEM tensors allocated
+[WG2 CTA0] finish 1: WG2 started
+[WG1 CTA1] finish 1: start loading Q from global memory
+[WG0 CTA1] finish 1: LSE loaded from global memory
+[WG3 CTA0] finish 1: TMEM tensors allocated
+[WG0 CTA0] finish 1: LSE loaded from global memory
+[WG1 CTA0] finish 1: start loading Q from global memory
+[WG1 CTA1] finish 2: Q loaded to SMEM (NoPE + RoPE)
+[WG1 CTA0] finish 2: Q loaded to SMEM (NoPE + RoPE)
+[WG1 CTA1] finish 3: KV loaded to SMEM
+[WG1 CTA0] finish 3: KV loaded to SMEM
+[WG1 CTA1] finish 4: dO loaded to SMEM
+[WG1 CTA0] finish 4: dO loaded to SMEM
+[WG0 CTA1] P is ready, computing softmax
+[WG3] finish 2: P computed (NoPE + RoPE)
+[WG0 CTA0] P is ready, computing softmax
+[WG1 CTA1] finish 5: Q written to global memory (NoPE + RoPE)
+[WG1 CTA0] finish 5: Q written to global memory (NoPE + RoPE)
+[WG3] finish 3: dP computed
+[WG0 CTA1] finish 2: P read from TMEM and written to global memory
+[WG1 CTA1] finish 6: KV written to global memory
+[WG0 CTA0] finish 2: P read from TMEM and written to global memory
+[WG1 CTA0] finish 6: KV written to global memory
+[WG0 CTA1] finish 3: P loaded from TMEM
+[WG0 CTA0] finish 3: P loaded from TMEM
+[WG1 CTA1] finish 7: dO written to global memory
+[WG1 CTA0] finish 7: dO written to global memory
+[WG0 CTA1] finish 5: softmax computed and s stored to SMEM
+[WG0 CTA0] finish 5: softmax computed and s stored to SMEM
+[WG0 CTA1] finish 6: s written to global memory
+[WG3 CTA1] finish 4: s and ds ready, starting dKV computation
+[WG0 CTA0] finish 6: s written to global memory
+[WG3 CTA0] finish 4: s and ds ready, starting dKV computation
+[WG0 CTA1] finish 7: delta loaded from global memory
+[WG0 CTA0] finish 7: delta loaded from global memory
+[WG0 CTA1] finish 8: dP is ready, computing ds
+[WG0 CTA0] finish 8: dP is ready, computing ds
+[WG0 CTA1] finish 9: dp loaded from TMEM
+[WG0 CTA0] finish 9: dp loaded from TMEM
+[WG0 CTA1] finish 10: ds computed and stored to SMEM
+[WG0 CTA0] finish 10: ds computed and stored to SMEM
+cudaLaunchKernelEx failed with error: an illegal memory access was encountered
 Traceback (most recent call last):
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
-    subprocess.run(
-  File "/usr/lib/python3.12/subprocess.py", line 571, in run
-    raise CalledProcessError(retcode, process.args,
-subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/setup.py", line 73, in <module>
-    setup(
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
-    return distutils.core.setup(**attrs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
-    return run_commands(dist)
-           ^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
-    dist.run_commands()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
-    self.run_command(cmd)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
-    super().run_command(command)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
-    cmd_obj.run()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
-    _build_ext.run(self)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
-    self.build_extensions()
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
-    build_ext.build_extensions(self)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
-    self._build_extensions_serial()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
-    self.build_extension(ext)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
-    _build_ext.build_extension(self, ext)
-  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
-    super().build_extension(ext)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
-    objects = self.compiler.compile(
-              ^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
-    _write_ninja_file_and_compile_objects(
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
-    _run_ninja_build(
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
-    raise RuntimeError(message) from e
-RuntimeError: Error compiling objects for extension
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 538, in <module>
+    passed = test_mla_bwd()
+             ^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 133, in test_mla_bwd
+    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA kernel launch failed: an illegal memory access was encountered
