@@ -239,7 +239,7 @@ static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
 
 // Kernel declaration (cluster dims specified at launch time)
 // Must be in global scope for CUDA kernel
-__global__ void __launch_bounds__(512, 1, 2) test_mla_bwd_kernel(
+__global__ void test_mla_bwd_kernel(
     const test_operator::mla_bwd::bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
     const test_operator::mla_bwd::bf16* __restrict__ kv,      // [B_TOPK, D_K] = [64, 576]
     const test_operator::mla_bwd::bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
