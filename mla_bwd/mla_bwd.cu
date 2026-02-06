@@ -84,7 +84,7 @@ __global__ void preprocess_delta_kernel(
 }
 
 // Kernel implementation: test mla_bwd with Q, KV, dO inputs
-__global__ void test_mla_bwd_kernel(
+__global__ void __launch_bounds__(512, 1, 2) test_mla_bwd_kernel(
     const bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
     const bf16* __restrict__ kv,     // [B_TOPK, D_K] = [64, 576]
     const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
