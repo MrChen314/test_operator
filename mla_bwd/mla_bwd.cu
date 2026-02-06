@@ -675,18 +675,13 @@ __global__ void test_mla_bwd_kernel(
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
             constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
-            uint32_t tmem_base_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
             float* dst = dKV + row * D_K + half * COLS_PER_HALF;
 
             // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
-                if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                    printf("[WG2 CTA%d] finish 3: dKV_part0 loaded from TMEM chunk %d\n", cta_idx, chunk);
-                }
                 float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
-                uint32_t tmem_addr = tmem_base_addr + chunk * CHUNK_SIZE;
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_addr, dkv_data);
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
 
@@ -721,15 +716,13 @@ __global__ void test_mla_bwd_kernel(
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
             constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
-            uint32_t tmem_base_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
             float* dst = dKV + row * D_K + 256 + half * COLS_PER_HALF;
 
             // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
                 float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
-                uint32_t tmem_addr = tmem_base_addr + chunk * CHUNK_SIZE;
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_addr, dkv_data);
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
 
@@ -763,9 +756,8 @@ __global__ void test_mla_bwd_kernel(
         // ---- Step 3.8: Transfer dKV_part2 to global memory (dims 512-575, RoPE) ----
         {
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;  // 32 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV_RoPE + half * ROPE_COLS_PER_HALF;
             float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];  // 16 float2 = 32 floats
-            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_addr, dkv_rope_data);
+            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
@@ -900,9 +892,9 @@ __global__ void test_mla_bwd_kernel(
             ku::tcgen05_after_thread_sync();
 
             // ---- Step 2.6: Compute dV[256:512] = s^T @ dO[:, 256:512] (clear) ----
-            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _1{}), tdKV, true);
+            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _1{}, _0{}), tdKV, true);
             // ---- Step 2.7: Compute dK[256:512] = ds^T @ Q[:, 256:512] (accumulate) ----
-            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _1{}), tdKV, false);
+            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _1{}, _0{}), tdKV, false);
 
             // ---- Step 2.8: Notify WG2 that dKV_part1 is ready ----
             ku::tcgen05_after_thread_sync();
