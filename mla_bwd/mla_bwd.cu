@@ -187,8 +187,8 @@ __global__ void test_mla_bwd_kernel(
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
         row_lse = __ldg(lse + global_row_idx);
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 1: LSE loaded from global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 1: LSE loaded from global memory\n", cta_idx);
         }
         
         const float sm_scale = 1.0f / sqrtf(576.0f);  // softmax scale
@@ -200,8 +200,8 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_p_ready.wait(0);
         ku::tcgen05_after_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] P is ready, computing softmax\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] P is ready, computing softmax\n", cta_idx);
         }
         {
             // P shape: [B_H, B_TOPK] = [128, 64]
@@ -234,8 +234,8 @@ __global__ void test_mla_bwd_kernel(
             }
             __threadfence_block();
 
-            if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-                printf("[WG0] finish 2: P read from TMEM and written to global memory\n");
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 2: P read from TMEM and written to global memory\n", cta_idx);
             }   
         }
         
@@ -250,8 +250,8 @@ __global__ void test_mla_bwd_kernel(
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 3: P loaded from TMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 3: P loaded from TMEM\n", cta_idx);
         }
 
         // plan.bar_k_valid_ready.wait(0);
@@ -300,7 +300,7 @@ __global__ void test_mla_bwd_kernel(
 
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 5: softmax computed and s stored to SMEM cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 5: softmax computed and s stored to SMEM\n", cta_idx);
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -321,7 +321,7 @@ __global__ void test_mla_bwd_kernel(
         
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 6: s written to global memory cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 6: s written to global memory\n", cta_idx);
         }
         
         // Step 6: Load delta from global memory
@@ -329,7 +329,7 @@ __global__ void test_mla_bwd_kernel(
         delta_val = __ldg(delta + global_row_idx);
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 7: delta loaded from global memory cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 7: delta loaded from global memory\n", cta_idx);
         }
         
         // Step 7: Wait for WG3 to compute dp
@@ -337,7 +337,7 @@ __global__ void test_mla_bwd_kernel(
         ku::tcgen05_after_thread_sync();
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 8: dP is ready, computing ds cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 8: dP is ready, computing ds\n", cta_idx);
         }
 
         // Read dP from TMEM and write to global memory
@@ -380,7 +380,7 @@ __global__ void test_mla_bwd_kernel(
         ku::tcgen05_before_thread_sync();
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 9: dp loaded from TMEM cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 9: dp loaded from TMEM\n", cta_idx);
         }
         
         // Step 9: Compute ds = s * (dp - delta) * sm_scale
@@ -419,7 +419,7 @@ __global__ void test_mla_bwd_kernel(
 
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 10: ds computed and stored to SMEM cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 10: ds computed and stored to SMEM\n", cta_idx);
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -439,7 +439,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_ds_ready.arrive(0u);
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0] finish 11: ds written to global memory cta_idx %d\n", cta_idx);
+            printf("[WG0 CTA%d] finish 11: ds written to global memory\n", cta_idx);
         }
     }
     
@@ -451,7 +451,7 @@ __global__ void test_mla_bwd_kernel(
         cutlass::arch::warpgroup_reg_dealloc<96>();
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 1: start loading Q from global memory cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 1: start loading Q from global memory\n", cta_idx);
         }
         
         // Load Q from Global Memory to SMEM (split into NoPE and RoPE)
@@ -495,7 +495,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 2: Q loaded to SMEM (NoPE + RoPE) cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 2: Q loaded to SMEM (NoPE + RoPE)\n", cta_idx);
         }
         
         // Load KV from Global Memory to SMEM (split into NoPE and RoPE)
@@ -532,7 +532,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 3: KV loaded to SMEM cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 3: KV loaded to SMEM\n", cta_idx);
         }
         
         // Load dO from Global Memory to SMEM
@@ -555,7 +555,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 4: dO loaded to SMEM cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 4: dO loaded to SMEM\n", cta_idx);
         }
 
         // Barrier: notify WG3 that q, k, dO are all loaded to SMEM
@@ -588,7 +588,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 5: Q written to global memory (NoPE + RoPE) cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 5: Q written to global memory (NoPE + RoPE)\n", cta_idx);
         }
         
         // Write KV from SMEM to kv_out (split into NoPE and RoPE)
@@ -617,7 +617,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 6: KV written to global memory cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 6: KV written to global memory\n", cta_idx);
         }
         
         // Write dO from SMEM to dO_out
@@ -635,7 +635,7 @@ __global__ void test_mla_bwd_kernel(
         }
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG1] finish 7: dO written to global memory cta_idx %d\n", cta_idx);
+            printf("[WG1 CTA%d] finish 7: dO written to global memory\n", cta_idx);
         }
     }
     
@@ -652,7 +652,7 @@ __global__ void test_mla_bwd_kernel(
         uint32_t tmem_base_wg2 = plan.tmem_start_addr.data()[0];
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2] finish 1: WG2 started cta_idx %d\n", cta_idx);
+            printf("[WG2 CTA%d] finish 1: WG2 started\n", cta_idx);
         }
 
         // ---- Step 3.1: Wait for WG3 to compute dKV_part0 ----
@@ -691,7 +691,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part0_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2] finish 2: dKV_part0 transferred cta_idx %d\n", cta_idx);
+            printf("[WG2 CTA%d] finish 2: dKV_part0 transferred\n", cta_idx);
         }
 
         // ---- Step 3.4: Wait for WG3 to compute dKV_part1 ----
@@ -730,7 +730,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part1_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2] finish 3: dKV_part1 transferred cta_idx %d\n", cta_idx);
+            printf("[WG2 CTA%d] finish 3: dKV_part1 transferred\n", cta_idx);
         }
 
         // ---- Step 3.7: Wait for WG3 to compute dKV_part2 ----
@@ -762,7 +762,7 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_dkv_part2_done.arrive(0u);
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG2] finish 4: dKV_part2 (RoPE) transferred, all done cta_idx %d\n", cta_idx);
+            printf("[WG2 CTA%d] finish 4: dKV_part2 (RoPE) transferred, all done\n", cta_idx);
         }
     }
 
@@ -790,7 +790,7 @@ __global__ void test_mla_bwd_kernel(
         tdKV_RoPE.data().get() = tmem_cols::dKV_RoPE;
 
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG3] finish 1: TMEM tensors allocated cta_idx %d\n", cta_idx);
+            printf("[WG3 CTA%d] finish 1: TMEM tensors allocated\n", cta_idx);
         }
 
         // Extract V from memory: V uses the same layout as K_NoPE
