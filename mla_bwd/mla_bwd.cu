@@ -100,7 +100,8 @@ __global__ void test_mla_bwd_kernel(
     float* __restrict__ dP,           // [B_H, B_TOPK] = [128, 64] (dP = dO @ V^T)
     bf16* __restrict__ s,            // [B_H, B_TOPK] = [128, 64] (softmax values)
     bf16* __restrict__ ds,           // [B_H, B_TOPK] = [128, 64] (dS gradients)
-    const float* __restrict__ delta   // [B_H] = [128] (delta = sum(O * dO))
+    const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
+    float* __restrict__ dKV           // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
     // Use cute namespace inside kernel to avoid conflicts with PyTorch's at::Layout
@@ -123,6 +124,7 @@ __global__ void test_mla_bwd_kernel(
     const int idx_in_warpgroup = tid % 128;
     const bool is_wg0 = (warpgroup_idx == 0);
     const bool is_wg1 = (warpgroup_idx == 1);
+    const bool is_wg2 = (warpgroup_idx == 2);
     const bool is_wg3 = (warpgroup_idx == 3);
     
     if (tid == 0 && cta_idx == 0 && blockIdx.x == 0) {
@@ -149,6 +151,13 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_ds_ready.init(128*2);       // WG0通知WG3 ds已准备好 (2CTA sync)
         plan.bar_k_valid_free.init(128);
         plan.bar_k_valid_ready.init(8);
+        // WG3-WG2 barriers for dKV computation
+        plan.bar_dkv_part0_ready.init(1);
+        plan.bar_dkv_part1_ready.init(1);
+        plan.bar_dkv_part2_ready.init(1);
+        plan.bar_dkv_part0_done.init(128*2);
+        plan.bar_dkv_part1_done.init(128*2);
+        plan.bar_dkv_part2_done.init(128*2);
         fence_barrier_init();
     }
     
@@ -401,8 +410,10 @@ __global__ void test_mla_bwd_kernel(
         int ds_col_offset = (idx_in_warpgroup / 64) * 32;
         CUTE_UNROLL
         for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-            sDS(idx_in_warpgroup%64, i*2+ds_col_offset) = bf16(ds_fp32[i].x);
-            sDS(idx_in_warpgroup%64, i*2+1+ds_col_offset) = bf16(ds_fp32[i].y);
+            // sDS(idx_in_warpgroup%64, i*2+ds_col_offset) = bf16(ds_fp32[i].x);
+            // sDS(idx_in_warpgroup%64, i*2+1+ds_col_offset) = bf16(ds_fp32[i].y);
+            sDS(i*2+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].x);
+            sDS(i*2+1+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].y);
         }
         fence_view_async_shared();
 
@@ -420,7 +431,7 @@ __global__ void test_mla_bwd_kernel(
         if (idx_in_warpgroup < B_H/2) {
             const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup;
             for (int col = 0; col < B_TOPK; ++col) {
-                ds[global_row_idx * B_TOPK + col] = sDS(idx_in_warpgroup, col);
+                ds[global_row_idx * B_TOPK + col] = sDS(col, idx_in_warpgroup);
             }
         }
         
@@ -630,19 +641,139 @@ __global__ void test_mla_bwd_kernel(
     
 
     // ========================================
+    // Warpgroup 2: dKV Transfer (WG2)
+    // Responsibility: Read dKV from TMEM and atomicAdd to global memory
+    // ========================================
+    if (is_wg2) {
+        cutlass::arch::warpgroup_reg_alloc<144>();
+
+        const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
+        const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
+        uint32_t tmem_base_wg2 = plan.tmem_start_addr.data()[0];
+
+        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+            printf("[WG2] finish 1: WG2 started\n");
+        }
+
+        // ---- Step 3.1: Wait for WG3 to compute dKV_part0 ----
+        plan.bar_dkv_part0_ready.wait(0);
+        ku::tcgen05_after_thread_sync();
+
+        // ---- Step 3.2: Transfer dKV_part0 to global memory (dims 0-255) ----
+        {
+            constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
+            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
+            float2 dkv_data[COLS_PER_HALF / 2];  // 64 float2 = 128 floats
+            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
+
+            // atom.add.v4: atomically add to global memory
+            float* dst = dKV + row * D_K + half * COLS_PER_HALF;
+            float* src = (float*)dkv_data;
+            CUTE_UNROLL
+            for (int i = 0; i < COLS_PER_HALF; i += 4) {
+                atomicAdd(dst + i,     src[i]);
+                atomicAdd(dst + i + 1, src[i + 1]);
+                atomicAdd(dst + i + 2, src[i + 2]);
+                atomicAdd(dst + i + 3, src[i + 3]);
+            }
+        }
+
+        // ---- Step 3.3: Notify WG3 that dKV_part0 transfer is done ----
+        plan.bar_dkv_part0_done.arrive(0u);
+
+        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+            printf("[WG2] finish 2: dKV_part0 transferred\n");
+        }
+
+        // ---- Step 3.4: Wait for WG3 to compute dKV_part1 ----
+        plan.bar_dkv_part1_ready.wait(0);
+        ku::tcgen05_after_thread_sync();
+
+        // ---- Step 3.5: Transfer dKV_part1 to global memory (dims 256-511) ----
+        {
+            constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
+            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
+            float2 dkv_data[COLS_PER_HALF / 2];
+            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
+
+            // atom.add.v4: atomically add to global memory (offset by 256 for part1)
+            float* dst = dKV + row * D_K + 256 + half * COLS_PER_HALF;
+            float* src = (float*)dkv_data;
+            CUTE_UNROLL
+            for (int i = 0; i < COLS_PER_HALF; i += 4) {
+                atomicAdd(dst + i,     src[i]);
+                atomicAdd(dst + i + 1, src[i + 1]);
+                atomicAdd(dst + i + 2, src[i + 2]);
+                atomicAdd(dst + i + 3, src[i + 3]);
+            }
+        }
+
+        // ---- Step 3.6: Notify WG3 that dKV_part1 transfer is done ----
+        plan.bar_dkv_part1_done.arrive(0u);
+
+        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+            printf("[WG2] finish 3: dKV_part1 transferred\n");
+        }
+
+        // ---- Step 3.7: Wait for WG3 to compute dKV_part2 ----
+        plan.bar_dkv_part2_ready.wait(0);
+        ku::tcgen05_after_thread_sync();
+
+        // ---- Step 3.8: Transfer dKV_part2 to global memory (dims 512-575, RoPE) ----
+        {
+            constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;  // 32 float values per half
+            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV_RoPE + half * ROPE_COLS_PER_HALF;
+            float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];  // 16 float2 = 32 floats
+            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_addr, dkv_rope_data);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
+
+            // atom.add.v4: atomically add to global memory (offset by D_V=512 for RoPE part)
+            float* dst = dKV + row * D_K + D_V + half * ROPE_COLS_PER_HALF;
+            float* src = (float*)dkv_rope_data;
+            CUTE_UNROLL
+            for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
+                atomicAdd(dst + i,     src[i]);
+                atomicAdd(dst + i + 1, src[i + 1]);
+                atomicAdd(dst + i + 2, src[i + 2]);
+                atomicAdd(dst + i + 3, src[i + 3]);
+            }
+        }
+
+        // ---- Step 3.9: Notify WG3 that dKV_part2 transfer is done ----
+        plan.bar_dkv_part2_done.arrive(0u);
+
+        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
+            printf("[WG2] finish 4: dKV_part2 (RoPE) transferred, all done\n");
+        }
+    }
+
+    // ========================================
     // Warpgroup 3: Matrix Multiplication (WG3)
-    // Responsibility: Compute P and dP
+    // Responsibility: Compute P, dP, and dKV
     // ========================================
     if (is_wg3) {
         cutlass::arch::warpgroup_reg_alloc<144>();
         
-        // Allocate TMEM tensors
+        // Allocate TMEM tensors for P and dP
         TiledMMA_P tiled_mma_P{};
         TiledMMA_dP tiled_mma_dP{};
         Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H/2>, Int<B_TOPK>>{});
         Tensor tdP = partition_fragment_C(tiled_mma_dP, Shape<Int<B_H/2>, Int<B_TOPK>>{});
         tP.data().get() = tmem_cols::P;
         tdP.data().get() = tmem_cols::dP;
+
+        // Allocate TMEM tensors for dKV
+        TiledMMA_dKV tiled_mma_dKV{};
+        TiledMMA_dKV_RoPE tiled_mma_dKV_RoPE{};
+        Tensor tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<256>>{});
+        tdKV.data().get() = tmem_cols::dKV;
+        Tensor tdKV_RoPE = partition_fragment_C(tiled_mma_dKV_RoPE, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
+        tdKV_RoPE.data().get() = tmem_cols::dKV_RoPE;
 
         if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
             printf("[WG3] finish 1: TMEM tensors allocated\n");
@@ -651,20 +782,14 @@ __global__ void test_mla_bwd_kernel(
         // Extract V from memory: V uses the same layout as K_NoPE
         Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutV{});
 
-        // Compute P and dP using MMA operations
-        // Reference: phase1.cuh uses warp_idx == 8 for WG3
-        // For 4 warpgroups (512 threads total), WG3's first warp has warp_idx = 12 (threads 384-415)
-        // But phase1.cuh uses 512 threads with different warpgroup layout, so we use warp_idx == 12
+        // ---- Phase 1: 2x1SM MMA for P and dP (CTA0 only) ----
         if (cta_idx == 0 && warp_idx == 12 && elect_one_sync()) {
             // Wait for WG1 to load q, k, dO to SMEM
             plan.bar_qkv_loaded.wait(0);
             ku::tcgen05_after_thread_sync();
             
             // Compute P = Q @ K^T using TiledMMA_P
-            // First compute NoPE part: P += Q_NoPE @ K_NoPE^T (clear accumulator)
             ku::utcmma_ss(tiled_mma_P, sQNoPE, sKNoPE, tP, true);  // clear_accum = true
-            
-            // Then compute RoPE part: P += Q_RoPE @ K_RoPE^T (accumulate, don't clear)
             ku::utcmma_ss(tiled_mma_P, sQRoPE, sKRoPE, tP, false);  // clear_accum = false
             ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_p_ready, 1|2);
             
@@ -683,43 +808,87 @@ __global__ void test_mla_bwd_kernel(
             }
 
             ku::tcgen05_after_thread_sync();
+        }
 
-            // Wait for WG0 to compute s (needed for later computations)
+        // ---- Phase 2: WS MMA for dKV (both CTAs) ----
+        if (warp_idx == 12 && elect_one_sync()) {
+            // Wait for WG0 to compute s
             plan.bar_s_ready.wait(0);
 
+            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+                printf("[WG3 CTA%d] finish 4: s and ds ready, starting dKV computation\n", cta_idx);
+            }
+
+            // S and dS tensors for MMA A operand
+            Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
+            Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
+
+            // dO transposed: full [D_V, B_H/2] = [512, 64], then flat_divide into [256, 64] tiles
+            Tensor sdO_t_full = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutQTilesTransposed<D_V/64>{});
+            auto sdO_t_div = flat_divide(sdO_t_full, Shape<Int<256>, Int<B_H/2>>{});
+
+            // Q NoPE transposed: full [D_V, B_H/2] = [512, 64], then flat_divide into [256, 64] tiles
+            Tensor sQ_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.q_nope.data()), SmemLayoutQTilesTransposed<D_V/64>{});
+            auto sQ_t_div = flat_divide(sQ_t_full, Shape<Int<256>, Int<B_H/2>>{});
+
+            // Q RoPE transposed: [D_ROPE, B_H/2] = [64, 64]
+            Tensor sQ_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPETransposed{});
+
+            // ---- Step 2.2: Compute dV[0:256] = s^T @ dO[:, 0:256] (clear) ----
+            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _0{}), tdKV, true);
 
             // Wait for WG0 to compute ds
             plan.bar_ds_ready.wait(0);
+            // ---- Step 2.3: Compute dK[0:256] = ds^T @ Q[:, 0:256] (accumulate) ----
+            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _0{}), tdKV, false);
+            
+            // ---- Step 2.4: Notify WG2 that dKV_part0 is ready ----
+            ku::tcgen05_after_thread_sync();
+            plan.bar_dkv_part0_ready.arrive(0u);
 
-        } 
-        // else if (warp_idx == 13) {
-        //     // KV valid loading warp
-        //     // Note: B_TOPK is 64 for this test, but the mask logic supports it
-        //     if (lane_idx < 8) {
-        //         // CUTE_NO_UNROLL
-        //         // for (int k = 0; k < num_k_blocks; ++k) {
-        //         // int cur_buf = k%NUM_BUFS;
-        //         int32x8_t indices = ldg_256_indices(gIndices + lane_idx*8);
-        //         auto is_valid = [&](int rel_pos_in_lane, int index) -> char {
-        //             int abs_pos = lane_idx*8 + rel_pos_in_lane;
-        //             return index >= 0 && index < s_kv && abs_pos < topk_length;
-        //         };
-        //         char is_ks_valid_mask = \
-        //             is_valid(7, indices.a7) << 7 | 
-        //             is_valid(6, indices.a6) << 6 | 
-        //             is_valid(5, indices.a5) << 5 |
-        //             is_valid(4, indices.a4) << 4 |
-        //             is_valid(3, indices.a3) << 3 |
-        //             is_valid(2, indices.a2) << 2 |
-        //             is_valid(1, indices.a1) << 1 |
-        //             is_valid(0, indices.a0) << 0;
+            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+                printf("[WG3 CTA%d] finish 5: dKV_part0 computed, waiting for WG2 transfer\n", cta_idx);
+            }
 
-        //         // plan.bar_k_valid_free.wait(0);
-        //         plan.is_k_valid[lane_idx] = is_ks_valid_mask;
-        //         plan.bar_k_valid_ready.arrive();
-        //         // }
-        //     }
-        // }
+            // ---- Step 2.5: Wait for WG2 to finish dKV_part0 transfer ----
+            plan.bar_dkv_part0_done.wait(0);
+            ku::tcgen05_after_thread_sync();
+
+            // ---- Step 2.6: Compute dV[256:512] = s^T @ dO[:, 256:512] (clear) ----
+            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _1{}), tdKV, true);
+            // ---- Step 2.7: Compute dK[256:512] = ds^T @ Q[:, 256:512] (accumulate) ----
+            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _1{}), tdKV, false);
+
+            // ---- Step 2.8: Notify WG2 that dKV_part1 is ready ----
+            ku::tcgen05_after_thread_sync();
+            plan.bar_dkv_part1_ready.arrive(0u);
+
+            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+                printf("[WG3 CTA%d] finish 6: dKV_part1 computed, waiting for WG2 transfer\n", cta_idx);
+            }
+
+            // ---- Step 2.9: Wait for WG2 to finish dKV_part1 transfer ----
+            plan.bar_dkv_part1_done.wait(0);
+            ku::tcgen05_after_thread_sync();
+
+            // ---- Step 2.10: Compute dK_rope = ds^T @ Q_rope (clear) ----
+            ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQ_rope_t, tdKV_RoPE, true);
+
+            // ---- Step 2.11: Notify WG2 that dKV_part2 is ready ----
+            ku::tcgen05_after_thread_sync();
+            plan.bar_dkv_part2_ready.arrive(0u);
+
+            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+                printf("[WG3 CTA%d] finish 7: dKV_part2 (RoPE) computed, waiting for WG2 transfer\n", cta_idx);
+            }
+
+            // ---- Step 2.12: Wait for WG2 to finish dKV_part2 transfer ----
+            plan.bar_dkv_part2_done.wait(0);
+
+            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+                printf("[WG3 CTA%d] finish 8: All dKV parts transferred\n", cta_idx);
+            }
+        }
     }
 
     // All threads must sync before proceeding
@@ -775,6 +944,7 @@ void launch_test_mla_bwd(
     bf16* s,
     bf16* ds,
     const float* delta,
+    float* dKV,
     cudaStream_t stream
 ) {
     dim3 grid(2, 1, 1);  // 2 CTAs
@@ -809,7 +979,7 @@ void launch_test_mla_bwd(
     
     printf("finish 0: Launching kernel...\n");
     cudaError_t err = cudaLaunchKernelEx(&config, test_mla_bwd_kernel, 
-        q, kv, dO, lse, O, gIndices, s_kv, topk_length, q_out, kv_out, dO_out, P, dP, s, ds, delta);
+        q, kv, dO, lse, O, gIndices, s_kv, topk_length, q_out, kv_out, dO_out, P, dP, s, ds, delta, dKV);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
         return;
@@ -818,7 +988,7 @@ void launch_test_mla_bwd(
 }
 
 // Python binding
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mla_bwd_forward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mla_bwd_forward(
     torch::Tensor q, torch::Tensor kv, torch::Tensor dO, torch::Tensor lse, torch::Tensor O, torch::Tensor indices) {
     // Check inputs
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
@@ -868,6 +1038,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor s = torch::empty({B_H, B_TOPK}, options_bf16);
     torch::Tensor ds = torch::empty({B_H, B_TOPK}, options_bf16);
     torch::Tensor delta = torch::empty({B_H}, options_f32);
+    // dKV initialized to zeros for atomic add accumulation
+    torch::Tensor dKV = torch::zeros({B_TOPK, D_K}, options_f32);
     
     // Get data pointers
     const bf16* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr<at::BFloat16>());
@@ -884,6 +1056,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     bf16* s_ptr = reinterpret_cast<bf16*>(s.data_ptr<at::BFloat16>());
     bf16* ds_ptr = reinterpret_cast<bf16*>(ds.data_ptr<at::BFloat16>());
     float* delta_ptr = delta.data_ptr<float>();
+    float* dKV_ptr = dKV.data_ptr<float>();
     
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -905,7 +1078,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // Call kernel
     printf("finish -1: Starting kernel launch from Python binding\n");
     launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv, topk_length,
-        q_out_ptr, kv_out_ptr, dO_out_ptr, P_ptr, dP_ptr, s_ptr, ds_ptr, delta_ptr, stream);
+        q_out_ptr, kv_out_ptr, dO_out_ptr, P_ptr, dP_ptr, s_ptr, ds_ptr, delta_ptr, dKV_ptr, stream);
     
     // Synchronize and wait for kernel completion
     err = cudaStreamSynchronize(stream);
@@ -914,10 +1087,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }
     printf("finish 18: Kernel execution completed and synchronized\n");
     
-    return std::make_tuple(q_out, kv_out, dO_out, P, dP, s, ds);
+    return std::make_tuple(q_out, kv_out, dO_out, P, dP, s, ds, dKV);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_bwd", &mla_bwd_forward, 
-          "Test mla_bwd kernel (CUDA). Returns (q_out, kv_out, dO_out, P, dP, s, ds)");
+          "Test mla_bwd kernel (CUDA). Returns (q_out, kv_out, dO_out, P, dP, s, ds, dKV)");
 }

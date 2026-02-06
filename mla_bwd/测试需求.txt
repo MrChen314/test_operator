@@ -67,23 +67,66 @@
 
 
 要求3：
-1.kernel新增输入、输出、barrier
-    输入：
-    输出：dKV、dQ
+1.kernel新增输出、barrier
+    输出：dKV
     barrier：
-2.WG3等待WG0计算好ds
-3.WG3使用TiledMMA_dKV计算dV前256维
-    矩阵A：plan.s_ds.s，使用
-    矩阵B：plan.dO，使用
-    矩阵C：tmem_cols.P
-    注意：对tmem_cols.P执行clear_accum
-
-计算dKV_part0: dK_nope = ds^T @ q(0-255维)
-    指令：utcmma_ss
-    输入1：SharedMemoryPlan.ds
-    输入2：SharedMemoryPlan.u.q_kv.q(0-255维)
-    输出：tmem_cols.dKV
-    输出shape：[128, 256]
-    形式：累加
+        WG3通知WG2：dKV_part0计算完成
+        WG3通知WG2：dKV_part1计算完成
+        WG3通知WG2：dKV_part2计算完成
+        WG2通知WG3：dKV_part0传输完成
+        WG2通知WG3：dKV_part1传输完成
+        WG2通知WG3：dKV_part2传输完成
+2.WG3新增流程
+    2.1等待WG0计算好ds
+    2.2WG3使用TiledMMA_dKV计算dV前256维
+        矩阵A：plan.s_ds.s，使用SmemLayoutS
+        矩阵B：plan.dO，使用SmemLayoutdOTransposed，使用flat_divide切tile[64, 256]，使用第0个分片
+        矩阵C：tmem_cols.dKV
+        注意：对tmem_cols.dKV执行clear_accum
+    2.3WG3使用TiledMMA_dKV计算dK前256维
+        矩阵A：plan.s_ds.ds，使用SmemLayoutdS
+        矩阵B：plan.u.q_kv.q，使用SmemLayoutQNoPETransposed，使用flat_divide切tile[64, 256]，使用第0个分片
+        矩阵C：tmem_cols.dKV
+        注意：对tmem_cols.dKV执行累加
+    2.4WG3通知WG2：dKV_part0计算完成
+    2.5等待WG2传输完dKV_part0
+    2.6使用TiledMMA_dKV计算dV后256维
+        矩阵A：plan.s_ds.s，使用SmemLayoutS
+        矩阵B：plan.dO，使用SmemLayoutdOTransposed，使用flat_divide切tile[64, 256]，使用第1个分片
+        矩阵C：tmem_cols.dKV
+        注意：对tmem_cols.dKV执行clear_accum
+    2.7使用TiledMMA_dKV计算dK后256维
+        矩阵A：plan.s_ds.ds，使用SmemLayoutdS
+        矩阵B：plan.u.q_kv.q，使用SmemLayoutQNoPETransposed，使用flat_divide切tile[64, 256]，使用第1个分片
+        矩阵C：tmem_cols.dKV
+        注意：对tmem_cols.dKV执行累加
+    2.8WG3通知WG2：dKV_part1计算完成
+    2.9等待WG2传输完dKV_part1
+    2.10使用TiledMMA_dKV_RoPE计算dK_rope
+        矩阵A：plan.s_ds.ds，使用SmemLayoutdS
+        矩阵B：plan.u.q_kv.q_rope，使用SmemLayoutQRoPETransposed
+        矩阵C：tmem_cols.dKV_RoPE
+        注意：对tmem_cols.dKV_RoPE执行clear_accum
+    2.11WG3通知WG2：dKV_part2计算完成
+    2.12等待WG2传输完dKV_part2
+3.新增WG2
+    3.1等待WG3计算好dKV_part0
+    3.2进行dKV_part0到全局内存的传输(0-255维)
+        指令：atom.add.v4
+        数据：读取tmem_cols.dKV
+    3.3告知WG3信息：dKV_part0已经传输完成
+    3.4等待WG3计算好dKV_part1
+    3.5进行dKV_part1到全局内存的传输(256-511维)
+        指令：atom.add.v4
+        数据：读取tmem_cols.dKV
+    3.6告知WG3信息：dKV_part1已经传输完成
+    3.7等待WG3计算好dKV_part2
+    3.8进行dKV_part2到全局内存的传输(512-575维)
+        指令：atom.add.v4
+        数据：读取tmem_cols.dKV_RoPE
+    3.9告知WG3信息：dKV_part2已经传输完成
+4.test_mla_bwd.py添加精度测试
+    4.1torch_ref计算dKV_ref，计算流程可参考/Users/chenql/Desktop/workspace/operator/tilelang/examples/deepseek_v32/sparse_mla_bwd.py
+    4.2对比dKV_cuda和dKV_ref
 
 注：所有生成的文件都在/test_operator/mla_bwd 目录下

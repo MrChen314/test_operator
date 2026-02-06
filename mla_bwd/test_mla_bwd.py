@@ -105,9 +105,32 @@ def test_mla_bwd():
     print(f"ds_ref shape: {ds_ref.shape}, dtype: {ds_ref.dtype}")
     print()
     
+    # PyTorch reference: Compute dKV
+    # dKV = dV + dK_nope (for dims 0:D_V) + dK_rope (for dims D_V:D_Q)
+    # dV = s_bf16^T @ dO (softmax weights transposed times dO)
+    # dK_nope = ds_bf16^T @ Q_nope (dS transposed times Q NoPE part)
+    # dK_rope = ds_bf16^T @ Q_rope (dS transposed times Q RoPE part)
+    D_ROPE = D_Q - D_V  # 64
+    s_bf16 = s_ref.to(torch.bfloat16)
+    ds_bf16 = ds_ref.to(torch.bfloat16)
+    
+    # dV = s^T @ dO: [B_TOPK, B_H] @ [B_H, D_V] = [B_TOPK, D_V]
+    dV_ref = torch.matmul(s_bf16.float().T, dO.float())
+    # dK_nope = ds^T @ Q[:, :D_V]: [B_TOPK, B_H] @ [B_H, D_V] = [B_TOPK, D_V]
+    dK_nope_ref = torch.matmul(ds_bf16.float().T, q[:, :D_V].float())
+    # dK_rope = ds^T @ Q[:, D_V:]: [B_TOPK, B_H] @ [B_H, D_ROPE] = [B_TOPK, D_ROPE]
+    dK_rope_ref = torch.matmul(ds_bf16.float().T, q[:, D_V:].float())
+    
+    # dKV_nope = dV + dK_nope (V and K share the first D_V dimensions)
+    dKV_nope_ref = dV_ref + dK_nope_ref  # [B_TOPK, D_V]
+    # dKV = concat(dKV_nope, dK_rope)
+    dKV_ref = torch.cat([dKV_nope_ref, dK_rope_ref], dim=-1)  # [B_TOPK, D_K]
+    print(f"dKV_ref shape: {dKV_ref.shape}, dtype: {dKV_ref.dtype}")
+    print()
+    
     # CUDA kernel computation
     print("Running CUDA kernel...")
-    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
     torch.cuda.synchronize()
     print(f"q_out shape: {q_out.shape}, dtype: {q_out.dtype}")
     print(f"kv_out shape: {kv_out.shape}, dtype: {kv_out.dtype}")
@@ -116,6 +139,7 @@ def test_mla_bwd():
     print(f"dP_cuda shape: {dP_cuda.shape}, dtype: {dP_cuda.dtype}")
     print(f"s_cuda shape: {s_cuda.shape}, dtype: {s_cuda.dtype}")
     print(f"ds_cuda shape: {ds_cuda.shape}, dtype: {ds_cuda.dtype}")
+    print(f"dKV_cuda shape: {dKV_cuda.shape}, dtype: {dKV_cuda.dtype}")
     print()
     
     # Precision validation: compare CUDA result with PyTorch result
@@ -171,6 +195,24 @@ def test_mla_bwd():
     print(f"  Max relative diff:     {ds_relative_diff:.6e}")
     print()
     
+    # Compare dKV
+    dKV_diff = (dKV_cuda - dKV_ref).abs()
+    dKV_max_diff = dKV_diff.max().item()
+    dKV_mean_diff = dKV_diff.mean().item()
+    dKV_relative_diff = (dKV_diff / (dKV_ref.abs() + 1e-8)).max().item()
+    
+    print(f"dKV_cuda vs dKV_ref (PyTorch):")
+    print(f"  Max absolute diff:     {dKV_max_diff:.6e}")
+    print(f"  Mean absolute diff:    {dKV_mean_diff:.6e}")
+    print(f"  Max relative diff:     {dKV_relative_diff:.6e}")
+    
+    # Breakdown: NoPE part vs RoPE part
+    dKV_nope_diff = (dKV_cuda[:, :D_V] - dKV_ref[:, :D_V]).abs()
+    dKV_rope_diff = (dKV_cuda[:, D_V:] - dKV_ref[:, D_V:]).abs()
+    print(f"  dKV NoPE max diff:     {dKV_nope_diff.max().item():.6e}")
+    print(f"  dKV RoPE max diff:     {dKV_rope_diff.max().item():.6e}")
+    print()
+    
     # Print sample results for debugging
     print("Sample P_cuda vs P_ref (first 5x5 block):")
     print("P_cuda:")
@@ -206,6 +248,24 @@ def test_mla_bwd():
     print(ds_ref[:5, :5])
     print("Difference:")
     print(ds_diff[:5, :5])
+    print()
+    
+    print("Sample dKV_cuda vs dKV_ref (first 5x5 block):")
+    print("dKV_cuda:")
+    print(dKV_cuda[:5, :5])
+    print("dKV_ref (PyTorch):")
+    print(dKV_ref[:5, :5])
+    print("Difference:")
+    print(dKV_diff[:5, :5])
+    print()
+    
+    print("Sample dKV RoPE (dims 512-575, first 5x5 block):")
+    print("dKV_cuda RoPE:")
+    print(dKV_cuda[:5, D_V:D_V+5])
+    print("dKV_ref RoPE:")
+    print(dKV_ref[:5, D_V:D_V+5])
+    print("Difference:")
+    print(dKV_rope_diff[:5, :5])
     print()
     
     # Q, KV, dO precision validation
@@ -286,6 +346,9 @@ def test_mla_bwd():
     qkv_max_diff_threshold = 1e-5  # Maximum allowed absolute error for Q/KV/dO
     qkv_relative_diff_threshold = 1e-4  # Maximum allowed relative error for Q/KV/dO
     
+    dKV_max_diff_threshold = 1e-1  # dKV uses atomic add with bf16 intermediate, allow more error
+    dKV_relative_diff_threshold = 5e-1
+    
     P_test_passed = P_max_diff < max_diff_threshold and P_relative_diff < relative_diff_threshold
     dP_test_passed = dP_max_diff < max_diff_threshold and dP_relative_diff < relative_diff_threshold
     s_test_passed = s_max_diff < max_diff_threshold and s_relative_diff < relative_diff_threshold
@@ -293,8 +356,9 @@ def test_mla_bwd():
     q_test_passed = q_max_diff < qkv_max_diff_threshold and q_relative_diff < qkv_relative_diff_threshold
     kv_test_passed = kv_max_diff < qkv_max_diff_threshold and kv_relative_diff < qkv_relative_diff_threshold
     dO_test_passed = dO_max_diff < qkv_max_diff_threshold and dO_relative_diff < qkv_relative_diff_threshold
+    dKV_test_passed = dKV_max_diff < dKV_max_diff_threshold and dKV_relative_diff < dKV_relative_diff_threshold
     
-    all_passed = P_test_passed and dP_test_passed and s_test_passed and ds_test_passed and q_test_passed and kv_test_passed and dO_test_passed
+    all_passed = P_test_passed and dP_test_passed and s_test_passed and ds_test_passed and q_test_passed and kv_test_passed and dO_test_passed and dKV_test_passed
     
     if P_test_passed:
         print(f"✓ P matrix multiplication test PASSED!")
@@ -359,6 +423,15 @@ def test_mla_bwd():
         print(f"  (max_diff={dO_max_diff:.6e} >= {qkv_max_diff_threshold} or "
               f"relative_diff={dO_relative_diff:.6e} >= {qkv_relative_diff_threshold})")
     
+    if dKV_test_passed:
+        print(f"✓ dKV gradient test PASSED!")
+        print(f"  (max_diff={dKV_max_diff:.6e} < {dKV_max_diff_threshold}, "
+              f"relative_diff={dKV_relative_diff:.6e} < {dKV_relative_diff_threshold})")
+    else:
+        print(f"✗ dKV gradient test FAILED!")
+        print(f"  (max_diff={dKV_max_diff:.6e} >= {dKV_max_diff_threshold} or "
+              f"relative_diff={dKV_relative_diff:.6e} >= {dKV_relative_diff_threshold})")
+    
     return all_passed
 
 
@@ -415,7 +488,7 @@ def test_different_inputs():
             O = torch.randn(B_H, D_V, dtype=torch.bfloat16, device='cuda')
             
             # CUDA kernel
-            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
             
             P_max_diff = (P_cuda - P_ref).abs().max().item()
             P_relative_diff = ((P_cuda - P_ref).abs() / (P_ref.abs() + 1e-8)).max().item()
@@ -446,6 +519,7 @@ def test_different_inputs():
             print(f"    q: max_diff={q_max_diff:.6e}")
             print(f"    kv: max_diff={kv_max_diff:.6e}")
             print(f"    dO: max_diff={dO_max_diff:.6e}")
+            print(f"    dKV: max_diff={dKV_cuda.abs().max().item():.6e}")
             
             if not test_ok:
                 all_passed = False

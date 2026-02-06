@@ -96,6 +96,14 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+using SmemLayoutdS = SmemLayoutS;
+
+using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_INTER_Atom<bf16>{},
+    Shape<Int<B_H/2>, Int<B_TOPK>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
 // ============================================================================
 // TiledMMA 定义 (2CTA 模式)
 // ============================================================================
@@ -207,6 +215,13 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_ds_ready;                 // WG0通知WG3 ds已准备好 (2CTA sync)
     transac_bar_t bar_k_valid_free;             
     transac_bar_t bar_k_valid_ready;            // WG3通知WG0 k有效性掩码已加载到SMEM
+    // WG3-WG2 同步屏障 (dKV computation)
+    transac_bar_t bar_dkv_part0_ready;          // WG3通知WG2 dKV_part0计算完成
+    transac_bar_t bar_dkv_part1_ready;          // WG3通知WG2 dKV_part1计算完成
+    transac_bar_t bar_dkv_part2_ready;          // WG3通知WG2 dKV_part2计算完成
+    transac_bar_t bar_dkv_part0_done;           // WG2通知WG3 dKV_part0传输完成
+    transac_bar_t bar_dkv_part1_done;           // WG2通知WG3 dKV_part1传输完成
+    transac_bar_t bar_dkv_part2_done;           // WG2通知WG3 dKV_part2传输完成
 
     // TMEM 起始地址
     array_aligned<uint32_t, 1> tmem_start_addr;
@@ -240,7 +255,8 @@ __global__ void test_mla_bwd_kernel(
     float* __restrict__ dP,           // [B_H, B_TOPK] = [128, 64] (dP = dO @ V^T)
     test_operator::mla_bwd::bf16* __restrict__ s,           // [B_H, B_TOPK] = [128, 64] (softmax values)
     test_operator::mla_bwd::bf16* __restrict__ ds,           // [B_H, B_TOPK] = [128, 64] (dS gradients)
-    const float* __restrict__ delta   // [B_H] = [128] (delta = sum(O * dO))
+    const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
+    float* __restrict__ dKV           // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
 );
 
 // C++ wrapper declaration
@@ -261,5 +277,6 @@ void launch_test_mla_bwd(
     test_operator::mla_bwd::bf16* s,
     test_operator::mla_bwd::bf16* ds,
     const float* delta,
+    float* dKV,
     cudaStream_t stream = nullptr
 );
