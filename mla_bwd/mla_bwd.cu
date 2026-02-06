@@ -84,7 +84,7 @@ __global__ void preprocess_delta_kernel(
 }
 
 // Kernel implementation: test mla_bwd with Q, KV, dO inputs
-__global__ void __launch_bounds__(NUM_THREADS, 1, 2) test_mla_bwd_kernel(
+__global__ void __launch_bounds__(512, 1, 2) test_mla_bwd_kernel(
     const bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
     const bf16* __restrict__ kv,     // [B_TOPK, D_K] = [64, 576]
     const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
@@ -645,7 +645,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_alloc<168>();
+        cutlass::arch::warpgroup_reg_alloc<128>();
 
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
@@ -662,21 +662,28 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) test_mla_bwd_kernel(
         // ---- Step 3.2: Transfer dKV_part0 to global memory (dims 0-255) ----
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
-            float2 dkv_data[COLS_PER_HALF / 2];  // 64 float2 = 128 floats
-            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-
-            // atom.add.v4: atomically add to global memory
+            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
+            uint32_t tmem_base_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
             float* dst = dKV + row * D_K + half * COLS_PER_HALF;
-            float* src = (float*)dkv_data;
+
+            // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
-            for (int i = 0; i < COLS_PER_HALF; i += 4) {
-                atomicAdd(dst + i,     src[i]);
-                atomicAdd(dst + i + 1, src[i + 1]);
-                atomicAdd(dst + i + 2, src[i + 2]);
-                atomicAdd(dst + i + 3, src[i + 3]);
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
+                uint32_t tmem_addr = tmem_base_addr + chunk * CHUNK_SIZE;
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_addr, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+
+                // atom.add.v4: atomically add to global memory
+                float* src = (float*)dkv_data;
+                CUTE_UNROLL
+                for (int i = 0; i < CHUNK_SIZE; i += 4) {
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                }
             }
         }
 
@@ -694,21 +701,28 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) test_mla_bwd_kernel(
         // ---- Step 3.5: Transfer dKV_part1 to global memory (dims 256-511) ----
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
-            float2 dkv_data[COLS_PER_HALF / 2];
-            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-
-            // atom.add.v4: atomically add to global memory (offset by 256 for part1)
+            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
+            uint32_t tmem_base_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
             float* dst = dKV + row * D_K + 256 + half * COLS_PER_HALF;
-            float* src = (float*)dkv_data;
+
+            // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
-            for (int i = 0; i < COLS_PER_HALF; i += 4) {
-                atomicAdd(dst + i,     src[i]);
-                atomicAdd(dst + i + 1, src[i + 1]);
-                atomicAdd(dst + i + 2, src[i + 2]);
-                atomicAdd(dst + i + 3, src[i + 3]);
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
+                uint32_t tmem_addr = tmem_base_addr + chunk * CHUNK_SIZE;
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_addr, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+
+                // atom.add.v4: atomically add to global memory (offset by 256 for part1)
+                float* src = (float*)dkv_data;
+                CUTE_UNROLL
+                for (int i = 0; i < CHUNK_SIZE; i += 4) {
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                }
             }
         }
 
