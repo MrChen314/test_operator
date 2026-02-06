@@ -65,4 +65,25 @@
     6.2torch先计算delta，然后生成torch版本的计算s和ds的代码
     6.3添加torch版s和ds与cuda输出的s和ds的精度对比
 
+
+要求3：
+1.kernel新增输入、输出、barrier
+    输入：
+    输出：dKV、dQ
+    barrier：
+2.WG3等待WG0计算好ds
+3.WG3使用TiledMMA_dKV计算dV前256维
+    矩阵A：plan.s_ds.s，使用
+    矩阵B：plan.dO，使用
+    矩阵C：tmem_cols.P
+    注意：对tmem_cols.P执行clear_accum
+
+计算dKV_part0: dK_nope = ds^T @ q(0-255维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.q(0-255维)
+    输出：tmem_cols.dKV
+    输出shape：[128, 256]
+    形式：累加
+
 注：所有生成的文件都在/test_operator/mla_bwd 目录下

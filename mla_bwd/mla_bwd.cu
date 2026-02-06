@@ -282,8 +282,10 @@ __global__ void test_mla_bwd_kernel(
         int s_col_offset = (idx_in_warpgroup / 64) * 32;
         CUTE_UNROLL
         for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-            sS(idx_in_warpgroup%64, i*2+s_col_offset) = bf16(s_fp32[i].x);
-            sS(idx_in_warpgroup%64, i*2+1+s_col_offset) = bf16(s_fp32[i].y);
+            // sS(idx_in_warpgroup%64, i*2+s_col_offset) = bf16(s_fp32[i].x);
+            // sS(idx_in_warpgroup%64, i*2+1+s_col_offset) = bf16(s_fp32[i].y);
+            sS(i*2+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].x);
+            sS(i*2+1+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].y);
         }
         fence_view_async_shared();
 
@@ -301,7 +303,7 @@ __global__ void test_mla_bwd_kernel(
         if (idx_in_warpgroup < B_H/2) {
             const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup;
             for (int col = 0; col < B_TOPK; ++col) {
-                s[global_row_idx * B_TOPK + col] = sS(idx_in_warpgroup, col);
+                s[global_row_idx * B_TOPK + col] = sS(col, idx_in_warpgroup);
             }
         }
         
@@ -669,9 +671,7 @@ __global__ void test_mla_bwd_kernel(
             if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
                 printf("[WG3] finish 2: P computed (NoPE + RoPE)\n");
             }
-            
-            // Wait for WG0 to compute s (needed for later computations)
-            // plan.bar_s_ready.wait(0);
+
             ku::tcgen05_after_thread_sync();
             
             // Compute dP = dO @ V^T using TiledMMA_dP
@@ -681,10 +681,16 @@ __global__ void test_mla_bwd_kernel(
             if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
                 printf("[WG3] finish 3: dP computed\n");
             }
-            
-            // Wait for WG0 to compute ds
-            // plan.bar_ds_ready.wait(0);
+
             ku::tcgen05_after_thread_sync();
+
+            // Wait for WG0 to compute s (needed for later computations)
+            plan.bar_s_ready.wait(0);
+
+
+            // Wait for WG0 to compute ds
+            plan.bar_ds_ready.wait(0);
+
         } 
         // else if (warp_idx == 13) {
         //     // KV valid loading warp

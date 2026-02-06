@@ -43,11 +43,23 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-
 using SmemLayoutQNoPE = SmemLayoutQTiles<8>;
 using SmemLayoutQRoPE = SmemLayoutQTiles<1>;
 // Full Q layout: NoPE (8 tiles) + RoPE (1 tile) = 9 tiles
 using SmemLayoutQ = SmemLayoutQTiles<9>;
+// dO 完整 Layout: [B_H/2, D_V] = [64, 512]
+using SmemLayoutdO = SmemLayoutQTiles<D_V/64>;
+
+template<int NUM_TILES>
+using SmemLayoutQTilesTransposed = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    Shape<Int<64*NUM_TILES>, Int<B_H/2>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutQNoPETransposed = SmemLayoutQTilesTransposed<4>;
+using SmemLayoutQRoPETransposed = SmemLayoutQTilesTransposed<1>;
+using SmemLayoutdOTransposed = SmemLayoutQTilesTransposed<4>;
 
 // KV Layout 模板: [B_TOPK/2, 64*NUM_TILES]
 // 2CTA 模式下每个 CTA 加载 B_TOPK/2 行
@@ -67,28 +79,22 @@ using SmemLayoutKV = SmemLayoutKVTiles<9>;
 
 using SmemLayoutV = SmemLayoutKNoPE;
 
-// dO Layout 模板: [B_H/2, 64*NUM_TILES]
 template<int NUM_TILES>
-using SmemLayoutdOTiles = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<B_H/2>, Int<64*NUM_TILES>>{},
-    Step<_1, _2>{}
+using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    Shape<Int<64*NUM_TILES>, Int<B_TOPK/2>>{},
+    Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
-// dO 完整 Layout: [B_H/2, D_V] = [64, 512]
-using SmemLayoutdO = SmemLayoutdOTiles<D_V/64>;
+using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
+using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
-// S/dS 矩阵 Layout 模板: [B_H/2, 64*NUM_TILES]
 // 2CTA 模式下 S 矩阵形状为 [B_H/2, B_TOPK]
-template<int NUM_TILES>
-using SmemLayoutSTiles = decltype(coalesce(tile_to_shape(
+using SmemLayoutS = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_INTER_Atom<bf16>{},
-    Shape<Int<B_H/2>, Int<64*NUM_TILES>>{},
+    Shape<Int<B_TOPK>, Int<B_H/2>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
-
-// S/dS 完整 Layout: [B_H/2, B_TOPK] = [64, 64]
-using SmemLayoutS = SmemLayoutSTiles<B_TOPK/64>;
 
 // ============================================================================
 // TiledMMA 定义 (2CTA 模式)
@@ -109,6 +115,21 @@ using TiledMMA_dP = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
+using TiledMMA_dQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, 256, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+using TiledMMA_dKV = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::K, UMMA::Major::MN>{}
+));
+
+using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+));
 
 // TMEM column configuration
 struct tmem_cols {
