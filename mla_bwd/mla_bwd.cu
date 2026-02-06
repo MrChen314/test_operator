@@ -645,7 +645,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_dealloc<96>();
+        cutlass::arch::warpgroup_reg_alloc<168>();
 
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
