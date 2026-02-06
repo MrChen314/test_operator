@@ -1,16 +1,45 @@
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# python test_mla_bwd.py 
+CUDA Device: CF-NG-BZZ2-O
+CUDA Capability: (10, 0)
+
+============================================================
+Testing mla_bwd Kernel
+============================================================
+q shape: [128, 576]
+kv shape: [64, 576]
+dO shape: [128, 512]
+Expected P shape: [128, 64] = Q @ K^T
+Expected dP shape: [128, 64] = dO @ V^T
+
+q dtype: torch.bfloat16, device: cuda:0
+kv dtype: torch.bfloat16, device: cuda:0
+dO dtype: torch.bfloat16, device: cuda:0
+indices shape: torch.Size([64]), dtype: torch.int32
+indices range: [0, 63]
+
+Computing reference with PyTorch...
+P_ref shape: torch.Size([128, 64]), dtype: torch.float32
+dP_ref shape: torch.Size([128, 64]), dtype: torch.float32
+delta_ref shape: torch.Size([128]), dtype: torch.float32
+s_ref shape: torch.Size([128, 64]), dtype: torch.float32
+ds_ref shape: torch.Size([128, 64]), dtype: torch.float32
+
+dKV_ref shape: torch.Size([64, 576]), dtype: torch.float32
+
 Running CUDA kernel...
 finish -2: Computing delta...
 finish -1: Starting kernel launch from Python binding
 finish 0: Launching kernel...
+finish 17: Kernel launch completed
 [CTA 0] finish 1: Kernel started
 [CTA 0] finish 2: TMEM allocated
+[WG2 CTA0] finish 1: WG2 started
 [WG2 CTA1] finish 1: WG2 started
 [WG3 CTA1] finish 1: TMEM tensors allocated
-[WG2 CTA0] finish 1: WG2 started
-[WG1 CTA1] finish 1: start loading Q from global memory
-[WG0 CTA1] finish 1: LSE loaded from global memory
 [WG3 CTA0] finish 1: TMEM tensors allocated
 [WG0 CTA0] finish 1: LSE loaded from global memory
+[WG0 CTA1] finish 1: LSE loaded from global memory
+[WG1 CTA1] finish 1: start loading Q from global memory
 [WG1 CTA0] finish 1: start loading Q from global memory
 [WG1 CTA1] finish 2: Q loaded to SMEM (NoPE + RoPE)
 [WG1 CTA0] finish 2: Q loaded to SMEM (NoPE + RoPE)
@@ -23,14 +52,14 @@ finish 0: Launching kernel...
 [WG0 CTA0] P is ready, computing softmax
 [WG1 CTA1] finish 5: Q written to global memory (NoPE + RoPE)
 [WG1 CTA0] finish 5: Q written to global memory (NoPE + RoPE)
-[WG3] finish 3: dP computed
 [WG0 CTA1] finish 2: P read from TMEM and written to global memory
+[WG3] finish 3: dP computed
 [WG1 CTA1] finish 6: KV written to global memory
 [WG0 CTA0] finish 2: P read from TMEM and written to global memory
 [WG1 CTA0] finish 6: KV written to global memory
 [WG0 CTA1] finish 3: P loaded from TMEM
-[WG0 CTA0] finish 3: P loaded from TMEM
 [WG1 CTA1] finish 7: dO written to global memory
+[WG0 CTA0] finish 3: P loaded from TMEM
 [WG1 CTA0] finish 7: dO written to global memory
 [WG0 CTA1] finish 5: softmax computed and s stored to SMEM
 [WG0 CTA0] finish 5: softmax computed and s stored to SMEM
@@ -46,12 +75,293 @@ finish 0: Launching kernel...
 [WG0 CTA0] finish 9: dp loaded from TMEM
 [WG0 CTA1] finish 10: ds computed and stored to SMEM
 [WG0 CTA0] finish 10: ds computed and stored to SMEM
-cudaLaunchKernelEx failed with error: an illegal memory access was encountered
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 538, in <module>
-    passed = test_mla_bwd()
-             ^^^^^^^^^^^^^^
-  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 133, in test_mla_bwd
-    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
-                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: CUDA kernel launch failed: an illegal memory access was encountered
+[WG2 CTA1] finish 2: dKV_part0 ready
+[WG0 CTA1] finish 11: ds written to global memory
+[WG3 CTA1] finish 5: dKV_part0 computed, waiting for WG2 transfer
+[WG2 CTA0] finish 2: dKV_part0 ready
+[WG0 CTA0] finish 11: ds written to global memory
+[WG3 CTA0] finish 5: dKV_part0 computed, waiting for WG2 transfer
+[WG2 CTA1] finish 4: dKV_part0 transferred
+[WG3 CTA1] finish 6: dKV_part1 computed, waiting for WG2 transfer
+[WG2 CTA0] finish 4: dKV_part0 transferred
+[WG3 CTA0] finish 6: dKV_part1 computed, waiting for WG2 transfer
+[WG2 CTA1] finish 5: dKV_part1 transferred
+[WG3 CTA1] finish 7: dKV_part2 (RoPE) computed, waiting for WG2 transfer
+[WG2 CTA0] finish 5: dKV_part1 transferred
+[WG3 CTA0] finish 7: dKV_part2 (RoPE) computed, waiting for WG2 transfer
+[WG2 CTA1] finish 6: dKV_part2 (RoPE) transferred, all done
+[WG3 CTA1] finish 8: All dKV parts transferred
+[WG2 CTA0] finish 6: dKV_part2 (RoPE) transferred, all done
+[WG3 CTA0] finish 8: All dKV parts transferred
+[CTA 1] finish 16: TMEM freed, kernel completed
+[CTA 0] finish 16: TMEM freed, kernel completed
+finish 18: Kernel execution completed and synchronized
+q_out shape: torch.Size([128, 576]), dtype: torch.bfloat16
+kv_out shape: torch.Size([64, 576]), dtype: torch.bfloat16
+dO_out shape: torch.Size([128, 512]), dtype: torch.bfloat16
+P_cuda shape: torch.Size([128, 64]), dtype: torch.float32
+dP_cuda shape: torch.Size([128, 64]), dtype: torch.float32
+s_cuda shape: torch.Size([128, 64]), dtype: torch.bfloat16
+ds_cuda shape: torch.Size([128, 64]), dtype: torch.bfloat16
+dKV_cuda shape: torch.Size([64, 576]), dtype: torch.float32
+
+============================================================
+Matrix Multiplication Precision Validation:
+============================================================
+P_cuda vs P_ref (PyTorch):
+  Max absolute diff:     5.340576e-05
+  Mean absolute diff:    3.586672e-06
+  Max relative diff:     3.037109e-03
+
+dP_cuda vs dP_ref (PyTorch):
+  Max absolute diff:     3.814697e-05
+  Mean absolute diff:    2.940624e-06
+  Max relative diff:     1.561255e-03
+
+s_cuda vs s_ref (PyTorch):
+  Max absolute diff:     7.812500e-03
+  Mean absolute diff:    9.536743e-07
+  Max relative diff:     6.514659e-03
+
+ds_cuda vs ds_ref (PyTorch):
+  Max absolute diff:     9.765625e-04
+  Mean absolute diff:    1.192093e-07
+  Max relative diff:     4.264394e-03
+
+dKV_cuda vs dKV_ref (PyTorch):
+  Max absolute diff:     1.008965e+02
+  Mean absolute diff:    1.371493e+00
+  Max relative diff:     5.056717e+03
+  dKV NoPE max diff:     1.008965e+02
+  dKV RoPE max diff:     1.408533e+01
+
+Sample P_cuda vs P_ref (first 5x5 block):
+P_cuda:
+tensor([[-14.0655,   7.1772,   0.2317,  23.1827,  13.6558],
+        [  0.9089,  19.6210,  -9.7746, -19.7500,   0.2107],
+        [ -1.0775,   7.4809,  41.6738, -26.1867,  21.4613],
+        [  7.5103,  12.3107, -20.8927, -24.4189,   2.8953],
+        [-22.6056,   1.9758,  11.1435,  -2.3612, -22.6088]], device='cuda:0')
+P_ref (PyTorch):
+tensor([[-14.0655,   7.1772,   0.2317,  23.1827,  13.6558],
+        [  0.9089,  19.6210,  -9.7746, -19.7500,   0.2107],
+        [ -1.0775,   7.4809,  41.6738, -26.1867,  21.4613],
+        [  7.5103,  12.3107, -20.8927, -24.4189,   2.8953],
+        [-22.6056,   1.9758,  11.1435,  -2.3612, -22.6088]], device='cuda:0')
+Difference:
+tensor([[0.0000e+00, 4.7684e-07, 4.2915e-06, 0.0000e+00, 0.0000e+00],
+        [1.9073e-06, 7.6294e-06, 0.0000e+00, 0.0000e+00, 9.5367e-07],
+        [1.9073e-06, 3.8147e-06, 7.6294e-06, 0.0000e+00, 7.6294e-06],
+        [2.8610e-06, 2.8610e-06, 1.9073e-06, 0.0000e+00, 9.5367e-07],
+        [0.0000e+00, 1.9073e-06, 0.0000e+00, 1.9073e-06, 3.8147e-06]],
+       device='cuda:0')
+
+Sample dP_cuda vs dP_ref (first 5x5 block):
+dP_cuda:
+tensor([[-13.9328,  -0.2793, -12.3647, -12.9843,  37.4843],
+        [ -4.5393,  31.3483,  22.6844,  -7.2078,  -3.4699],
+        [ 28.2853,  22.2986,   7.3026, -22.1168, -32.5454],
+        [-33.5848,  17.8276,  -9.1332,   3.6433, -14.9654],
+        [-22.8539, -15.0258,  -1.0055,  12.6559,  10.0950]], device='cuda:0')
+dP_ref (PyTorch):
+tensor([[-13.9328,  -0.2793, -12.3647, -12.9843,  37.4843],
+        [ -4.5393,  31.3483,  22.6844,  -7.2077,  -3.4699],
+        [ 28.2853,  22.2986,   7.3026, -22.1168, -32.5453],
+        [-33.5848,  17.8275,  -9.1332,   3.6433, -14.9654],
+        [-22.8539, -15.0258,  -1.0055,  12.6559,  10.0950]], device='cuda:0')
+Difference:
+tensor([[0.0000e+00, 1.9073e-06, 0.0000e+00, 9.5367e-07, 3.8147e-06],
+        [1.4305e-06, 7.6294e-06, 0.0000e+00, 2.8610e-06, 9.5367e-07],
+        [9.5367e-06, 1.9073e-06, 0.0000e+00, 1.9073e-06, 7.6294e-06],
+        [1.5259e-05, 1.9073e-06, 0.0000e+00, 2.3842e-06, 1.9073e-06],
+        [1.9073e-06, 0.0000e+00, 0.0000e+00, 9.5367e-07, 9.5367e-07]],
+       device='cuda:0')
+
+Sample s_cuda vs s_ref (first 5x5 block):
+s_cuda:
+tensor([[0.0432, 0.1050, 0.0786, 0.2041, 0.1377],
+        [0.0168, 0.0366, 0.0108, 0.0071, 0.0164],
+        [0.0231, 0.0330, 0.1377, 0.0081, 0.0591],
+        [0.1162, 0.1416, 0.0356, 0.0308, 0.0957],
+        [0.0311, 0.0864, 0.1270, 0.0723, 0.0311]], device='cuda:0',
+       dtype=torch.bfloat16)
+s_ref (PyTorch):
+tensor([[0.0432, 0.1048, 0.0784, 0.2041, 0.1372],
+        [0.0168, 0.0367, 0.0108, 0.0071, 0.0163],
+        [0.0231, 0.0330, 0.1373, 0.0081, 0.0591],
+        [0.1161, 0.1419, 0.0356, 0.0307, 0.0958],
+        [0.0311, 0.0866, 0.1269, 0.0723, 0.0311]], device='cuda:0')
+Difference:
+tensor([[0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+
+Sample ds_cuda vs ds_ref (first 5x5 block):
+ds_cuda:
+tensor([[-0.0062,  0.0447, -0.0060, -0.0210,  0.2754],
+        [ 0.0005,  0.0559,  0.0125, -0.0006,  0.0012],
+        [ 0.0540,  0.0688,  0.2002,  0.0019, -0.0118],
+        [-0.3164, -0.0835, -0.0608, -0.0361, -0.1875],
+        [ 0.0187,  0.0806,  0.1914,  0.1504,  0.0613]], device='cuda:0',
+       dtype=torch.bfloat16)
+ds_ref (PyTorch):
+tensor([[-0.0062,  0.0447, -0.0060, -0.0210,  0.2744],
+        [ 0.0005,  0.0559,  0.0125, -0.0006,  0.0012],
+        [ 0.0540,  0.0689,  0.2006,  0.0019, -0.0118],
+        [-0.3172, -0.0835, -0.0609, -0.0362, -0.1874],
+        [ 0.0187,  0.0803,  0.1919,  0.1505,  0.0614]], device='cuda:0')
+Difference:
+tensor([[0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+
+Sample dKV_cuda vs dKV_ref (first 5x5 block):
+dKV_cuda:
+tensor([[  9.6226, -20.4985,  18.2147,   3.6616,   5.7044],
+        [ 13.9416,  -6.1130,   8.1114,  -4.1020,  11.8197],
+        [ 15.7262, -15.4261,  14.7731,  -0.5067,   5.0050],
+        [  9.0067,   5.5163,   2.9472,   4.2506,   3.8659],
+        [  6.9627,  -6.4550,   6.4039,   0.2079,   2.9446]], device='cuda:0')
+dKV_ref (PyTorch):
+tensor([[  9.6226, -20.4985,  18.2147,   3.6616,   5.7044],
+        [ 13.9416,  -6.1130,   8.1114,  -4.1020,  11.8197],
+        [ 15.7262, -15.4261,  14.7731,  -0.5067,   5.0050],
+        [  9.0067,   5.5163,   2.9472,   4.2506,   3.8659],
+        [  6.9627,  -6.4550,   6.4039,   0.2079,   2.9446]], device='cuda:0')
+Difference:
+tensor([[2.8610e-06, 1.9073e-06, 1.9073e-06, 3.0994e-06, 4.7684e-07],
+        [0.0000e+00, 0.0000e+00, 0.0000e+00, 9.5367e-07, 1.9073e-06],
+        [0.0000e+00, 0.0000e+00, 0.0000e+00, 4.7684e-07, 4.7684e-07],
+        [0.0000e+00, 4.7684e-07, 2.3842e-07, 4.7684e-07, 7.1526e-07],
+        [0.0000e+00, 0.0000e+00, 0.0000e+00, 1.1921e-07, 4.7684e-07]],
+       device='cuda:0')
+
+Sample dKV RoPE (dims 512-575, first 5x5 block):
+dKV_cuda RoPE:
+tensor([[-18.0764,  -8.7687, -12.2670,  15.3111,   1.6658],
+        [ -0.0743,   1.1301,  -2.5186,   7.3152,   6.5897],
+        [-13.0730,  -5.4949, -11.9640,  10.6808,   3.8630],
+        [  2.4778,   2.5982,   0.3216,  -3.3785,   5.4414],
+        [ -1.3232,  -1.9267,  -1.3039,   1.7702,   2.0117]], device='cuda:0')
+dKV_ref RoPE:
+tensor([[-18.0764,  -8.7687, -12.2670,  15.3111,   1.6658],
+        [ -0.0743,   1.1301,  -2.5186,   7.3152,   6.5897],
+        [-13.0730,  -5.4949, -11.9640,  10.6808,   3.8630],
+        [  2.4778,   2.5982,   0.3216,  -3.3785,   5.4414],
+        [ -1.3232,  -1.9267,  -1.3039,   1.7702,   2.0117]], device='cuda:0')
+Difference:
+tensor([[3.8147e-06, 2.8610e-06, 1.9073e-06, 1.9073e-06, 1.0729e-06],
+        [2.0862e-07, 1.1921e-07, 1.1921e-06, 9.5367e-07, 9.5367e-07],
+        [9.5367e-07, 4.7684e-07, 9.5367e-07, 1.9073e-06, 1.1921e-06],
+        [4.7684e-07, 2.3842e-07, 5.3644e-07, 2.3842e-07, 4.7684e-07],
+        [2.3842e-07, 2.3842e-07, 3.5763e-07, 2.3842e-07, 2.3842e-07]],
+       device='cuda:0')
+
+============================================================
+Q, KV, dO Precision Validation:
+============================================================
+q_out vs q (original):
+  Max absolute diff:     0.000000e+00
+  Mean absolute diff:    0.000000e+00
+  Max relative diff:     0.000000e+00
+
+kv_out vs kv (original):
+  Max absolute diff:     0.000000e+00
+  Mean absolute diff:    0.000000e+00
+  Max relative diff:     0.000000e+00
+
+dO_out vs dO (original):
+  Max absolute diff:     0.000000e+00
+  Mean absolute diff:    0.000000e+00
+  Max relative diff:     0.000000e+00
+
+Sample q_out vs q (first 5x5 block):
+q_out:
+tensor([[ 0.1943,  2.1562, -0.1719,  0.8477, -1.9219],
+        [-0.1406,  2.2500,  1.7812,  0.1738,  1.4062],
+        [ 2.5156, -1.2969,  0.3379,  0.1816,  0.9297],
+        [-2.3906, -1.0781, -1.1484,  0.2188,  1.8984],
+        [ 0.7383, -0.4785, -0.3164,  0.4648,  0.3242]], device='cuda:0',
+       dtype=torch.bfloat16)
+q (original):
+tensor([[ 0.1943,  2.1562, -0.1719,  0.8477, -1.9219],
+        [-0.1406,  2.2500,  1.7812,  0.1738,  1.4062],
+        [ 2.5156, -1.2969,  0.3379,  0.1816,  0.9297],
+        [-2.3906, -1.0781, -1.1484,  0.2188,  1.8984],
+        [ 0.7383, -0.4785, -0.3164,  0.4648,  0.3242]], device='cuda:0',
+       dtype=torch.bfloat16)
+Difference:
+tensor([[0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.]], device='cuda:0')
+
+Sample kv_out vs kv (first 5x5 block):
+kv_out:
+tensor([[ 0.1387, -0.1084, -0.7188,  0.7578,  0.3711],
+        [-0.2246,  0.6445, -0.2871, -0.5703,  0.2734],
+        [ 0.9727,  2.1875,  0.2451,  0.5508,  0.3047],
+        [-0.1787,  0.7422,  0.3477, -0.8867, -1.4141],
+        [ 2.4844,  0.6758, -0.7227, -0.2793, -0.7773]], device='cuda:0',
+       dtype=torch.bfloat16)
+kv (original):
+tensor([[ 0.1387, -0.1084, -0.7188,  0.7578,  0.3711],
+        [-0.2246,  0.6445, -0.2871, -0.5703,  0.2734],
+        [ 0.9727,  2.1875,  0.2451,  0.5508,  0.3047],
+        [-0.1787,  0.7422,  0.3477, -0.8867, -1.4141],
+        [ 2.4844,  0.6758, -0.7227, -0.2793, -0.7773]], device='cuda:0',
+       dtype=torch.bfloat16)
+Difference:
+tensor([[0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.]], device='cuda:0')
+
+Sample dO_out vs dO (first 5x5 block):
+dO_out:
+tensor([[-0.5195,  1.2266,  0.6250, -0.9102,  0.5703],
+        [-0.8320,  0.7305, -0.6953,  0.0498, -0.0111],
+        [-0.8047, -0.3770, -2.4062,  0.0535,  0.1904],
+        [-0.8516,  0.0469, -0.2480,  2.2188,  1.5234],
+        [-0.6523,  0.1895, -1.1641, -0.6875,  0.3691]], device='cuda:0',
+       dtype=torch.bfloat16)
+dO (original):
+tensor([[-0.5195,  1.2266,  0.6250, -0.9102,  0.5703],
+        [-0.8320,  0.7305, -0.6953,  0.0498, -0.0111],
+        [-0.8047, -0.3770, -2.4062,  0.0535,  0.1904],
+        [-0.8516,  0.0469, -0.2480,  2.2188,  1.5234],
+        [-0.6523,  0.1895, -1.1641, -0.6875,  0.3691]], device='cuda:0',
+       dtype=torch.bfloat16)
+Difference:
+tensor([[0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.]], device='cuda:0')
+
+✓ P matrix multiplication test PASSED!
+  (max_diff=5.340576e-05 < 0.01, relative_diff=3.037109e-03 < 0.1)
+✓ dP matrix multiplication test PASSED!
+  (max_diff=3.814697e-05 < 0.01, relative_diff=1.561255e-03 < 0.1)
+✓ s (softmax) test PASSED!
+  (max_diff=7.812500e-03 < 0.01, relative_diff=6.514659e-03 < 0.1)
+✓ ds test PASSED!
+  (max_diff=9.765625e-04 < 0.01, relative_diff=4.264394e-03 < 0.1)
+✓ q precision test PASSED!
+  (max_diff=0.000000e+00 < 1e-05, relative_diff=0.000000e+00 < 0.0001)
+✓ kv precision test PASSED!
+  (max_diff=0.000000e+00 < 1e-05, relative_diff=0.000000e+00 < 0.0001)
+✓ dO precision test PASSED!
+  (max_diff=0.000000e+00 < 1e-05, relative_diff=0.000000e+00 < 0.0001)
+✗ dKV gradient test FAILED!
+  (max_diff=1.008965e+02 >= 0.1 or relative_diff=5.056717e+03 >= 0.5)
+
+============================================================
+Some tests FAILED!
+============================================================
