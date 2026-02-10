@@ -124,11 +124,11 @@ using TiledMMA_dP = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, 256, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
@@ -222,6 +222,11 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dkv_part0_done;           // WG2通知WG3 dKV_part0传输完成
     transac_bar_t bar_dkv_part1_done;           // WG2通知WG3 dKV_part1传输完成
     transac_bar_t bar_dkv_part2_done;           // WG2通知WG3 dKV_part2传输完成
+    // WG1-WG3 同步屏障 (kv_peer cp_async)
+    transac_bar_t bar_kv_peer_cp_async;         // cp_async传输kv_peer的transaction barrier
+    transac_bar_t bar_kv_peer_ready;            // WG1通知WG3 kv_peer加载完成
+    // WG3-WG0 同步屏障 (dQ computation)
+    transac_bar_t bar_dq_ready;                 // WG3通知WG0 dQ计算完成
 
     // TMEM 起始地址
     array_aligned<uint32_t, 1> tmem_start_addr;
@@ -256,7 +261,9 @@ __global__ void test_mla_bwd_kernel(
     test_operator::mla_bwd::bf16* __restrict__ s,           // [B_H, B_TOPK] = [128, 64] (softmax values)
     test_operator::mla_bwd::bf16* __restrict__ ds,           // [B_H, B_TOPK] = [128, 64] (dS gradients)
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
-    float* __restrict__ dKV           // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
+    float* __restrict__ dKV,          // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
+    test_operator::mla_bwd::bf16* __restrict__ sdO_t_out,  // [D_V, B_H] = [512, 128] (dO transposed output)
+    float* __restrict__ dQ             // [B_H, D_Q] = [128, 576] (dQ gradient)
 );
 
 // C++ wrapper declaration
@@ -278,5 +285,7 @@ void launch_test_mla_bwd(
     test_operator::mla_bwd::bf16* ds,
     const float* delta,
     float* dKV,
+    test_operator::mla_bwd::bf16* sdO_t_out,
+    float* dQ,
     cudaStream_t stream = nullptr
 );

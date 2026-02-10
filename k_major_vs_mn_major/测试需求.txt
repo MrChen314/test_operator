@@ -1,0 +1,18 @@
+对TiledMMA_dKV(SM100_MMA_F16BF16_WS_SS_NOELECT)进行两种major的测试
+来源/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh
+
+要求：
+1.生成.cuh/.cu文件
+    kernel输入：s_bf16、dO
+    kernel输出：dV_cuda_k，dV_cuda_mn
+    线程数：128
+2.有两个TiledMMA_dKV：第一个输入都是k_major，第二个s_bf16是k_major、dO是mn_major
+3.要给dO定义两种layout：Layout_MN_SW128_Atom和Layout_K_SW128_Atom
+3.注意kernel使用2cta，cta0和cta1分别用不同的TiledMMA_dKV对s_bf16和dO做矩阵乘，结果输出到tmem，然后将tmem输出到全局内存
+4.test_k_mn_major.py
+    4.1生成输入数据
+        s_bf16:[128, 64]
+        do_shape:[128, 256]
+    4.2对比torch的ref结果与两种major的矩阵乘结果的精度误差
+
+注：所有生成的文件都在/Users/chenql/Desktop/workspace/operator/test_operator/k_major_vs_mn_major 目录下

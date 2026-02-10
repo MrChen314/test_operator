@@ -129,4 +129,25 @@
     4.1torch_ref计算dKV_ref，计算流程可参考/Users/chenql/Desktop/workspace/operator/tilelang/examples/deepseek_v32/sparse_mla_bwd.py
     4.2对比dKV_cuda和dKV_ref
 
+要求4：
+1.kernel新增输出、barrier
+    输出：dQ
+    barrier：
+        cp_async传输kv_peer
+        WG1通知WG3：kv_peer加载完成
+        WG3通知WG0：dQ计算完成
+2.WG0新增流程
+    2.1等待WG3计算好dQ
+    2.2将dQ传输到全局内存
+3.WG1新增流程
+    2.1加载对端的kv_peer，参考/Users/chenql/Desktop/workspace/operator/test_operator/smem_cp_async/test_smem_cp_async.cu
+    2.2通知WG3：kv_peer加载完成
+4.WG3新增流程
+    以下新增操作插入到WG3通知WG2：dKV_part0计算完成之后，等待WG2传输完dKV_part0之前
+    3.1使用TiledMMA_dQ和TiledMMA_dQ_RoPE计算dQ+=ds@k_local，累加
+    3.2等待WG1传输完kv_peer
+    3.3使用TiledMMA_dQ和TiledMMA_dQ_RoPE计算dQ+=ds@k_peer，累加
+    3.4通知WG0：dQ计算完成
+5.test_mla_bwd.py增加对dQ的精度对比，torch_ref = ds@K
+
 注：所有生成的文件都在/test_operator/mla_bwd 目录下

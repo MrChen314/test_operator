@@ -8,6 +8,13 @@ import torch
 import mla_bwd_cuda  # Compiled module
 
 
+def calc_diff(a, b):
+    abs_diff = torch.abs(a - b)
+    max_diff = abs_diff.max().item()
+    rel_diff = (abs_diff / (1e-4 + torch.abs(a))).mean().item()
+    return max_diff, rel_diff
+
+
 def test_mla_bwd():
     """Test mla_bwd kernel precision"""
     print("=" * 60)
@@ -26,6 +33,7 @@ def test_mla_bwd():
     print(f"dO shape: [{B_H}, {D_V}]")
     print(f"Expected P shape: [{B_H}, {B_TOPK}] = Q @ K^T")
     print(f"Expected dP shape: [{B_H}, {B_TOPK}] = dO @ V^T")
+    print(f"Expected dQ shape: [{B_H}, {D_Q}] = ds @ K")
     print()
     
     # Generate input data
@@ -126,11 +134,21 @@ def test_mla_bwd():
     # dKV = concat(dKV_nope, dK_rope)
     dKV_ref = torch.cat([dKV_nope_ref, dK_rope_ref], dim=-1)  # [B_TOPK, D_K]
     print(f"dKV_ref shape: {dKV_ref.shape}, dtype: {dKV_ref.dtype}")
+
+    # PyTorch reference: Compute dQ = ds @ K
+    dQ_ref = torch.matmul(ds_bf16.float(), k)  # [B_H, B_TOPK] @ [B_TOPK, D_Q] = [B_H, D_Q]
+    print(f"dQ_ref shape: {dQ_ref.shape}, dtype: {dQ_ref.dtype}")
+    
+    # PyTorch reference: Compute sdO_t = dO^T (transpose of dO)
+    # dO shape: [B_H, D_V] = [128, 512]
+    # sdO_t shape: [D_V, B_H] = [512, 128]
+    sdO_t_ref = dO.float().T  # [D_V, B_H] = [512, 128]
+    print(f"sdO_t_ref shape: {sdO_t_ref.shape}, dtype: {sdO_t_ref.dtype}")
     print()
     
     # CUDA kernel computation
     print("Running CUDA kernel...")
-    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+    q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda, sdO_t_cuda, dQ_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
     torch.cuda.synchronize()
     print(f"q_out shape: {q_out.shape}, dtype: {q_out.dtype}")
     print(f"kv_out shape: {kv_out.shape}, dtype: {kv_out.dtype}")
@@ -140,6 +158,8 @@ def test_mla_bwd():
     print(f"s_cuda shape: {s_cuda.shape}, dtype: {s_cuda.dtype}")
     print(f"ds_cuda shape: {ds_cuda.shape}, dtype: {ds_cuda.dtype}")
     print(f"dKV_cuda shape: {dKV_cuda.shape}, dtype: {dKV_cuda.dtype}")
+    print(f"sdO_t_cuda shape: {sdO_t_cuda.shape}, dtype: {sdO_t_cuda.dtype}")
+    print(f"dQ_cuda shape: {dQ_cuda.shape}, dtype: {dQ_cuda.dtype}")
     print()
     
     # Precision validation: compare CUDA result with PyTorch result
@@ -149,68 +169,71 @@ def test_mla_bwd():
     
     # Compare P
     P_diff = (P_cuda - P_ref).abs()
-    P_max_diff = P_diff.max().item()
-    P_mean_diff = P_diff.mean().item()
-    P_relative_diff = (P_diff / (P_ref.abs() + 1e-8)).max().item()
+    P_max_diff, P_relative_diff = calc_diff(P_cuda, P_ref)
     
     print(f"P_cuda vs P_ref (PyTorch):")
     print(f"  Max absolute diff:     {P_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {P_mean_diff:.6e}")
-    print(f"  Max relative diff:     {P_relative_diff:.6e}")
+    print(f"  Relative diff:         {P_relative_diff:.6e}")
     print()
     
     # Compare dP
     dP_diff = (dP_cuda - dP_ref).abs()
-    dP_max_diff = dP_diff.max().item()
-    dP_mean_diff = dP_diff.mean().item()
-    dP_relative_diff = (dP_diff / (dP_ref.abs() + 1e-8)).max().item()
+    dP_max_diff, dP_relative_diff = calc_diff(dP_cuda, dP_ref)
     
     print(f"dP_cuda vs dP_ref (PyTorch):")
     print(f"  Max absolute diff:     {dP_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {dP_mean_diff:.6e}")
-    print(f"  Max relative diff:     {dP_relative_diff:.6e}")
+    print(f"  Relative diff:         {dP_relative_diff:.6e}")
     print()
     
     # Compare s
     s_diff = (s_cuda - s_ref.bfloat16()).abs()
-    s_max_diff = s_diff.max().item()
-    s_mean_diff = s_diff.mean().item()
-    s_relative_diff = (s_diff / (s_ref.abs() + 1e-8)).max().item()
+    s_max_diff, s_relative_diff = calc_diff(s_cuda.float(), s_ref.float())
     
     print(f"s_cuda vs s_ref (PyTorch):")
     print(f"  Max absolute diff:     {s_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {s_mean_diff:.6e}")
-    print(f"  Max relative diff:     {s_relative_diff:.6e}")
+    print(f"  Relative diff:         {s_relative_diff:.6e}")
     print()
     
     # Compare ds
     ds_diff = (ds_cuda - ds_ref.bfloat16()).abs()
-    ds_max_diff = ds_diff.max().item()
-    ds_mean_diff = ds_diff.mean().item()
-    ds_relative_diff = (ds_diff / (ds_ref.abs() + 1e-8)).max().item()
+    ds_max_diff, ds_relative_diff = calc_diff(ds_cuda.float(), ds_ref.float())
     
     print(f"ds_cuda vs ds_ref (PyTorch):")
     print(f"  Max absolute diff:     {ds_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {ds_mean_diff:.6e}")
-    print(f"  Max relative diff:     {ds_relative_diff:.6e}")
+    print(f"  Relative diff:         {ds_relative_diff:.6e}")
     print()
     
     # Compare dKV
     dKV_diff = (dKV_cuda - dKV_ref).abs()
-    dKV_max_diff = dKV_diff.max().item()
-    dKV_mean_diff = dKV_diff.mean().item()
-    dKV_relative_diff = (dKV_diff / (dKV_ref.abs() + 1e-8)).max().item()
+    dKV_max_diff, dKV_relative_diff = calc_diff(dKV_cuda, dKV_ref)
     
     print(f"dKV_cuda vs dKV_ref (PyTorch):")
     print(f"  Max absolute diff:     {dKV_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {dKV_mean_diff:.6e}")
-    print(f"  Max relative diff:     {dKV_relative_diff:.6e}")
+    print(f"  Relative diff:         {dKV_relative_diff:.6e}")
     
     # Breakdown: NoPE part vs RoPE part
     dKV_nope_diff = (dKV_cuda[:, :D_V] - dKV_ref[:, :D_V]).abs()
     dKV_rope_diff = (dKV_cuda[:, D_V:] - dKV_ref[:, D_V:]).abs()
     print(f"  dKV NoPE max diff:     {dKV_nope_diff.max().item():.6e}")
     print(f"  dKV RoPE max diff:     {dKV_rope_diff.max().item():.6e}")
+    print()
+    
+    # Compare sdO_t
+    sdO_t_diff = (sdO_t_cuda.float() - sdO_t_ref).abs()
+    sdO_t_max_diff, sdO_t_relative_diff = calc_diff(sdO_t_cuda.float(), sdO_t_ref)
+    
+    print(f"sdO_t_cuda vs sdO_t_ref (PyTorch):")
+    print(f"  Max absolute diff:     {sdO_t_max_diff:.6e}")
+    print(f"  Relative diff:         {sdO_t_relative_diff:.6e}")
+    print()
+
+    # Compare dQ
+    dQ_diff = (dQ_cuda - dQ_ref).abs()
+    dQ_max_diff, dQ_relative_diff = calc_diff(dQ_cuda, dQ_ref)
+
+    print(f"dQ_cuda vs dQ_ref (PyTorch):")
+    print(f"  Max absolute diff:     {dQ_max_diff:.6e}")
+    print(f"  Relative diff:         {dQ_relative_diff:.6e}")
     print()
     
     # Print sample results for debugging
@@ -268,6 +291,24 @@ def test_mla_bwd():
     print(dKV_rope_diff[:5, :5])
     print()
     
+    print("Sample sdO_t_cuda vs sdO_t_ref (first 5x5 block):")
+    print("sdO_t_cuda:")
+    print(sdO_t_cuda[:5, :5])
+    print("sdO_t_ref (PyTorch):")
+    print(sdO_t_ref[:5, :5])
+    print("Difference:")
+    print(sdO_t_diff[:5, :5])
+    print()
+
+    print("Sample dQ_cuda vs dQ_ref (first 5x5 block):")
+    print("dQ_cuda:")
+    print(dQ_cuda[:5, :5])
+    print("dQ_ref (PyTorch):")
+    print(dQ_ref[:5, :5])
+    print("Difference:")
+    print(dQ_diff[:5, :5])
+    print()
+    
     # Q, KV, dO precision validation
     print("=" * 60)
     print("Q, KV, dO Precision Validation:")
@@ -275,38 +316,29 @@ def test_mla_bwd():
     
     # Compare q_out with original q
     q_diff = (q_out.float() - q.float()).abs()
-    q_max_diff = q_diff.max().item()
-    q_mean_diff = q_diff.mean().item()
-    q_relative_diff = (q_diff / (q.float().abs() + 1e-8)).max().item()
+    q_max_diff, q_relative_diff = calc_diff(q_out.float(), q.float())
     
     print(f"q_out vs q (original):")
     print(f"  Max absolute diff:     {q_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {q_mean_diff:.6e}")
-    print(f"  Max relative diff:     {q_relative_diff:.6e}")
+    print(f"  Relative diff:         {q_relative_diff:.6e}")
     print()
     
     # Compare kv_out with original kv
     kv_diff = (kv_out.float() - kv.float()).abs()
-    kv_max_diff = kv_diff.max().item()
-    kv_mean_diff = kv_diff.mean().item()
-    kv_relative_diff = (kv_diff / (kv.float().abs() + 1e-8)).max().item()
+    kv_max_diff, kv_relative_diff = calc_diff(kv_out.float(), kv.float())
     
     print(f"kv_out vs kv (original):")
     print(f"  Max absolute diff:     {kv_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {kv_mean_diff:.6e}")
-    print(f"  Max relative diff:     {kv_relative_diff:.6e}")
+    print(f"  Relative diff:         {kv_relative_diff:.6e}")
     print()
     
     # Compare dO_out with original dO
     dO_diff = (dO_out.float() - dO.float()).abs()
-    dO_max_diff = dO_diff.max().item()
-    dO_mean_diff = dO_diff.mean().item()
-    dO_relative_diff = (dO_diff / (dO.float().abs() + 1e-8)).max().item()
+    dO_max_diff, dO_relative_diff = calc_diff(dO_out.float(), dO.float())
     
     print(f"dO_out vs dO (original):")
     print(f"  Max absolute diff:     {dO_max_diff:.6e}")
-    print(f"  Mean absolute diff:    {dO_mean_diff:.6e}")
-    print(f"  Max relative diff:     {dO_relative_diff:.6e}")
+    print(f"  Relative diff:         {dO_relative_diff:.6e}")
     print()
     
     # Print sample results for debugging
@@ -337,101 +369,32 @@ def test_mla_bwd():
     print(dO_diff[:5, :5])
     print()
     
-    # Assert precision is within reasonable range
-    # For bfloat16 input and float32 output, allow some numerical error
-    max_diff_threshold = 1e-2  # Maximum allowed absolute error for P and dP
-    relative_diff_threshold = 1e-1  # Maximum allowed relative error for P and dP
-    
-    # For Q, KV, dO (bfloat16), allow bit-exact match or very small error
-    qkv_max_diff_threshold = 1e-5  # Maximum allowed absolute error for Q/KV/dO
-    qkv_relative_diff_threshold = 1e-4  # Maximum allowed relative error for Q/KV/dO
-    
-    dKV_max_diff_threshold = 1e-1  # dKV uses atomic add with bf16 intermediate, allow more error
-    dKV_relative_diff_threshold = 5e-1
-    
-    P_test_passed = P_max_diff < max_diff_threshold and P_relative_diff < relative_diff_threshold
-    dP_test_passed = dP_max_diff < max_diff_threshold and dP_relative_diff < relative_diff_threshold
-    s_test_passed = s_max_diff < max_diff_threshold and s_relative_diff < relative_diff_threshold
-    ds_test_passed = ds_max_diff < max_diff_threshold and ds_relative_diff < relative_diff_threshold
-    q_test_passed = q_max_diff < qkv_max_diff_threshold and q_relative_diff < qkv_relative_diff_threshold
-    kv_test_passed = kv_max_diff < qkv_max_diff_threshold and kv_relative_diff < qkv_relative_diff_threshold
-    dO_test_passed = dO_max_diff < qkv_max_diff_threshold and dO_relative_diff < qkv_relative_diff_threshold
-    dKV_test_passed = dKV_max_diff < dKV_max_diff_threshold and dKV_relative_diff < dKV_relative_diff_threshold
-    
-    all_passed = P_test_passed and dP_test_passed and s_test_passed and ds_test_passed and q_test_passed and kv_test_passed and dO_test_passed and dKV_test_passed
-    
-    if P_test_passed:
-        print(f"✓ P matrix multiplication test PASSED!")
-        print(f"  (max_diff={P_max_diff:.6e} < {max_diff_threshold}, "
-              f"relative_diff={P_relative_diff:.6e} < {relative_diff_threshold})")
-    else:
-        print(f"✗ P matrix multiplication test FAILED!")
-        print(f"  (max_diff={P_max_diff:.6e} >= {max_diff_threshold} or "
-              f"relative_diff={P_relative_diff:.6e} >= {relative_diff_threshold})")
-    
-    if dP_test_passed:
-        print(f"✓ dP matrix multiplication test PASSED!")
-        print(f"  (max_diff={dP_max_diff:.6e} < {max_diff_threshold}, "
-              f"relative_diff={dP_relative_diff:.6e} < {relative_diff_threshold})")
-    else:
-        print(f"✗ dP matrix multiplication test FAILED!")
-        print(f"  (max_diff={dP_max_diff:.6e} >= {max_diff_threshold} or "
-              f"relative_diff={dP_relative_diff:.6e} >= {relative_diff_threshold})")
-    
-    if s_test_passed:
-        print(f"✓ s (softmax) test PASSED!")
-        print(f"  (max_diff={s_max_diff:.6e} < {max_diff_threshold}, "
-              f"relative_diff={s_relative_diff:.6e} < {relative_diff_threshold})")
-    else:
-        print(f"✗ s (softmax) test FAILED!")
-        print(f"  (max_diff={s_max_diff:.6e} >= {max_diff_threshold} or "
-              f"relative_diff={s_relative_diff:.6e} >= {relative_diff_threshold})")
-    
-    if ds_test_passed:
-        print(f"✓ ds test PASSED!")
-        print(f"  (max_diff={ds_max_diff:.6e} < {max_diff_threshold}, "
-              f"relative_diff={ds_relative_diff:.6e} < {relative_diff_threshold})")
-    else:
-        print(f"✗ ds test FAILED!")
-        print(f"  (max_diff={ds_max_diff:.6e} >= {max_diff_threshold} or "
-              f"relative_diff={ds_relative_diff:.6e} >= {relative_diff_threshold})")
-    
-    if q_test_passed:
-        print(f"✓ q precision test PASSED!")
-        print(f"  (max_diff={q_max_diff:.6e} < {qkv_max_diff_threshold}, "
-              f"relative_diff={q_relative_diff:.6e} < {qkv_relative_diff_threshold})")
-    else:
-        print(f"✗ q precision test FAILED!")
-        print(f"  (max_diff={q_max_diff:.6e} >= {qkv_max_diff_threshold} or "
-              f"relative_diff={q_relative_diff:.6e} >= {qkv_relative_diff_threshold})")
-    
-    if kv_test_passed:
-        print(f"✓ kv precision test PASSED!")
-        print(f"  (max_diff={kv_max_diff:.6e} < {qkv_max_diff_threshold}, "
-              f"relative_diff={kv_relative_diff:.6e} < {qkv_relative_diff_threshold})")
-    else:
-        print(f"✗ kv precision test FAILED!")
-        print(f"  (max_diff={kv_max_diff:.6e} >= {qkv_max_diff_threshold} or "
-              f"relative_diff={kv_relative_diff:.6e} >= {qkv_relative_diff_threshold})")
-    
-    if dO_test_passed:
-        print(f"✓ dO precision test PASSED!")
-        print(f"  (max_diff={dO_max_diff:.6e} < {qkv_max_diff_threshold}, "
-              f"relative_diff={dO_relative_diff:.6e} < {qkv_relative_diff_threshold})")
-    else:
-        print(f"✗ dO precision test FAILED!")
-        print(f"  (max_diff={dO_max_diff:.6e} >= {qkv_max_diff_threshold} or "
-              f"relative_diff={dO_relative_diff:.6e} >= {qkv_relative_diff_threshold})")
-    
-    if dKV_test_passed:
-        print(f"✓ dKV gradient test PASSED!")
-        print(f"  (max_diff={dKV_max_diff:.6e} < {dKV_max_diff_threshold}, "
-              f"relative_diff={dKV_relative_diff:.6e} < {dKV_relative_diff_threshold})")
-    else:
-        print(f"✗ dKV gradient test FAILED!")
-        print(f"  (max_diff={dKV_max_diff:.6e} >= {dKV_max_diff_threshold} or "
-              f"relative_diff={dKV_relative_diff:.6e} >= {dKV_relative_diff_threshold})")
-    
+    # Precision criterion: rel_diff < 0.01
+    rel_diff_threshold = 0.01
+
+    metrics = [
+        ("P matrix multiplication", P_max_diff, P_relative_diff),
+        ("dP matrix multiplication", dP_max_diff, dP_relative_diff),
+        ("s (softmax)", s_max_diff, s_relative_diff),
+        ("ds", ds_max_diff, ds_relative_diff),
+        ("q precision", q_max_diff, q_relative_diff),
+        ("kv precision", kv_max_diff, kv_relative_diff),
+        ("dO precision", dO_max_diff, dO_relative_diff),
+        ("dKV gradient", dKV_max_diff, dKV_relative_diff),
+        ("sdO_t (dO transposed)", sdO_t_max_diff, sdO_t_relative_diff),
+        ("dQ gradient", dQ_max_diff, dQ_relative_diff),
+    ]
+
+    all_passed = True
+    for metric_name, max_diff, rel_diff in metrics:
+        metric_passed = rel_diff < rel_diff_threshold
+        status = "✓" if metric_passed else "✗"
+        result = "PASSED" if metric_passed else "FAILED"
+        print(f"{status} {metric_name} test {result}!")
+        print(f"  (max_diff={max_diff:.6e}, rel_diff={rel_diff:.6e}, threshold={rel_diff_threshold:.2e})")
+        if not metric_passed:
+            all_passed = False
+
     return all_passed
 
 
@@ -456,6 +419,7 @@ def test_different_inputs():
          lambda *args, **kwargs: torch.rand(*args, **kwargs) * 2 - 1),
     ]
     
+    rel_diff_threshold = 0.01
     all_passed = True
     for name, q_gen, kv_gen, dO_gen in test_cases:
         try:
@@ -486,40 +450,54 @@ def test_different_inputs():
             # Generate lse and O
             lse = torch.randn(B_H, dtype=torch.float32, device='cuda') * 2.0 + 5.0
             O = torch.randn(B_H, D_V, dtype=torch.bfloat16, device='cuda')
+
+            # PyTorch reference for dQ
+            sm_scale = 1.0 / (D_Q ** 0.5)
+            scale_log2e = sm_scale * 1.44269504
+            delta_ref = (O.float() * dO.float()).sum(dim=-1)
+            s_ref = torch.exp2(P_ref * scale_log2e - lse.unsqueeze(-1))
+            ds_ref = s_ref * (dP_ref - delta_ref.unsqueeze(-1)) * sm_scale
+            dQ_ref = torch.matmul(ds_ref.to(torch.bfloat16).float(), k)
+
+            # PyTorch reference for dKV
+            s_bf16 = s_ref.to(torch.bfloat16)
+            ds_bf16 = ds_ref.to(torch.bfloat16)
+            dV_ref = torch.matmul(s_bf16.float().T, dO.float())
+            dK_nope_ref = torch.matmul(ds_bf16.float().T, q[:, :D_V].float())
+            dK_rope_ref = torch.matmul(ds_bf16.float().T, q[:, D_V:].float())
+            dKV_ref = torch.cat([dV_ref + dK_nope_ref, dK_rope_ref], dim=-1)
             
             # CUDA kernel
-            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+            q_out, kv_out, dO_out, P_cuda, dP_cuda, s_cuda, ds_cuda, dKV_cuda, sdO_t_cuda, dQ_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
             
-            P_max_diff = (P_cuda - P_ref).abs().max().item()
-            P_relative_diff = ((P_cuda - P_ref).abs() / (P_ref.abs() + 1e-8)).max().item()
+            P_max_diff, P_relative_diff = calc_diff(P_cuda, P_ref)
+            dP_max_diff, dP_relative_diff = calc_diff(dP_cuda, dP_ref)
+            q_max_diff, q_relative_diff = calc_diff(q_out.float(), q.float())
+            kv_max_diff, kv_relative_diff = calc_diff(kv_out.float(), kv.float())
+            dO_max_diff, dO_relative_diff = calc_diff(dO_out.float(), dO.float())
+            dKV_max_diff, dKV_relative_diff = calc_diff(dKV_cuda, dKV_ref)
+            dQ_max_diff, dQ_relative_diff = calc_diff(dQ_cuda, dQ_ref)
             
-            dP_max_diff = (dP_cuda - dP_ref).abs().max().item()
-            dP_relative_diff = ((dP_cuda - dP_ref).abs() / (dP_ref.abs() + 1e-8)).max().item()
+            P_test_ok = P_relative_diff < rel_diff_threshold
+            dP_test_ok = dP_relative_diff < rel_diff_threshold
+            q_test_ok = q_relative_diff < rel_diff_threshold
+            kv_test_ok = kv_relative_diff < rel_diff_threshold
+            dO_test_ok = dO_relative_diff < rel_diff_threshold
+            dKV_test_ok = dKV_relative_diff < rel_diff_threshold
+            dQ_test_ok = dQ_relative_diff < rel_diff_threshold
             
-            q_max_diff = (q_out.float() - q.float()).abs().max().item()
-            kv_max_diff = (kv_out.float() - kv.float()).abs().max().item()
-            dO_max_diff = (dO_out.float() - dO.float()).abs().max().item()
-            
-            max_diff_threshold = 1e-2
-            relative_diff_threshold = 1e-1
-            qkv_max_diff_threshold = 1e-5
-            
-            P_test_ok = P_max_diff < max_diff_threshold and P_relative_diff < relative_diff_threshold
-            dP_test_ok = dP_max_diff < max_diff_threshold and dP_relative_diff < relative_diff_threshold
-            q_test_ok = q_max_diff < qkv_max_diff_threshold
-            kv_test_ok = kv_max_diff < qkv_max_diff_threshold
-            dO_test_ok = dO_max_diff < qkv_max_diff_threshold
-            
-            test_ok = P_test_ok and dP_test_ok and q_test_ok and kv_test_ok and dO_test_ok
+            test_ok = P_test_ok and dP_test_ok and q_test_ok and kv_test_ok and dO_test_ok and dKV_test_ok and dQ_test_ok
             
             status = "✓" if test_ok else "✗"
             print(f"{status} {name}:")
-            print(f"    P: max_diff={P_max_diff:.6e}, relative_diff={P_relative_diff:.6e}")
-            print(f"    dP: max_diff={dP_max_diff:.6e}, relative_diff={dP_relative_diff:.6e}")
-            print(f"    q: max_diff={q_max_diff:.6e}")
-            print(f"    kv: max_diff={kv_max_diff:.6e}")
-            print(f"    dO: max_diff={dO_max_diff:.6e}")
-            print(f"    dKV: max_diff={dKV_cuda.abs().max().item():.6e}")
+            print(f"    P: max_diff={P_max_diff:.6e}, rel_diff={P_relative_diff:.6e}")
+            print(f"    dP: max_diff={dP_max_diff:.6e}, rel_diff={dP_relative_diff:.6e}")
+            print(f"    q: max_diff={q_max_diff:.6e}, rel_diff={q_relative_diff:.6e}")
+            print(f"    kv: max_diff={kv_max_diff:.6e}, rel_diff={kv_relative_diff:.6e}")
+            print(f"    dO: max_diff={dO_max_diff:.6e}, rel_diff={dO_relative_diff:.6e}")
+            print(f"    dKV: max_diff={dKV_max_diff:.6e}, rel_diff={dKV_relative_diff:.6e}")
+            print(f"    dQ: max_diff={dQ_max_diff:.6e}, rel_diff={dQ_relative_diff:.6e}")
+            print(f"    threshold: rel_diff < {rel_diff_threshold:.2e}")
             
             if not test_ok:
                 all_passed = False

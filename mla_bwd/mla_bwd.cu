@@ -101,7 +101,9 @@ __global__ void test_mla_bwd_kernel(
     bf16* __restrict__ s,            // [B_H, B_TOPK] = [128, 64] (softmax values)
     bf16* __restrict__ ds,           // [B_H, B_TOPK] = [128, 64] (dS gradients)
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
-    float* __restrict__ dKV           // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
+    float* __restrict__ dKV,          // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
+    bf16* __restrict__ sdO_t_out,    // [D_V, B_H] = [512, 128] (dO transposed output)
+    float* __restrict__ dQ           // [B_H, D_Q] = [128, 576] (dQ gradient, float32)
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
     // Use cute namespace inside kernel to avoid conflicts with PyTorch's at::Layout
@@ -147,17 +149,22 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_qkv_loaded.init(128*2);     // WG1通知WG3 q/k/dO已加载到SMEM (2CTA sync)
         plan.bar_p_ready.init(1);        // WG3通知WG0 p已准备好 (2CTA sync)
         plan.bar_dp_ready.init(1);       // WG3通知WG0 dp已准备好 (2CTA sync)
-        plan.bar_s_ready.init(128*2);        // WG0通知WG3 s已准备好 (2CTA sync)
-        plan.bar_ds_ready.init(128*2);       // WG0通知WG3 ds已准备好 (2CTA sync)
+        plan.bar_s_ready.init(128);        // WG0通知WG3 s已准备好
+        plan.bar_ds_ready.init(128);       // WG0通知WG3 ds已准备好
         plan.bar_k_valid_free.init(128);
         plan.bar_k_valid_ready.init(8);
         // WG3-WG2 barriers for dKV computation
         plan.bar_dkv_part0_ready.init(1);
         plan.bar_dkv_part1_ready.init(1);
         plan.bar_dkv_part2_ready.init(1);
-        plan.bar_dkv_part0_done.init(128*2);
-        plan.bar_dkv_part1_done.init(128*2);
-        plan.bar_dkv_part2_done.init(128*2);
+        plan.bar_dkv_part0_done.init(128);
+        plan.bar_dkv_part1_done.init(128);
+        plan.bar_dkv_part2_done.init(128);
+        // WG1-WG3 barriers for kv_peer cp_async
+        plan.bar_kv_peer_cp_async.init(1);      // cp_async transaction barrier
+        plan.bar_kv_peer_ready.init(1);         // WG1 notifies WG3 kv_peer is ready
+        // WG3-WG0 barrier for dQ computation
+        plan.bar_dq_ready.init(1);              // WG3 notifies WG0 dQ is ready
         fence_barrier_init();
     }
     
@@ -174,6 +181,8 @@ __global__ void test_mla_bwd_kernel(
     Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKNoPE{});
     Tensor sKRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPE{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
+    // kv_peer: [B_TOPK/2, D_K] = [32, 576] for cross-CTA K loading
+    Tensor sKV_peer = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKV{});
 
     // ========================================
     // Warpgroup 0: Softmax and dS Computation (WG0)
@@ -187,8 +196,8 @@ __global__ void test_mla_bwd_kernel(
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
         row_lse = __ldg(lse + global_row_idx);
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 1: LSE loaded from global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 1: LSE loaded from global memory\n", cta_idx);
         }
         
         const float sm_scale = 1.0f / sqrtf(576.0f);  // softmax scale
@@ -200,8 +209,8 @@ __global__ void test_mla_bwd_kernel(
         plan.bar_p_ready.wait(0);
         ku::tcgen05_after_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] P is ready, computing softmax\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] P is ready, computing softmax\n", cta_idx);
         }
         {
             // P shape: [B_H, B_TOPK] = [128, 64]
@@ -234,8 +243,8 @@ __global__ void test_mla_bwd_kernel(
             }
             __threadfence_block();
 
-            if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-                printf("[WG0] finish 2: P read from TMEM and written to global memory\n");
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 2: P read from TMEM and written to global memory\n", cta_idx);
             }   
         }
         
@@ -250,8 +259,8 @@ __global__ void test_mla_bwd_kernel(
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 3: P loaded from TMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 3: P loaded from TMEM\n", cta_idx);
         }
 
         // plan.bar_k_valid_ready.wait(0);
@@ -299,8 +308,8 @@ __global__ void test_mla_bwd_kernel(
         fence_view_async_shared();
 
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 5: softmax computed and s stored to SMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 5: softmax computed and s stored to SMEM\n", cta_idx);
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -317,27 +326,31 @@ __global__ void test_mla_bwd_kernel(
         }
         
         // Notify WG3 that s is ready
-        plan.bar_s_ready.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_s_ready.arrive(0u);
+        } else {
+            plan.bar_s_ready.arrive(1u);
+        }
         
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 6: s written to global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 6: s written to global memory\n", cta_idx);
         }
         
         // Step 6: Load delta from global memory
         float delta_val = 0.0f;
         delta_val = __ldg(delta + global_row_idx);
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 7: delta loaded from global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 7: delta loaded from global memory\n", cta_idx);
         }
         
         // Step 7: Wait for WG3 to compute dp
         plan.bar_dp_ready.wait(0);
         ku::tcgen05_after_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 8: dP is ready, computing ds\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 8: dP is ready, computing ds\n", cta_idx);
         }
 
         // Read dP from TMEM and write to global memory
@@ -379,8 +392,8 @@ __global__ void test_mla_bwd_kernel(
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 9: dp loaded from TMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 9: dp loaded from TMEM\n", cta_idx);
         }
         
         // Step 9: Compute ds = s * (dp - delta) * sm_scale
@@ -418,8 +431,8 @@ __global__ void test_mla_bwd_kernel(
         fence_view_async_shared();
 
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 10: ds computed and stored to SMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 10: ds computed and stored to SMEM\n", cta_idx);
         }
         
         // WG0内同步：使用条件同步，只有WG0的线程参与
@@ -436,10 +449,100 @@ __global__ void test_mla_bwd_kernel(
         }
         
         // Notify WG3 that ds is ready
-        plan.bar_ds_ready.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_ds_ready.arrive(0u);
+        } else {
+            plan.bar_ds_ready.arrive(1u);
+        }
+
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 11: ds written to global memory\n", cta_idx);
+        }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG0] finish 11: ds written to global memory\n");
+        // ========================================
+        // WG0 Step 12-13: Wait for dQ and transfer to global memory
+        // ========================================
+        
+        // Step 12: Wait for WG3 to compute dQ
+        plan.bar_dq_ready.wait(0);
+        ku::tcgen05_after_thread_sync();
+        
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 12: dQ is ready, transferring to global memory\n", cta_idx);
+        }
+        
+        // Step 13: Read dQ from TMEM and write to global memory
+        // dQ shape: [B_H, D_Q] = [128, 576], each CTA handles [B_H/2, D_Q] = [64, 576]
+        // dQ is stored in two parts: dQ_NoPE (dims 0-511) and dQ_RoPE (dims 512-575)
+        // TMEM layout: dQ uses cols dQ (256 cols for [64, 512] in two tiles) and dQ_RoPE (32 cols for [64, 64])
+        {
+            constexpr int dQ_ROWS = B_H / 2;  // 64
+            
+            int dQ_cta_row_offset = cta_idx * dQ_ROWS;
+            
+            // Each thread handles a portion of dQ
+            // Thread mapping: 128 threads handle 64 rows x 576 cols
+            // We'll have each of the 128 threads handle different rows/cols
+            
+            // For dQ_NoPE part (dims 0-511): read from TMEM and write to global in chunks
+            // Use 8 chunks to reduce per-thread register footprint.
+            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;  // 128 floats per thread per tile half
+            constexpr int NOPE_CHUNKS = 8;
+            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16 floats per chunk
+            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;  // 8 float2 per chunk
+            
+            int row_in_cta = idx_in_warpgroup % dQ_ROWS;  // 0-63
+            int col_half = idx_in_warpgroup / dQ_ROWS;     // 0 or 1
+            int global_row = dQ_cta_row_offset + row_in_cta;
+            
+            uint32_t tmem_base_dq = plan.tmem_start_addr.data()[0];
+            uint32_t tmem_addr_dq0 = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ;
+            uint32_t tmem_addr_dq1 = tmem_base_dq + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+
+            // 8-iteration loop for NoPE output (both 256-col tiles)
+            for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
+                const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
+                float2 dq_chunk[NOPE_CHUNK_FLOAT2];
+
+                // Tile 0: cols [0, 255]
+                ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
+                    int col = col_half * (256 / 2) + chunk_col_base + i * 2;
+                    dQ[global_row * D_Q + col] = dq_chunk[i].x;
+                    dQ[global_row * D_Q + col + 1] = dq_chunk[i].y;
+                }
+
+                // Tile 1: cols [256, 511]
+                ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
+                    int col = 256 + col_half * (256 / 2) + chunk_col_base + i * 2;
+                    dQ[global_row * D_Q + col] = dq_chunk[i].x;
+                    dQ[global_row * D_Q + col + 1] = dq_chunk[i].y;
+                }
+            }
+            
+            // Read dQ_RoPE (cols 512-575)
+            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;  // 16 float2 per row
+            float2 dq_rope[ROPE_FLOAT2_PER_ROW];
+            uint32_t tmem_addr_dq_rope = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+            ku::tmem_ld_32dp32bNx<D_ROPE/2>(tmem_addr_dq_rope, dq_rope);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
+            
+            // Write dQ_RoPE to global memory
+            for (int i = 0; i < ROPE_FLOAT2_PER_ROW; ++i) {
+                int col = D_V + col_half * (D_ROPE / 2) + i * 2;
+                dQ[global_row * D_Q + col] = dq_rope[i].x;
+                dQ[global_row * D_Q + col + 1] = dq_rope[i].y;
+            }
+        }
+        
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG0 CTA%d] finish 13: dQ written to global memory\n", cta_idx);
         }
     }
     
@@ -448,10 +551,10 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Load Q, KV, dO from global memory and write back
     // ========================================
     if (is_wg1) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_dealloc<96>();
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 1: start loading Q from global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 1: start loading Q from global memory\n", cta_idx);
         }
         
         // Load Q from Global Memory to SMEM (split into NoPE and RoPE)
@@ -494,8 +597,8 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();  // 确保内存操作的可见性
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 2: Q loaded to SMEM (NoPE + RoPE)\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 2: Q loaded to SMEM (NoPE + RoPE)\n", cta_idx);
         }
         
         // Load KV from Global Memory to SMEM (split into NoPE and RoPE)
@@ -531,8 +634,8 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 3: KV loaded to SMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 3: KV loaded to SMEM\n", cta_idx);
         }
         
         // Load dO from Global Memory to SMEM
@@ -554,8 +657,8 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 4: dO loaded to SMEM\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 4: dO loaded to SMEM\n", cta_idx);
         }
 
         // Barrier: notify WG3 that q, k, dO are all loaded to SMEM
@@ -587,8 +690,8 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 5: Q written to global memory (NoPE + RoPE)\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 5: Q written to global memory (NoPE + RoPE)\n", cta_idx);
         }
         
         // Write KV from SMEM to kv_out (split into NoPE and RoPE)
@@ -616,8 +719,8 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 6: KV written to global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 6: KV written to global memory\n", cta_idx);
         }
         
         // Write dO from SMEM to dO_out
@@ -634,8 +737,60 @@ __global__ void test_mla_bwd_kernel(
             __threadfence_block();
         }
         
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG1] finish 7: dO written to global memory\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 7: dO written to global memory\n", cta_idx);
+        }
+        
+        // ========================================
+        // WG1 Step 8: Load kv_peer from peer CTA using cp_async
+        // Reference: test_smem_cp_async.cu
+        // ========================================
+        // kv_peer: [B_TOPK/2, D_K] = [32, 576] per CTA
+        constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
+        
+        // Prepare for cp_async: expect transaction bytes
+        if (idx_in_warpgroup == 0) {
+            plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
+        }
+        
+        // Cluster sync before cp_async
+        // cluster_sync();
+        
+        // Launch cp_async to copy K from peer CTA's sKNoPE + sKRoPE to local sKV_peer
+        // CTA0 copies from CTA1's KV, CTA1 copies from CTA0's KV
+        if (idx_in_warpgroup == 0) {
+            // Get peer address for kv_peer buffer
+            bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
+            transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
+            
+            // Source is local K_nope + K_rope (need to be combined in kv_peer layout)
+            // For simplicity, we copy the local k_nope and k_rope combined area
+            // Note: k_nope and k_rope are contiguous in memory layout
+            kerutils::cp_async_bulk_shared_cta_to_shared_cluster(
+                peer_kv_peer_ptr,
+                plan.u.q_kv.k_nope.data(),  // Source: local k_nope (which continues to k_rope)
+                sizeof(bf16) * KV_PEER_ELEMENTS,
+                *peer_bar_ptr
+            );
+        }
+        
+        fence_view_async_shared();
+        
+        // Wait for cp_async to complete
+        if (idx_in_warpgroup == 0) {
+            plan.bar_kv_peer_cp_async.wait(0);
+            // __threadfence_block();
+            
+            // Notify WG3 that kv_peer is ready
+            if (cta_idx == 0) {
+                plan.bar_kv_peer_ready.arrive(0u);
+            } else {
+                plan.bar_kv_peer_ready.arrive(1u);
+            }
+        }
+        
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG1 CTA%d] finish 8: kv_peer loaded via cp_async\n", cta_idx);
         }
     }
     
@@ -645,46 +800,59 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_alloc<128>();
 
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
         uint32_t tmem_base_wg2 = plan.tmem_start_addr.data()[0];
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG2] finish 1: WG2 started\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 1: WG2 started\n", cta_idx);
         }
 
         // ---- Step 3.1: Wait for WG3 to compute dKV_part0 ----
         plan.bar_dkv_part0_ready.wait(0);
         ku::tcgen05_after_thread_sync();
 
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 2: dKV_part0 ready\n", cta_idx);
+        }
+
         // ---- Step 3.2: Transfer dKV_part0 to global memory (dims 0-255) ----
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
-            float2 dkv_data[COLS_PER_HALF / 2];  // 64 float2 = 128 floats
-            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-
-            // atom.add.v4: atomically add to global memory
+            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
             float* dst = dKV + row * D_K + half * COLS_PER_HALF;
-            float* src = (float*)dkv_data;
+
+            // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
-            for (int i = 0; i < COLS_PER_HALF; i += 4) {
-                atomicAdd(dst + i,     src[i]);
-                atomicAdd(dst + i + 1, src[i + 1]);
-                atomicAdd(dst + i + 2, src[i + 2]);
-                atomicAdd(dst + i + 3, src[i + 3]);
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+
+                // atom.add.v4: atomically add to global memory
+                float* src = (float*)dkv_data;
+                CUTE_UNROLL
+                for (int i = 0; i < CHUNK_SIZE; i += 4) {
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                }
             }
         }
 
         // ---- Step 3.3: Notify WG3 that dKV_part0 transfer is done ----
-        plan.bar_dkv_part0_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part0_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part0_done.arrive(1u);
+        }
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG2] finish 2: dKV_part0 transferred\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 4: dKV_part0 transferred\n", cta_idx);
         }
 
         // ---- Step 3.4: Wait for WG3 to compute dKV_part1 ----
@@ -694,29 +862,38 @@ __global__ void test_mla_bwd_kernel(
         // ---- Step 3.5: Transfer dKV_part1 to global memory (dims 256-511) ----
         {
             constexpr int COLS_PER_HALF = 256 / 2;  // 128 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV + half * COLS_PER_HALF;
-            float2 dkv_data[COLS_PER_HALF / 2];
-            ku::tmem_ld_32dp32bNx<COLS_PER_HALF>(tmem_addr, dkv_data);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-
-            // atom.add.v4: atomically add to global memory (offset by 256 for part1)
+            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;  // 32 float values per chunk
             float* dst = dKV + row * D_K + 256 + half * COLS_PER_HALF;
-            float* src = (float*)dkv_data;
+
+            // Loop 4 times to read in chunks, reducing register usage
             CUTE_UNROLL
-            for (int i = 0; i < COLS_PER_HALF; i += 4) {
-                atomicAdd(dst + i,     src[i]);
-                atomicAdd(dst + i + 1, src[i + 1]);
-                atomicAdd(dst + i + 2, src[i + 2]);
-                atomicAdd(dst + i + 3, src[i + 3]);
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];  // 16 float2 = 32 floats
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+
+                // atom.add.v4: atomically add to global memory (offset by 256 for part1)
+                float* src = (float*)dkv_data;
+                CUTE_UNROLL
+                for (int i = 0; i < CHUNK_SIZE; i += 4) {
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
+                    atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                }
             }
         }
 
         // ---- Step 3.6: Notify WG3 that dKV_part1 transfer is done ----
-        plan.bar_dkv_part1_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part1_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part1_done.arrive(1u);
+        }
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG2] finish 3: dKV_part1 transferred\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 5: dKV_part1 transferred\n", cta_idx);
         }
 
         // ---- Step 3.7: Wait for WG3 to compute dKV_part2 ----
@@ -726,9 +903,8 @@ __global__ void test_mla_bwd_kernel(
         // ---- Step 3.8: Transfer dKV_part2 to global memory (dims 512-575, RoPE) ----
         {
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;  // 32 float values per half
-            uint32_t tmem_addr = tmem_base_wg2 + (row << 16) + tmem_cols::dKV_RoPE + half * ROPE_COLS_PER_HALF;
             float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];  // 16 float2 = 32 floats
-            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_addr, dkv_rope_data);
+            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
@@ -745,10 +921,14 @@ __global__ void test_mla_bwd_kernel(
         }
 
         // ---- Step 3.9: Notify WG3 that dKV_part2 transfer is done ----
-        plan.bar_dkv_part2_done.arrive(0u);
+        if (cta_idx == 0) {
+            plan.bar_dkv_part2_done.arrive(0u);
+        } else {
+            plan.bar_dkv_part2_done.arrive(1u);
+        }
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG2] finish 4: dKV_part2 (RoPE) transferred, all done\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG2 CTA%d] finish 6: dKV_part2 (RoPE) transferred, all done\n", cta_idx);
         }
     }
 
@@ -757,7 +937,7 @@ __global__ void test_mla_bwd_kernel(
     // Responsibility: Compute P, dP, and dKV
     // ========================================
     if (is_wg3) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
+        cutlass::arch::warpgroup_reg_alloc<168>();
         
         // Allocate TMEM tensors for P and dP
         TiledMMA_P tiled_mma_P{};
@@ -775,8 +955,8 @@ __global__ void test_mla_bwd_kernel(
         Tensor tdKV_RoPE = partition_fragment_C(tiled_mma_dKV_RoPE, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
         tdKV_RoPE.data().get() = tmem_cols::dKV_RoPE;
 
-        if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-            printf("[WG3] finish 1: TMEM tensors allocated\n");
+        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+            printf("[WG3 CTA%d] finish 1: TMEM tensors allocated\n", cta_idx);
         }
 
         // Extract V from memory: V uses the same layout as K_NoPE
@@ -815,7 +995,7 @@ __global__ void test_mla_bwd_kernel(
             // Wait for WG0 to compute s
             plan.bar_s_ready.wait(0);
 
-            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 4: s and ds ready, starting dKV computation\n", cta_idx);
             }
 
@@ -841,13 +1021,124 @@ __global__ void test_mla_bwd_kernel(
             plan.bar_ds_ready.wait(0);
             // ---- Step 2.3: Compute dK[0:256] = ds^T @ Q[:, 0:256] (accumulate) ----
             ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _0{}), tdKV, false);
-            
+            ku::umma_arrive_noelect(plan.bar_dkv_part0_ready);
+
             // ---- Step 2.4: Notify WG2 that dKV_part0 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part0_ready.arrive(0u);
+            // if (cta_idx == 0) {
+            //     plan.bar_dkv_part0_ready.arrive(0u);
+            // } else {
+            //     plan.bar_dkv_part0_ready.arrive(1u);
+            // }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 5: dKV_part0 computed, waiting for WG2 transfer\n", cta_idx);
+            }
+
+            // ========================================
+            // WG3 Step 5.1-5.4: Compute dQ (inserted between dKV_part0 notify and wait)
+            // dQ = ds @ K (K_local + K_peer)
+            // ========================================
+            
+            // Allocate TMEM tensors for dQ
+            TiledMMA_dQ tiled_mma_dQ{};
+            TiledMMA_dQ_RoPE tiled_mma_dQ_RoPE{};
+            Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H/2>, Int<256>>{});
+            tdQ_part0.data().get() = tmem_cols::dQ;
+            Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H/2>, Int<256>>{});
+            tdQ_part1.data().get() = tmem_cols::dQ + 128;
+            Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE, Shape<Int<B_H/2>, Int<D_ROPE>>{});
+            tdQ_RoPE.data().get() = tmem_cols::dQ_RoPE;
+            
+            // dS transposed tensor for MMA A operand: [B_H/2, B_TOPK] -> treat as A matrix
+            Tensor sDS_t = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdSTransposed{});
+            auto sDS_t_div = flat_divide(sDS_t, Shape<Int<B_H/2>, Int<B_TOPK/2>>{});
+            
+            // K NoPE transposed: [D_V, B_TOPK/2] per CTA, flat_divide into [256, B_TOPK/2] tiles
+            Tensor sK_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
+            auto sK_nope_t_div = flat_divide(sK_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
+            
+            // K RoPE transposed: [D_ROPE, B_TOPK/2] = [64, 32]
+            Tensor sK_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPETransposed{});
+            
+            // K_peer transposed tensors (peer CTA's K)
+            Tensor sK_peer_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
+            auto sK_peer_nope_t_div = flat_divide(sK_peer_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
+            
+            // K_peer RoPE transposed: [D_ROPE, B_TOPK/2] = [64, 32]
+            // kv_peer layout: [B_TOPK/2, D_K] = [32, 576], so RoPE part starts at offset D_V
+            Tensor sK_peer_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data() + (B_TOPK/2) * D_V), SmemLayoutKRoPETransposed{});
+            
+            // dQ reduction dimension (topk) must match each CTA's K ownership:
+            // CTA0: local K is topk[0:32], peer K is topk[32:64]
+            // CTA1: local K is topk[32:64], peer K is topk[0:32]
+            if (cta_idx == 0) {
+                // ---- Step 5.1: Compute dQ_nope[0:256] = ds[:, 0:32] @ K_local_nope[0:256] (clear) ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, true);
+                
+                if (blockIdx.x < 2) {
+                    printf("[WG3 CTA%d] finish 5.1: dQ_nope[0:256] computed with K_local\n", cta_idx);
+                }
+                
+                // ---- Step 5.2: Wait for WG1 to finish loading kv_peer ----
+                plan.bar_kv_peer_ready.wait(0);
+                ku::tcgen05_after_thread_sync();
+                
+                if (blockIdx.x < 2) {
+                    printf("[WG3 CTA%d] finish 5.2: kv_peer ready, computing dQ with K_peer\n", cta_idx);
+                }
+                
+                // ---- Step 5.3: Compute dQ_nope[0:256] += ds[:, 32:64] @ K_peer_nope[0:256] (accumulate) ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
+                
+                // ---- Step 5.3b: Compute dQ_nope[256:512] = ds[:, 0:32] @ K_local_nope[256:512] + ds[:, 32:64] @ K_peer_nope[256:512] ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, true);  // clear for part1
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
+                
+                // ---- Step 5.3c: Compute dQ_rope = ds[:, 0:32] @ K_local_rope + ds[:, 32:64] @ K_peer_rope ----
+                ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_rope_t, tdQ_RoPE, true);   // clear
+                ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_peer_rope_t, tdQ_RoPE, false);  // accumulate
+            } else {
+                // ---- Step 5.1: Compute dQ_nope[0:256] = ds[:, 32:64] @ K_local_nope[0:256] (clear) ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, true);
+                
+                if (blockIdx.x < 2) {
+                    printf("[WG3 CTA%d] finish 5.1: dQ_nope[0:256] computed with K_local\n", cta_idx);
+                }
+                
+                // ---- Step 5.2: Wait for WG1 to finish loading kv_peer ----
+                plan.bar_kv_peer_ready.wait(0);
+                ku::tcgen05_after_thread_sync();
+                
+                if (blockIdx.x < 2) {
+                    printf("[WG3 CTA%d] finish 5.2: kv_peer ready, computing dQ with K_peer\n", cta_idx);
+                }
+                
+                // ---- Step 5.3: Compute dQ_nope[0:256] += ds[:, 0:32] @ K_peer_nope[0:256] (accumulate) ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
+                
+                // ---- Step 5.3b: Compute dQ_nope[256:512] = ds[:, 32:64] @ K_local_nope[256:512] + ds[:, 0:32] @ K_peer_nope[256:512] ----
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, true);  // clear for part1
+                ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
+                
+                // ---- Step 5.3c: Compute dQ_rope = ds[:, 32:64] @ K_local_rope + ds[:, 0:32] @ K_peer_rope ----
+                ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_rope_t, tdQ_RoPE, true);   // clear
+                ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_peer_rope_t, tdQ_RoPE, false);  // accumulate
+            }
+            ku::umma_arrive_noelect(plan.bar_dq_ready);
+
+            
+            ku::tcgen05_after_thread_sync();
+            
+            if (blockIdx.x < 2) {
+                printf("[WG3 CTA%d] finish 5.3: dQ computed (NoPE + RoPE)\n", cta_idx);
+            }
+            
+            // ---- Step 5.4: Notify WG0 that dQ is ready ----
+            // ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dq_ready, 1|2);
+            
+            if (blockIdx.x < 2) {
+                printf("[WG3 CTA%d] finish 5.4: dQ ready, notified WG0\n", cta_idx);
             }
 
             // ---- Step 2.5: Wait for WG2 to finish dKV_part0 transfer ----
@@ -855,15 +1146,20 @@ __global__ void test_mla_bwd_kernel(
             ku::tcgen05_after_thread_sync();
 
             // ---- Step 2.6: Compute dV[256:512] = s^T @ dO[:, 256:512] (clear) ----
-            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _1{}), tdKV, true);
+            ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _1{}, _0{}), tdKV, true);
             // ---- Step 2.7: Compute dK[256:512] = ds^T @ Q[:, 256:512] (accumulate) ----
-            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _1{}), tdKV, false);
+            ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _1{}, _0{}), tdKV, false);
+            ku::umma_arrive_noelect(plan.bar_dkv_part1_ready);
 
             // ---- Step 2.8: Notify WG2 that dKV_part1 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part1_ready.arrive(0u);
+            // if (cta_idx == 0) {
+            //     plan.bar_dkv_part1_ready.arrive(0u);
+            // } else {
+            //     plan.bar_dkv_part1_ready.arrive(1u);
+            // }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 6: dKV_part1 computed, waiting for WG2 transfer\n", cta_idx);
             }
 
@@ -873,20 +1169,47 @@ __global__ void test_mla_bwd_kernel(
 
             // ---- Step 2.10: Compute dK_rope = ds^T @ Q_rope (clear) ----
             ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQ_rope_t, tdKV_RoPE, true);
+            ku::umma_arrive_noelect(plan.bar_dkv_part2_ready);
 
             // ---- Step 2.11: Notify WG2 that dKV_part2 is ready ----
             ku::tcgen05_after_thread_sync();
-            plan.bar_dkv_part2_ready.arrive(0u);
+            // if (cta_idx == 0) {
+            //     plan.bar_dkv_part2_ready.arrive(0u);
+            // } else {
+            //     plan.bar_dkv_part2_ready.arrive(1u);
+            // }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 7: dKV_part2 (RoPE) computed, waiting for WG2 transfer\n", cta_idx);
             }
 
             // ---- Step 2.12: Wait for WG2 to finish dKV_part2 transfer ----
             plan.bar_dkv_part2_done.wait(0);
 
-            if (idx_in_warpgroup == 0 && blockIdx.x == 0) {
+            if (blockIdx.x < 2) {
                 printf("[WG3 CTA%d] finish 8: All dKV parts transferred\n", cta_idx);
+            }
+
+            // ---- Step 2.13: Output sdO_t_full to global memory ----
+            // sdO_t_full shape: [D_V, B_H/2] = [512, 64] per CTA
+            // Full output shape: [D_V, B_H] = [512, 128] (both CTAs combined)
+            // Only one thread executes (elect_one_sync), so it writes the entire tensor
+            constexpr int D_V = 512;
+            constexpr int B_H_HALF = 64;
+            int row_offset = cta_idx * B_H_HALF;  // CTA0: 0-63, CTA1: 64-127
+            
+            // Write sdO_t_full to global memory
+            // sdO_t_full is stored in SMEM with layout SmemLayoutQTilesTransposed<D_V/64>
+            // sdO_t_full(col, row) accesses element at [col, row] in the transposed layout
+            // Output to global memory: sdO_t_out[col * B_H + row_offset + row]
+            for (int col = 0; col < D_V; ++col) {
+                for (int row = 0; row < B_H_HALF; ++row) {
+                    sdO_t_out[col * B_H + row_offset + row] = sdO_t_full(col, row);
+                }
+            }
+            
+            if (blockIdx.x < 2) {
+                printf("[WG3 CTA%d] finish 9: sdO_t_full written to global memory\n", cta_idx);
             }
         }
     }
@@ -900,7 +1223,7 @@ __global__ void test_mla_bwd_kernel(
         TMEM::Allocator2Sm().free(plan.tmem_start_addr.data()[0], 512);
     }
     
-    if (tid == 0 && cta_idx == 0 && blockIdx.x == 0) {
+    if (tid == 0 && blockIdx.x < 2) {
         printf("[CTA %d] finish 16: TMEM freed, kernel completed\n", cta_idx);
     }
 
@@ -945,6 +1268,8 @@ void launch_test_mla_bwd(
     bf16* ds,
     const float* delta,
     float* dKV,
+    bf16* sdO_t_out,
+    float* dQ,
     cudaStream_t stream
 ) {
     dim3 grid(2, 1, 1);  // 2 CTAs
@@ -979,7 +1304,7 @@ void launch_test_mla_bwd(
     
     printf("finish 0: Launching kernel...\n");
     cudaError_t err = cudaLaunchKernelEx(&config, test_mla_bwd_kernel, 
-        q, kv, dO, lse, O, gIndices, s_kv, topk_length, q_out, kv_out, dO_out, P, dP, s, ds, delta, dKV);
+        q, kv, dO, lse, O, gIndices, s_kv, topk_length, q_out, kv_out, dO_out, P, dP, s, ds, delta, dKV, sdO_t_out, dQ);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
         return;
@@ -988,7 +1313,7 @@ void launch_test_mla_bwd(
 }
 
 // Python binding
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mla_bwd_forward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mla_bwd_forward(
     torch::Tensor q, torch::Tensor kv, torch::Tensor dO, torch::Tensor lse, torch::Tensor O, torch::Tensor indices) {
     // Check inputs
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
@@ -1040,6 +1365,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor delta = torch::empty({B_H}, options_f32);
     // dKV initialized to zeros for atomic add accumulation
     torch::Tensor dKV = torch::zeros({B_TOPK, D_K}, options_f32);
+    torch::Tensor sdO_t_out = torch::empty({D_V, B_H}, options_bf16);
+    torch::Tensor dQ = torch::empty({B_H, D_Q}, options_f32);
     
     // Get data pointers
     const bf16* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr<at::BFloat16>());
@@ -1057,6 +1384,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     bf16* ds_ptr = reinterpret_cast<bf16*>(ds.data_ptr<at::BFloat16>());
     float* delta_ptr = delta.data_ptr<float>();
     float* dKV_ptr = dKV.data_ptr<float>();
+    bf16* sdO_t_out_ptr = reinterpret_cast<bf16*>(sdO_t_out.data_ptr<at::BFloat16>());
+    float* dQ_ptr = dQ.data_ptr<float>();
     
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -1078,7 +1407,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     // Call kernel
     printf("finish -1: Starting kernel launch from Python binding\n");
     launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv, topk_length,
-        q_out_ptr, kv_out_ptr, dO_out_ptr, P_ptr, dP_ptr, s_ptr, ds_ptr, delta_ptr, dKV_ptr, stream);
+        q_out_ptr, kv_out_ptr, dO_out_ptr, P_ptr, dP_ptr, s_ptr, ds_ptr, delta_ptr, dKV_ptr, sdO_t_out_ptr, dQ_ptr, stream);
     
     // Synchronize and wait for kernel completion
     err = cudaStreamSynchronize(stream);
@@ -1087,10 +1416,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     }
     printf("finish 18: Kernel execution completed and synchronized\n");
     
-    return std::make_tuple(q_out, kv_out, dO_out, P, dP, s, ds, dKV);
+    return std::make_tuple(q_out, kv_out, dO_out, P, dP, s, ds, dKV, sdO_t_out, dQ);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_bwd", &mla_bwd_forward, 
-          "Test mla_bwd kernel (CUDA). Returns (q_out, kv_out, dO_out, P, dP, s, ds, dKV)");
+          "Test mla_bwd kernel (CUDA). Returns (q_out, kv_out, dO_out, P, dP, s, ds, dKV, sdO_t_out, dQ)");
 }

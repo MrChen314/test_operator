@@ -1,0 +1,31 @@
+要求1：
+1.先搜索英伟达官网或cutlass库等，找到2cta模式下，使用cp.async传输对端cta的smem数据到自己smem的指令方法
+2.kernel输入输出
+    输入：A、B
+    输出：C
+3.test_smem_cp_async.py构造输入数据
+    A：shape[128, 64]
+    B：shape[64, 256]
+    C = A @ B
+4.cta0持有数据的前一半，cta1持有数据的后一半
+    每个cta持有的数据
+    A_half：shape[64, 64]
+    B_half：shape[32, 256]
+5.每个cta先将属于自己的数据从全局内存加载到smem
+6.然后执行cp.async将对端的smem加载到自己的smem(B_peer)中
+7.分两次mma操作，第一次A@自己的B，第二次A@B_peer
+8.读取tmem输出到全局内存
+9.test_smem_cp_async.py对比torch_ref与cuda的输出精度
+
+要求2：
+1.使用256个线程，分成2个warpgroup
+2.WG0负责数据的读取加载，WG1负责mma操作
+3.为了增加通算掩盖，在WG0加载好B_local后，通知WG1进行第一轮mma
+4.WG0加载好B_peer后，通知WG1进行第二轮mma
+5.这里要使用barrier进行同步，并且要分cta0和cta1进行同步，参考/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cu
+        if (cta_idx == 0) {
+            plan.bar_ds_ready.arrive(0u);
+        } else {
+            plan.bar_ds_ready.arrive(1u);
+        }
+    0u代表cta0，1u代表cta1
