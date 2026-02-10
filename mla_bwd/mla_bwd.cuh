@@ -20,7 +20,8 @@ template<
     typename Shape_QNoPE, typename TMA_QNoPE,
     typename Shape_QRoPE, typename TMA_QRoPE,
     typename Shape_KV, typename TMA_KV,
-    typename Shape_dO, typename TMA_dO
+    typename Shape_dO, typename TMA_dO,
+    typename Shape_dQ, typename TMA_dQ
 >
 struct TmaParams {
     Shape_QNoPE shape_Q_nope;
@@ -31,6 +32,8 @@ struct TmaParams {
     TMA_KV tma_KV;
     Shape_dO shape_dO;
     TMA_dO tma_dO;
+    Shape_dQ shape_dQ;
+    TMA_dQ tma_dQ;
 };
 
 // ============================================================================
@@ -192,19 +195,17 @@ struct alignas(128) SharedMemoryPlan {
     union {
         // Q + KV 计算阶段: Q 和 KV 同时驻留
         struct {
-            // Q 缓冲区 (每个 CTA 处理 B_H/2 行)
-            array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;      // [B_H/2, D_V] = [64, 512] bf16
-            array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
             // KV 缓冲区 (每个 CTA 加载 B_TOPK/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;    // [B_TOPK/2, D_V] = [32, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;    // [B_TOPK/2, D_ROPE] = [32, 64] bf16
             array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;    // [B_TOPK/2, D_K] = [32, 576] bf16
+            // Q 缓冲区 (每个 CTA 处理 B_H/2 行)
+            array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;      // [B_H/2, D_V] = [64, 512] bf16
+            array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
         } q_kv;
         
-        // dQ 输出阶段 (与 Q+KV 空间复用)
-        struct {
-            array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;    // [B_H/2, D_Q] = [64, 576] bf16
-        } dq;
+        // dQ 输出阶段 (与 KV 空间复用；注意不能与Q复用，会影响dKV精度)
+        array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;    // [B_H/2, D_Q] = [64, 576] bf16
     } u;
     
     // dO 缓冲区: 全程驻留 (每个 CTA 处理 B_H/2 行)
@@ -276,7 +277,7 @@ __global__ __launch_bounds__(test_operator::mla_bwd::NUM_THREADS, 1) void test_m
     int topk_length,                 // TopK length
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
     float* __restrict__ dKV,          // [topk_length, D_K]
-    float* __restrict__ dQ,            // [B_H, D_Q] = [128, 576] (dQ gradient)
+    test_operator::mla_bwd::bf16* __restrict__ dQ,  // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 );
 
@@ -292,6 +293,6 @@ void launch_test_mla_bwd(
     int topk_length,
     const float* delta,
     float* dKV,
-    float* dQ,
+    test_operator::mla_bwd::bf16* dQ,
     cudaStream_t stream = nullptr
 );

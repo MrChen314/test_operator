@@ -1,88 +1,15 @@
-root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# python test_mla_bwd.py 
-CUDA Device: CF-NG-BZZ2-O
-CUDA Capability: (10, 0)
+finish 18: Kernel execution completed and synchronized
+Random normal:
+  dQ  max_diff=7.812500e-03, rel_diff=1.156330e-05
+  dKV max_diff=5.569540e+03, rel_diff=1.563004e-01
+============================================================
+Precision Validation (dQ/dKV)
+============================================================
+PASS dQ  rel_diff=1.156330e-05, threshold=1.00e-02
+FAIL dKV rel_diff=1.563004e-01, threshold=1.00e-02
+dQ  max_diff=7.812500e-03
+dKV max_diff=5.569540e+03
 
 ============================================================
-Testing mla_bwd kernel (dQ/dKV only)
+Some tests FAILED!
 ============================================================
-q shape: [128, 576]
-kv shape: [256, 576]
-dO shape: [128, 512]
-dQ shape: [128, 576]
-dKV shape: [256, 576]
-
-finish -2: Computing delta...
-finish -1: Starting single kernel launch from Python binding, topk_length=256
-finish 0: Launching kernel...
-finish 17: Kernel launch completed
-[CTA 0] finish 1: Kernel started
-[CTA 0] finish 2: TMEM allocated
-[WG2 CTA1] finish 1: WG2 started
-[WG2 CTA0] finish 1: WG2 started
-[WG3 CTA1] finish 1: TMEM tensors allocated
-[WG1 CTA1] finish 1: starting KV tile loop
-[WG1 CTA0] finish 1: starting KV tile loop
-[WG3 CTA0] finish 1: TMEM tensors allocated
-[WG0 CTA1] finish 1: LSE loaded from global memory
-[WG0 CTA0] finish 1: LSE loaded from global memory
-[WG2 CTA1] k=0 step 2-pre: wait bar_dkv_part0_ready phase=0
-[WG1 CTA1] k=0 arrive bar_prologue_kv tx posted
-[WG1 CTA0] k=0 arrive bar_prologue_kv tx posted
-[WG2 CTA0] k=0 step 2-pre: wait bar_dkv_part0_ready phase=0
-[WG3 CTA0] k=0 step 1-pre: wait bar_prologue_kv phase=0
-[WG1 CTA1] k=0 bar_kv_peer_cp_async wait done phase=0
-[WG1 CTA0] k=0 bar_kv_peer_cp_async wait done phase=0
-[WG3 CTA0] k=0 step 1: bar_prologue_kv done
-[WG1 CTA1] k=0 bar_kv_peer_ready arrive
-[WG3 CTA0] k=0 step 2a: P done, bar_p_ready
-[WG0 CTA1] k=0 P is ready, computing softmax
-[WG0 CTA0] k=0 P is ready, computing softmax
-[WG1 CTA0] k=0 bar_kv_peer_ready arrive
-[WG1 CTA1] k=0 finish: KV/kv_peer ready
-[WG3 CTA0] k=0 step 2b: dP done, bar_dp_ready
-[WG0 CTA1] finish 5: softmax computed and s stored to SMEM
-[WG0 CTA0] finish 5: softmax computed and s stored to SMEM
-[WG1 CTA0] k=0 finish: KV/kv_peer ready
-[WG1 CTA1] k=1 wait bar_dq_ready phase=0 (begin)
-[WG0 CTA1] finish 6: s ready for WG3
-[WG3 CTA0] k=0 step 3-pre: wait bar_s_ready phase=0
-[WG0 CTA0] finish 6: s ready for WG3
-[WG1 CTA0] k=1 wait bar_dq_ready phase=0 (begin)
-[WG0 CTA1] finish 7: delta loaded from global memory
-[WG3 CTA0] k=0 step 3: bar_s_ready done
-[WG0 CTA0] finish 7: delta loaded from global memory
-[WG0 CTA1] finish 8: dP is ready, computing ds
-[WG3 CTA0] k=0 step 4-pre: wait bar_ds_ready phase=0
-[WG0 CTA0] finish 8: dP is ready, computing ds
-[WG0 CTA1] finish 9: dp loaded from TMEM
-[WG0 CTA0] finish 9: dp loaded from TMEM
-[WG0 CTA1] finish 10: ds computed and stored to SMEM
-[WG0 CTA0] finish 10: ds computed and stored to SMEM
-[WG0 CTA1] k=0 finish 11: ds ready for WG3
-[WG0 CTA0] k=0 finish 11: ds ready for WG3
-[WG3 CTA0] k=0 step 4: bar_ds_ready done
-[WG3 CTA0] k=0 step 5: bar_dkv_part0_ready arrive
-[WG2 CTA0] k=0 step 2: bar_dkv_part0_ready done
-[WG3 CTA0] k=0 step 6-pre: wait bar_kv_peer_ready phase=0
-[WG2 CTA0] k=0 step 3: bar_dkv_part0_done arrive
-[WG3 CTA0] k=0 step 6: bar_kv_peer_ready done
-[WG2 CTA0] k=0 step 4-pre: wait bar_dkv_part1_ready phase=0
-[WG3 CTA0] k=0 step 7: bar_dq_ready arrive
-[WG1 CTA0] k=1 wait bar_dq_ready phase=0 (done)
-[WG3 CTA0] k=0 step 8-pre: wait bar_dkv_part0_done phase=0
-[WG1 CTA0] k=1 arrive bar_prologue_kv tx posted
-[WG3 CTA0] k=0 step 8: bar_dkv_part0_done done
-[WG1 CTA0] k=1 launch_tma_copy KV tile=2
-[WG2 CTA0] k=0 step 4: bar_dkv_part1_ready done
-[WG3 CTA0] k=0 step 9: bar_dkv_part1_ready arrive
-[WG2 CTA0] k=0 step 5: bar_dkv_part1_done arrive
-[WG3 CTA0] k=0 step 10-pre: wait bar_dkv_part1_done phase=0
-[WG2 CTA0] k=0 step 6-pre: wait bar_dkv_part2_ready phase=0
-[WG3 CTA0] k=0 step 10: bar_dkv_part1_done done
-[WG2 CTA0] k=0 step 6: bar_dkv_part2_ready done
-[WG3 CTA0] k=0 step 11: bar_dkv_part2_ready arrive
-[WG2 CTA0] k=0 step 7: bar_dkv_part2_done arrive
-[WG3 CTA0] k=0 step 12-pre: wait bar_dkv_part2_done phase=0
-[WG2 CTA0] k=1 step 2-pre: wait bar_dkv_part0_ready phase=1
-[WG3 CTA0] k=0 step 12: bar_dkv_part2_done done
-[WG3 CTA0] k=1 step 1-pre: wait bar_prologue_kv phase=1

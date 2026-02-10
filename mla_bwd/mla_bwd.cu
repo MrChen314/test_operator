@@ -11,6 +11,7 @@
 using namespace test_operator::mla_bwd;
 using cutlass::arch::fence_barrier_init;
 using cutlass::arch::fence_view_async_shared;
+using cutlass::arch::NamedBarrier;
 
 // Helper function: float2 subtraction using float2_add and float2_neg
 CUTE_DEVICE
@@ -97,7 +98,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     int topk_length,                 // TopK length
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
     float* __restrict__ dKV,          // [topk_length, D_K] (dKV gradient, float32 for atomic add)
-    float* __restrict__ dQ,           // [B_H, D_Q] = [128, 576] (dQ gradient, float32)
+    bf16* __restrict__ dQ,            // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
@@ -132,6 +133,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_KV.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_dQ.get_tma_descriptor());
     }
     
     if (tid == 0 && cta_idx == 0 && blockIdx.x == 0) {
@@ -428,73 +430,89 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             printf("[WG0 CTA%d] finish 12: dQ is ready, transferring to global memory\n", cta_idx);
         }
         
-        // Step 13: Read dQ from TMEM and write to global memory
+        // Step 13: Read dQ (fp32) from TMEM, convert to bf16 in SMEM, then TMA-store to global memory
         // dQ shape: [B_H, D_Q] = [128, 576], each CTA handles [B_H/2, D_Q] = [64, 576]
-        // dQ is stored in two parts: dQ_NoPE (dims 0-511) and dQ_RoPE (dims 512-575)
-        // TMEM layout: dQ uses cols dQ (256 cols for [64, 512] in two tiles) and dQ_RoPE (32 cols for [64, 64])
         {
             constexpr int dQ_ROWS = B_H / 2;  // 64
-            
-            int dQ_cta_row_offset = cta_idx * dQ_ROWS;
-            
-            // Each thread handles a portion of dQ
-            // Thread mapping: 128 threads handle 64 rows x 576 cols
-            // We'll have each of the 128 threads handle different rows/cols
-            
-            // For dQ_NoPE part (dims 0-511): read from TMEM and write to global in chunks
-            // Use 8 chunks to reduce per-thread register footprint.
-            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;  // 128 floats per thread per tile half
+            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;            // 128 floats/thread per NoPE tile-half
             constexpr int NOPE_CHUNKS = 8;
-            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16 floats per chunk
-            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;  // 8 float2 per chunk
-            
-            int row_in_cta = idx_in_warpgroup % dQ_ROWS;  // 0-63
+            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16 floats/chunk
+            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;                 // 8 float2/chunk
+            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;                      // 16 float2/row
+
+            Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dq.data()), SmemLayoutQ{});
+
+            int row_in_cta = idx_in_warpgroup % dQ_ROWS;   // 0-63
             int col_half = idx_in_warpgroup / dQ_ROWS;     // 0 or 1
-            int global_row = dQ_cta_row_offset + row_in_cta;
-            
+
             uint32_t tmem_base_dq = plan.tmem_start_addr.data()[0];
             uint32_t tmem_addr_dq0 = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ;
             uint32_t tmem_addr_dq1 = tmem_base_dq + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
-            // 8-iteration loop for NoPE output (both 256-col tiles)
+            // dQ_NoPE part0: cols [0, 255]
+            CUTE_UNROLL
             for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
                 const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
                 float2 dq_chunk[NOPE_CHUNK_FLOAT2];
-
-                // Tile 0: cols [0, 255]
                 ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-                for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
-                    int col = col_half * (256 / 2) + chunk_col_base + i * 2;
-                    dQ[global_row * D_Q + col] = dq_chunk[i].x;
-                    dQ[global_row * D_Q + col + 1] = dq_chunk[i].y;
-                }
 
-                // Tile 1: cols [256, 511]
+                CUTE_UNROLL
+                for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
+                    int col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
+                    sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
+                }
+            }
+
+            // dQ_NoPE part1: cols [256, 511]
+            CUTE_UNROLL
+            for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
+                const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
+                float2 dq_chunk[NOPE_CHUNK_FLOAT2];
                 ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
+
+                CUTE_UNROLL
                 for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
-                    int col = 256 + col_half * (256 / 2) + chunk_col_base + i * 2;
-                    dQ[global_row * D_Q + col] = dq_chunk[i].x;
-                    dQ[global_row * D_Q + col + 1] = dq_chunk[i].y;
+                    int col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
+                    sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
                 }
             }
-            
-            // Read dQ_RoPE (cols 512-575)
-            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;  // 16 float2 per row
+
+            // dQ_RoPE: cols [512, 575]
             float2 dq_rope[ROPE_FLOAT2_PER_ROW];
             uint32_t tmem_addr_dq_rope = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
             ku::tmem_ld_32dp32bNx<D_ROPE/2>(tmem_addr_dq_rope, dq_rope);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
-            
-            // Write dQ_RoPE to global memory
+
+            CUTE_UNROLL
             for (int i = 0; i < ROPE_FLOAT2_PER_ROW; ++i) {
                 int col = D_V + col_half * (D_ROPE / 2) + i * 2;
-                dQ[global_row * D_Q + col] = dq_rope[i].x;
-                dQ[global_row * D_Q + col + 1] = dq_rope[i].y;
+                sdQ(row_in_cta, col) = bf16(dq_rope[i].x);
+                sdQ(row_in_cta, col + 1) = bf16(dq_rope[i].y);
+            }
+
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, 0);
+
+            if (warp_idx == 0 && elect_one_sync()) {
+                Tensor gdQ = flat_divide(
+                    tma_params.tma_dQ.get_tma_tensor(tma_params.shape_dQ)(_, _),
+                    Tile<Int<B_H/2>>{}
+                )(_, cta_idx, _);
+                auto thr_tma_dq = tma_params.tma_dQ.get_slice(_0{});
+                cute::copy(
+                    tma_params.tma_dQ,
+                    thr_tma_dq.partition_S(sdQ),
+                    thr_tma_dq.partition_D(gdQ)
+                );
+                cute::tma_store_arrive();
+                cute::tma_store_wait<0>();
             }
         }
         
@@ -954,7 +972,7 @@ void launch_test_mla_bwd(
     int topk_length,
     const float* delta,
     float* dKV,
-    float* dQ,
+    bf16* dQ,
     cudaStream_t stream
 ) {
     // Create TMA descriptors for prologue loads (Q/KV/dO)
@@ -998,18 +1016,30 @@ void launch_test_mla_bwd(
         SmemLayoutdO{}
     );
 
+    auto shape_dQ = cute::make_shape(B_H, D_Q);
+    auto tma_dQ = cute::make_tma_copy(
+        cute::SM90_TMA_STORE{},
+        cute::make_tensor(
+            cute::make_gmem_ptr((bf16*)dQ),
+            cute::make_layout(shape_dQ, cute::make_stride(D_Q, cute::_1{}))
+        ),
+        SmemLayoutQ{}
+    );
+
     using KernelTmaParams = TmaParams<
         decltype(shape_Q_nope), decltype(tma_Q_nope),
         decltype(shape_Q_rope), decltype(tma_Q_rope),
         decltype(shape_KV), decltype(tma_KV),
-        decltype(shape_dO), decltype(tma_dO)
+        decltype(shape_dO), decltype(tma_dO),
+        decltype(shape_dQ), decltype(tma_dQ)
     >;
 
     KernelTmaParams tma_params = {
         shape_Q_nope, tma_Q_nope,
         shape_Q_rope, tma_Q_rope,
         shape_KV, tma_KV,
-        shape_dO, tma_dO
+        shape_dO, tma_dO,
+        shape_dQ, tma_dQ
     };
 
     auto kernel = &test_mla_bwd_kernel<KernelTmaParams>;
@@ -1101,8 +1131,12 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
         .device(q.device());
     
     torch::Tensor delta = torch::empty({B_H}, options_f32);
+    auto options_bf16 = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(q.device());
+
     torch::Tensor dKV = torch::zeros({topk_length, D_K}, options_f32);
-    torch::Tensor dQ = torch::zeros({B_H, D_Q}, options_f32);
+    torch::Tensor dQ = torch::zeros({B_H, D_Q}, options_bf16);
     
     // Get data pointers
     const bf16* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr<at::BFloat16>());
@@ -1113,7 +1147,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     const int32_t* indices_ptr = indices.data_ptr<int32_t>();
     float* delta_ptr = delta.data_ptr<float>();
     float* dKV_ptr = dKV.data_ptr<float>();
-    float* dQ_ptr = dQ.data_ptr<float>();
+    bf16* dQ_ptr = reinterpret_cast<bf16*>(dQ.data_ptr<at::BFloat16>());
     
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();

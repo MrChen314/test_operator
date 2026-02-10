@@ -66,7 +66,7 @@ def run_one_case(name: str, q: torch.Tensor, kv: torch.Tensor, dO: torch.Tensor,
     dQ_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
     torch.cuda.synchronize()
 
-    dQ_max_diff, dQ_rel_diff = calc_diff(dQ_cuda, dQ_ref)
+    dQ_max_diff, dQ_rel_diff = calc_diff(dQ_cuda, dQ_ref.bfloat16())
     dKV_max_diff, dKV_rel_diff = calc_diff(dKV_cuda, dKV_ref)
 
     print(f"{name}:")
