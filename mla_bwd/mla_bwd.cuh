@@ -16,6 +16,23 @@ using namespace cute;
 
 using bf16 = cutlass::bfloat16_t;
 
+template<
+    typename Shape_QNoPE, typename TMA_QNoPE,
+    typename Shape_QRoPE, typename TMA_QRoPE,
+    typename Shape_KV, typename TMA_KV,
+    typename Shape_dO, typename TMA_dO
+>
+struct TmaParams {
+    Shape_QNoPE shape_Q_nope;
+    TMA_QNoPE tma_Q_nope;
+    Shape_QRoPE shape_Q_rope;
+    TMA_QRoPE tma_Q_rope;
+    Shape_KV shape_KV;
+    TMA_KV tma_KV;
+    Shape_dO shape_dO;
+    TMA_dO tma_dO;
+};
+
 // ============================================================================
 // 维度常量定义
 // ============================================================================
@@ -31,7 +48,7 @@ static constexpr bool HAVE_ROPE = (D_QK == 576);    // 是否启用 RoPE
 // 2CTA 相关常量定义
 // ============================================================================
 static constexpr int B_H = 128;                     // Query head 块大小 (2CTA 共享，每个 CTA 处理 B_H/2=64 行)
-static constexpr int B_TOPK = 64;                    // TopK 块大小 (2CTA 模式每次处理 64 个 topk，每个 CTA 加载 B_TOPK/2=32 行)
+static constexpr int B_TOPK = 64;                    // 编译期 tile 大小。运行时 topk 由 kernel 内按 64 分块循环处理
 static constexpr int NUM_THREADS = 4 * 128; // 4个 WarpGroup，每个128线程
 
 // SMEM Layout definitions (from config.h)
@@ -206,15 +223,18 @@ struct alignas(128) SharedMemoryPlan {
     // ========================================================================
     // 同步屏障 (2CTA 同步)
     // ========================================================================
-    // WG1-WG3 同步屏障
-    transac_bar_t bar_qkv_loaded;               // WG1通知WG3 q/k/dO已加载到SMEM (2CTA sync)
+    // Prologue TMA load barriers
+    transac_bar_t bar_prologue_q_nope;          // Q_NoPE TMA 完成
+    transac_bar_t bar_prologue_q_rope;          // Q_RoPE TMA 完成
+    transac_bar_t bar_prologue_kv;              // KV TMA 完成
+    transac_bar_t bar_prologue_dO;              // dO TMA 完成
     // WG0-WG3 同步屏障
     transac_bar_t bar_p_ready;                  // WG3通知WG0 p已准备好 (2CTA sync)
     transac_bar_t bar_dp_ready;                 // WG3通知WG0 dp已准备好 (2CTA sync)
     transac_bar_t bar_s_ready;                  // WG0通知WG3 s已准备好 (2CTA sync)
     transac_bar_t bar_ds_ready;                 // WG0通知WG3 ds已准备好 (2CTA sync)
-    transac_bar_t bar_k_valid_free;             
-    transac_bar_t bar_k_valid_ready;            // WG3通知WG0 k有效性掩码已加载到SMEM
+    transac_bar_t bar_k_valid_free;             // Reserved for future k-mask path (unused now)
+    transac_bar_t bar_k_valid_ready;            // Reserved for future k-mask path (unused now)
     // WG3-WG2 同步屏障 (dKV computation)
     transac_bar_t bar_dkv_part0_ready;          // WG3通知WG2 dKV_part0计算完成
     transac_bar_t bar_dkv_part1_ready;          // WG3通知WG2 dKV_part1计算完成
@@ -244,26 +264,20 @@ static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
 
 // Kernel declaration (cluster dims specified at launch time)
 // Must be in global scope for CUDA kernel
-__global__ void test_mla_bwd_kernel(
+template<typename TmaParamsType>
+__global__ __launch_bounds__(test_operator::mla_bwd::NUM_THREADS, 1) void test_mla_bwd_kernel(
     const test_operator::mla_bwd::bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
-    const test_operator::mla_bwd::bf16* __restrict__ kv,      // [B_TOPK, D_K] = [64, 576]
+    const test_operator::mla_bwd::bf16* __restrict__ kv,      // [topk_length, D_K]
     const test_operator::mla_bwd::bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
     const float* __restrict__ lse,     // [B_H] = [128] (log-sum-exp for softmax)
     const test_operator::mla_bwd::bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
-    const int32_t* __restrict__ gIndices,  // [B_TOPK] = [64] (indices for sparse attention)
+    const int32_t* __restrict__ gIndices,  // [topk_length]
     int s_kv,                        // KV sequence length
     int topk_length,                 // TopK length
-    test_operator::mla_bwd::bf16* __restrict__ q_out,        // [B_H, D_Q] = [128, 576] (output Q from SMEM)
-    test_operator::mla_bwd::bf16* __restrict__ kv_out,       // [B_TOPK, D_K] = [64, 576] (output KV from SMEM)
-    test_operator::mla_bwd::bf16* __restrict__ dO_out,       // [B_H, D_V] = [128, 512] (output dO from SMEM)
-    float* __restrict__ P,           // [B_H, B_TOPK] = [128, 64] (P = Q @ K^T)
-    float* __restrict__ dP,           // [B_H, B_TOPK] = [128, 64] (dP = dO @ V^T)
-    test_operator::mla_bwd::bf16* __restrict__ s,           // [B_H, B_TOPK] = [128, 64] (softmax values)
-    test_operator::mla_bwd::bf16* __restrict__ ds,           // [B_H, B_TOPK] = [128, 64] (dS gradients)
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
-    float* __restrict__ dKV,          // [B_TOPK, D_K] = [64, 576] (dKV gradient, float32 for atomic add)
-    test_operator::mla_bwd::bf16* __restrict__ sdO_t_out,  // [D_V, B_H] = [512, 128] (dO transposed output)
-    float* __restrict__ dQ             // [B_H, D_Q] = [128, 576] (dQ gradient)
+    float* __restrict__ dKV,          // [topk_length, D_K]
+    float* __restrict__ dQ,            // [B_H, D_Q] = [128, 576] (dQ gradient)
+    __grid_constant__ const TmaParamsType tma_params
 );
 
 // C++ wrapper declaration
@@ -276,16 +290,8 @@ void launch_test_mla_bwd(
     const int32_t* gIndices,
     int s_kv,
     int topk_length,
-    test_operator::mla_bwd::bf16* q_out,
-    test_operator::mla_bwd::bf16* kv_out,
-    test_operator::mla_bwd::bf16* dO_out,
-    float* P,
-    float* dP,
-    test_operator::mla_bwd::bf16* s,
-    test_operator::mla_bwd::bf16* ds,
     const float* delta,
     float* dKV,
-    test_operator::mla_bwd::bf16* sdO_t_out,
     float* dQ,
     cudaStream_t stream = nullptr
 );

@@ -1,101 +1,88 @@
-root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
-                module.to(
-                ^
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# python test_mla_bwd.py 
+CUDA Device: CF-NG-BZZ2-O
+CUDA Capability: (10, 0)
 
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(158): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                module.to(detail::py_object_to_dtype(object), non_blocking);
-                ^
+============================================================
+Testing mla_bwd kernel (dQ/dKV only)
+============================================================
+q shape: [128, 576]
+kv shape: [256, 576]
+dO shape: [128, 512]
+dQ shape: [128, 576]
+dKV shape: [256, 576]
 
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(171): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(detail::py_object_to_device(device), non_blocking);
-                  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(173): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-                  module.to(
-                  ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(480): warning #177-D: variable "dQ_NOPE_COLS" was declared but never referenced
-              constexpr int dQ_NOPE_COLS = D_V;
-                            ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(481): warning #177-D: variable "dQ_ROPE_COLS" was declared but never referenced
-              constexpr int dQ_ROPE_COLS = D_ROPE;
-                            ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu(118): warning #177-D: variable "lane_idx" was declared but never referenced
-      const int lane_idx = threadIdx.x % 32;
-                ^
-
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/atom/mma_traits_sm100.hpp(294): error: static assertion failed with "Not a canonical UMMA_K Layout: Expected stride failure."
-      static_assert(stride_00 == expected_stride_00, "Not a canonical UMMA_K Layout: Expected stride failure.");
-      ^
-          detected during:
-            instantiation of "cute::UMMA::SmemDescriptor cute::UMMA::make_umma_desc<MajorMode,TEngine,TLayout>(const cute::Tensor<TEngine, TLayout> &) [with MajorMode=cute::UMMA::Major::K, TEngine=cute::ViewEngine<cute::smem_ptr<test_operator::mla_bwd::bf16 *>>, TLayout=cute::Layout<cute::tuple<cute::tuple<cute::_8, cute::_8>, cute::_16>, cute::tuple<cute::tuple<cute::_1, cute::_512>, cute::_8>>]" at line 28 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/helpers.cuh
-            instantiation of "void kerutils::utcmma_ss(TiledMMA &, TensorA, TensorB, TensorFragC, __nv_bool) [with TiledMMA=test_operator::mla_bwd::TiledMMA_dQ, TensorA=cute::Tensor<cute::ViewEngine<cute::smem_ptr<test_operator::mla_bwd::bf16 *>>, cute::Layout<cute::tuple<cute::tuple<cute::_8, cute::_8>, cute::_64>, cute::tuple<cute::tuple<cute::_1, cute::_512>, cute::_8>>>, TensorB=cute::Tensor<cute::ViewEngine<cute::swizzle_ptr<cute::Swizzle<3, 4, 3>, cute::smem_ptr<test_operator::mla_bwd::bf16 *>>>, cute::Layout<cute::tuple<cute::tuple<cute::_64, cute::_4>, cute::C<32>>, cute::tuple<cute::tuple<cute::_1, cute::_2048>, cute::_64>>>, TensorFragC=cute::Tensor<cute::ViewEngine<cute::tmem_ptr<float>>, cute::Layout<cute::tuple<cute::tuple<cute::_64, cute::tuple<cute::_128, cute::C<2>>>, cute::_1, cute::_1>, cute::tuple<cute::tuple<cute::C<65536>, cute::tuple<cute::_1, cute::C<4194304>>>, cute::C<0>, cute::C<0>>>>]" at line 1070 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu
-
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/helpers.cuh(30): error: static assertion failed
-      static_assert(size<2>(sA_frag) == size<2>(sB_frag));
-      ^
-          detected during instantiation of "void kerutils::utcmma_ss(TiledMMA &, TensorA, TensorB, TensorFragC, __nv_bool) [with TiledMMA=test_operator::mla_bwd::TiledMMA_dQ, TensorA=cute::Tensor<cute::ViewEngine<cute::smem_ptr<test_operator::mla_bwd::bf16 *>>, cute::Layout<cute::tuple<cute::tuple<cute::_8, cute::_8>, cute::_64>, cute::tuple<cute::tuple<cute::_1, cute::_512>, cute::_8>>>, TensorB=cute::Tensor<cute::ViewEngine<cute::swizzle_ptr<cute::Swizzle<3, 4, 3>, cute::smem_ptr<test_operator::mla_bwd::bf16 *>>>, cute::Layout<cute::tuple<cute::tuple<cute::_64, cute::_4>, cute::C<32>>, cute::tuple<cute::tuple<cute::_1, cute::_2048>, cute::_64>>>, TensorFragC=cute::Tensor<cute::ViewEngine<cute::tmem_ptr<float>>, cute::Layout<cute::tuple<cute::tuple<cute::_64, cute::tuple<cute::_128, cute::C<2>>>, cute::_1, cute::_1>, cute::tuple<cute::tuple<cute::C<65536>, cute::tuple<cute::_1, cute::C<4194304>>>, cute::C<0>, cute::C<0>>>>]" at line 1070 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu
-
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/helpers.cuh(30): error: static assertion failed
-      static_assert(size<2>(sA_frag) == size<2>(sB_frag));
-      ^
-          detected during instantiation of "void kerutils::utcmma_ss(TiledMMA &, TensorA, TensorB, TensorFragC, __nv_bool) [with TiledMMA=test_operator::mla_bwd::TiledMMA_dQ_RoPE, TensorA=cute::Tensor<cute::ViewEngine<cute::smem_ptr<test_operator::mla_bwd::bf16 *>>, cute::Layout<cute::tuple<cute::tuple<cute::_8, cute::_8>, cute::_64>, cute::tuple<cute::tuple<cute::_1, cute::_512>, cute::_8>>>, TensorB=cute::Tensor<cute::ViewEngine<cute::swizzle_ptr<cute::Swizzle<3, 4, 3>, cute::smem_ptr<test_operator::mla_bwd::bf16 *>>>, cute::Layout<cute::tuple<cute::C<64>, cute::C<32>>, cute::tuple<cute::_1, cute::C<64>>>>, TensorFragC=cute::Tensor<cute::ViewEngine<cute::tmem_ptr<float>>, cute::Layout<cute::tuple<cute::tuple<cute::_64, cute::tuple<cute::_32, cute::_2>>, cute::_1, cute::_1>, cute::tuple<cute::tuple<cute::C<65536>, cute::tuple<cute::_1, cute::C<4194304>>>, cute::C<0>, cute::C<0>>>>]" at line 1094 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu
-
-3 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu".
-ninja: build stopped: subcommand failed.
-Traceback (most recent call last):
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
-    subprocess.run(
-  File "/usr/lib/python3.12/subprocess.py", line 571, in run
-    raise CalledProcessError(retcode, process.args,
-subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/setup.py", line 73, in <module>
-    setup(
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
-    return distutils.core.setup(**attrs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
-    return run_commands(dist)
-           ^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
-    dist.run_commands()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
-    self.run_command(cmd)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
-    super().run_command(command)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
-    cmd_obj.run()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
-    _build_ext.run(self)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
-    self.build_extensions()
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
-    build_ext.build_extensions(self)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
-    self._build_extensions_serial()
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
-    self.build_extension(ext)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
-    _build_ext.build_extension(self, ext)
-  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
-    super().build_extension(ext)
-  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
-    objects = self.compiler.compile(
-              ^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
-    _write_ninja_file_and_compile_objects(
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
-    _run_ninja_build(
-  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
-    raise RuntimeError(message) from e
-RuntimeError: Error compiling objects for extension
+finish -2: Computing delta...
+finish -1: Starting single kernel launch from Python binding, topk_length=256
+finish 0: Launching kernel...
+finish 17: Kernel launch completed
+[CTA 0] finish 1: Kernel started
+[CTA 0] finish 2: TMEM allocated
+[WG2 CTA1] finish 1: WG2 started
+[WG2 CTA0] finish 1: WG2 started
+[WG3 CTA1] finish 1: TMEM tensors allocated
+[WG1 CTA1] finish 1: starting KV tile loop
+[WG1 CTA0] finish 1: starting KV tile loop
+[WG3 CTA0] finish 1: TMEM tensors allocated
+[WG0 CTA1] finish 1: LSE loaded from global memory
+[WG0 CTA0] finish 1: LSE loaded from global memory
+[WG2 CTA1] k=0 step 2-pre: wait bar_dkv_part0_ready phase=0
+[WG1 CTA1] k=0 arrive bar_prologue_kv tx posted
+[WG1 CTA0] k=0 arrive bar_prologue_kv tx posted
+[WG2 CTA0] k=0 step 2-pre: wait bar_dkv_part0_ready phase=0
+[WG3 CTA0] k=0 step 1-pre: wait bar_prologue_kv phase=0
+[WG1 CTA1] k=0 bar_kv_peer_cp_async wait done phase=0
+[WG1 CTA0] k=0 bar_kv_peer_cp_async wait done phase=0
+[WG3 CTA0] k=0 step 1: bar_prologue_kv done
+[WG1 CTA1] k=0 bar_kv_peer_ready arrive
+[WG3 CTA0] k=0 step 2a: P done, bar_p_ready
+[WG0 CTA1] k=0 P is ready, computing softmax
+[WG0 CTA0] k=0 P is ready, computing softmax
+[WG1 CTA0] k=0 bar_kv_peer_ready arrive
+[WG1 CTA1] k=0 finish: KV/kv_peer ready
+[WG3 CTA0] k=0 step 2b: dP done, bar_dp_ready
+[WG0 CTA1] finish 5: softmax computed and s stored to SMEM
+[WG0 CTA0] finish 5: softmax computed and s stored to SMEM
+[WG1 CTA0] k=0 finish: KV/kv_peer ready
+[WG1 CTA1] k=1 wait bar_dq_ready phase=0 (begin)
+[WG0 CTA1] finish 6: s ready for WG3
+[WG3 CTA0] k=0 step 3-pre: wait bar_s_ready phase=0
+[WG0 CTA0] finish 6: s ready for WG3
+[WG1 CTA0] k=1 wait bar_dq_ready phase=0 (begin)
+[WG0 CTA1] finish 7: delta loaded from global memory
+[WG3 CTA0] k=0 step 3: bar_s_ready done
+[WG0 CTA0] finish 7: delta loaded from global memory
+[WG0 CTA1] finish 8: dP is ready, computing ds
+[WG3 CTA0] k=0 step 4-pre: wait bar_ds_ready phase=0
+[WG0 CTA0] finish 8: dP is ready, computing ds
+[WG0 CTA1] finish 9: dp loaded from TMEM
+[WG0 CTA0] finish 9: dp loaded from TMEM
+[WG0 CTA1] finish 10: ds computed and stored to SMEM
+[WG0 CTA0] finish 10: ds computed and stored to SMEM
+[WG0 CTA1] k=0 finish 11: ds ready for WG3
+[WG0 CTA0] k=0 finish 11: ds ready for WG3
+[WG3 CTA0] k=0 step 4: bar_ds_ready done
+[WG3 CTA0] k=0 step 5: bar_dkv_part0_ready arrive
+[WG2 CTA0] k=0 step 2: bar_dkv_part0_ready done
+[WG3 CTA0] k=0 step 6-pre: wait bar_kv_peer_ready phase=0
+[WG2 CTA0] k=0 step 3: bar_dkv_part0_done arrive
+[WG3 CTA0] k=0 step 6: bar_kv_peer_ready done
+[WG2 CTA0] k=0 step 4-pre: wait bar_dkv_part1_ready phase=0
+[WG3 CTA0] k=0 step 7: bar_dq_ready arrive
+[WG1 CTA0] k=1 wait bar_dq_ready phase=0 (done)
+[WG3 CTA0] k=0 step 8-pre: wait bar_dkv_part0_done phase=0
+[WG1 CTA0] k=1 arrive bar_prologue_kv tx posted
+[WG3 CTA0] k=0 step 8: bar_dkv_part0_done done
+[WG1 CTA0] k=1 launch_tma_copy KV tile=2
+[WG2 CTA0] k=0 step 4: bar_dkv_part1_ready done
+[WG3 CTA0] k=0 step 9: bar_dkv_part1_ready arrive
+[WG2 CTA0] k=0 step 5: bar_dkv_part1_done arrive
+[WG3 CTA0] k=0 step 10-pre: wait bar_dkv_part1_done phase=0
+[WG2 CTA0] k=0 step 6-pre: wait bar_dkv_part2_ready phase=0
+[WG3 CTA0] k=0 step 10: bar_dkv_part1_done done
+[WG2 CTA0] k=0 step 6: bar_dkv_part2_ready done
+[WG3 CTA0] k=0 step 11: bar_dkv_part2_ready arrive
+[WG2 CTA0] k=0 step 7: bar_dkv_part2_done arrive
+[WG3 CTA0] k=0 step 12-pre: wait bar_dkv_part2_done phase=0
+[WG2 CTA0] k=1 step 2-pre: wait bar_dkv_part0_ready phase=1
+[WG3 CTA0] k=0 step 12: bar_dkv_part2_done done
+[WG3 CTA0] k=1 step 1-pre: wait bar_prologue_kv phase=1
