@@ -269,17 +269,18 @@ static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
 // Must be in global scope for CUDA kernel
 template<typename TmaParamsType>
 __global__ __launch_bounds__(test_operator::mla_bwd::NUM_THREADS, 1) void test_mla_bwd_kernel(
-    const test_operator::mla_bwd::bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
+    const test_operator::mla_bwd::bf16* __restrict__ q,      // [s_q, B_H, D_Q]
     const test_operator::mla_bwd::bf16* __restrict__ kv,      // [s_kv, D_K]
-    const test_operator::mla_bwd::bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
-    const float* __restrict__ lse,     // [B_H] = [128] (log-sum-exp for softmax)
-    const test_operator::mla_bwd::bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
-    const int32_t* __restrict__ gIndices,  // [topk_length]
+    const test_operator::mla_bwd::bf16* __restrict__ dO,     // [s_q, B_H, D_V]
+    const float* __restrict__ lse,     // [s_q, B_H] (log-sum-exp for softmax)
+    const test_operator::mla_bwd::bf16* __restrict__ O,     // [s_q, B_H, D_V] (forward output O)
+    const int32_t* __restrict__ gIndices,  // [s_q, topk_length]
     int s_kv,                        // KV sequence length
     int topk_length,                 // TopK length
-    const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
+    int s_q,                         // Query sequence length
+    const float* __restrict__ delta,  // [s_q, B_H] (delta = sum(O * dO))
     float* __restrict__ dKV,          // [s_kv, D_K]
-    test_operator::mla_bwd::bf16* __restrict__ dQ,  // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
+    test_operator::mla_bwd::bf16* __restrict__ dQ,  // [s_q, B_H, D_Q] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 );
 
@@ -293,6 +294,7 @@ void launch_test_mla_bwd(
     const int32_t* gIndices,
     int s_kv,
     int topk_length,
+    int s_q,
     const float* delta,
     float* dKV,
     test_operator::mla_bwd::bf16* dQ,

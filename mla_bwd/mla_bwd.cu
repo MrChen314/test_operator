@@ -43,30 +43,33 @@ CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
 
 // Preprocess delta kernel: compute delta = sum(O * dO, dim=-1)
 __global__ void preprocess_delta_kernel(
-    const bf16* __restrict__ O,      // [B_H, D_V] = [128, 512]
-    const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
-    float* __restrict__ delta        // [B_H] = [128]
+    const bf16* __restrict__ O,      // [s_q, B_H, D_V]
+    const bf16* __restrict__ dO,     // [s_q, B_H, D_V]
+    float* __restrict__ delta,       // [s_q, B_H]
+    int s_q
 ) {
     constexpr int D_V = 512;
     constexpr int B_H = 128;
     
+    const int s_q_idx = blockIdx.x;
     const int head_idx = threadIdx.x;  // Each thread processes one head
     
-    if (head_idx >= B_H) return;
+    if (s_q_idx >= s_q || head_idx >= B_H) return;
     
     // Compute delta: delta[i] = sum_j(O[i,j] * dO[i,j])
     float delta_val = 0.0f;
+    const int64_t row_base = ((int64_t)s_q_idx * B_H + head_idx) * D_V;
     
     // Accumulate O * dO using vectorized loads
     CUTE_UNROLL
     for (int col = 0; col < D_V; col += 8) {
         // Vectorized load of O (8 bf16 values = 128 bits)
-        uint4 o_raw = __ldg((const uint4*)(O + head_idx * D_V + col));
+        uint4 o_raw = __ldg((const uint4*)(O + row_base + col));
         bf16x8 o_vec;
         *(uint4*)&o_vec = o_raw;
         
         // Vectorized load of dO (8 bf16 values = 128 bits)
-        uint4 do_raw = __ldg((const uint4*)(dO + head_idx * D_V + col));
+        uint4 do_raw = __ldg((const uint4*)(dO + row_base + col));
         bf16x8 do_vec;
         *(uint4*)&do_vec = do_raw;
         
@@ -82,23 +85,24 @@ __global__ void preprocess_delta_kernel(
     }
     
     // Write delta to global memory
-    delta[head_idx] = delta_val;
+    delta[s_q_idx * B_H + head_idx] = delta_val;
 }
 
 // Kernel implementation: test mla_bwd with Q, KV, dO inputs
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
-    const bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
+    const bf16* __restrict__ q,      // [s_q, B_H, D_Q]
     const bf16* __restrict__ kv,     // [s_kv, D_K]
-    const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
-    const float* __restrict__ lse,   // [B_H] = [128] (log-sum-exp for softmax)
-    const bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
-    const int32_t* __restrict__ gIndices,  // [topk_length] (indices for sparse attention)
+    const bf16* __restrict__ dO,     // [s_q, B_H, D_V]
+    const float* __restrict__ lse,   // [s_q, B_H] (log-sum-exp for softmax)
+    const bf16* __restrict__ O,     // [s_q, B_H, D_V] (forward output O)
+    const int32_t* __restrict__ gIndices,  // [s_q, topk_length] (indices for sparse attention)
     int s_kv,                        // KV sequence length
     int topk_length,                 // TopK length
-    const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
+    int s_q,                         // Query sequence length
+    const float* __restrict__ delta,  // [s_q, B_H] (delta = sum(O * dO))
     float* __restrict__ dKV,          // [s_kv, D_K] (dKV gradient, float32 for atomic add)
-    bf16* __restrict__ dQ,            // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
+    bf16* __restrict__ dQ,            // [s_q, B_H, D_Q] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
@@ -109,8 +113,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     SharedMemoryPlan& plan = *reinterpret_cast<SharedMemoryPlan*>(smem_raw);
     
     const int cta_idx = blockIdx.x % 2;  // 0 or 1
+    const int s_q_idx = blockIdx.x / 2;
+    const int max_kv_i = s_q_idx;
     const int tid = threadIdx.x;
     const int warp_idx = cutlass::canonical_warp_idx_sync();  // Global warp index
+    const int lane_idx = threadIdx.x % 32;
+    if (s_q_idx >= s_q) {
+        return;
+    }
+    const int32_t* gIndices_s = gIndices + (int64_t)s_q_idx * topk_length;
+    const float* lse_s = lse + (int64_t)s_q_idx * B_H;
+    const float* delta_s = delta + (int64_t)s_q_idx * B_H;
     
     // Determine warpgroup: 4 warpgroups, 128 threads each
     // WG0: threads 0-127 (warpgroup_idx = 0, warp_idx = 0-3)
@@ -148,7 +161,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_dp_ready.init(1);       // WG3通知WG0 dp已准备好 (2CTA sync)
         plan.bar_s_ready.init(128);        // WG0通知WG3 s已准备好
         plan.bar_ds_ready.init(128);       // WG0通知WG3 ds已准备好
-        plan.bar_k_valid_free.init(128);
         // WG3-WG2 barriers for dKV computation
         plan.bar_dkv_part0_ready.init(1);
         plan.bar_dkv_part1_ready.init(1);
@@ -160,6 +172,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_kv_peer_cp_async.init(1);      // cp_async transaction barrier
         plan.bar_kv_peer_ready.init(1);         // WG1 notifies WG3 kv_peer is ready
         // WG3-WG0 barrier for dQ computation
+        plan.bar_k_valid_ready.init(8);
+        plan.bar_k_valid_free.init(128);
         plan.bar_dq_ready.init(1);              // WG3 notifies WG0 dQ is ready
         fence_barrier_init();
     }
@@ -185,21 +199,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         if (elect_one_sync()) {
             // Q_NoPE: [B_H, D_V] split by CTA on first dim
             Tensor gQNoPE = flat_divide(
-                tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _),
+                tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_nope, gQNoPE, sQNoPE, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
 
             // Q_RoPE: [B_H, D_ROPE] split by CTA on first dim
             Tensor gQRoPE = flat_divide(
-                tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _),
+                tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
 
             // dO: [B_H, D_V] split by CTA on first dim
             Tensor gdO = flat_divide(
-                tma_params.tma_dO.get_tma_tensor(tma_params.shape_dO)(_, _),
+                tma_params.tma_dO.get_tma_tensor(tma_params.shape_dO)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_dO, gdO, sdO, plan.bar_prologue_dO, TMA::CacheHintSm90::EVICT_FIRST);
@@ -226,7 +240,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         // Load LSE from global memory (needed for softmax computation)
         float row_lse = 0.0f;
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
-        row_lse = __ldg(lse + global_row_idx);
+        row_lse = __ldg(lse_s + global_row_idx);
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG0 CTA%d] finish 1: LSE loaded from global memory\n", cta_idx);
@@ -246,7 +260,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             ku::tcgen05_after_thread_sync();
             
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG0 CTA%d] k=%d P is ready, computing softmax\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG0] P is ready, computing softmax\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
             // Debug output P is removed; keep TMEM->register path for softmax only.
             
@@ -261,39 +276,41 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
-        // plan.bar_k_valid_ready.wait(0);
-        // uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
-        // float* p_float = (float*)p;
-        // CUTE_UNROLL
-        // for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-        //     if (!(is_k_valid_lo >> i & 1))
-        //         p_float[i] = -CUDART_INF_F;
-        // }
+            plan.bar_k_valid_ready.wait(phase);
+            uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+            float* p_float = (float*)p;
+            CUTE_UNROLL
+            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+                if (!(is_k_valid_lo >> i & 1))
+                    p_float[i] = -CUDART_INF_F;
+            }
+            plan.bar_k_valid_free.arrive();
 
-        // if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x == 0) {
-        //     printf("[WG0] finish 4: k valid mask loaded from SMEM\n");
-        // }
+            if (idx_in_warpgroup == 0 && cta_idx == 0 && blockIdx.x < 2) {
+                printf("[B%d SQ%d CTA%d] k=%d [WG0] k valid mask loaded from SMEM\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
+            }
 
-        // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
-        // Compute softmax values: s = exp2(P*scale - LSE)
-        float2 s_fp32[(B_TOPK/2)/2];
-        float2 neg_lse = make_float2(-row_lse, -row_lse);
-        CUTE_UNROLL
-        for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-            float2 scaled_p = ku::float2_fma(p[i], make_float2(scale, scale), neg_lse);
-            scaled_p.x = exp2f(scaled_p.x);
-            scaled_p.y = exp2f(scaled_p.y);
-            // s_fp32[i] = __float22bfloat162_rn(scaled_p);
-            s_fp32[i] = scaled_p;
-        }
-        
-        // Step 4: Store s to SMEM (convert fp32 to bf16)
-        // uint128_t* sS_base = (uint128_t*)plan.s_ds.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-        // CUTE_UNROLL
-        // for (int i = 0; i < B_TOPK/2/8; ++i) {
-        //     sS_base[64*i] = *(uint128_t*)(s_fp32 + i*4);
-        // }
-        // fence_view_async_shared();
+            // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
+            // Compute softmax values: s = exp2(P*scale - LSE)
+            float2 s_fp32[(B_TOPK/2)/2];
+            float2 neg_lse = make_float2(-row_lse, -row_lse);
+            CUTE_UNROLL
+            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
+                float2 scaled_p = ku::float2_fma(p[i], make_float2(scale, scale), neg_lse);
+                scaled_p.x = exp2f(scaled_p.x);
+                scaled_p.y = exp2f(scaled_p.y);
+                // s_fp32[i] = __float22bfloat162_rn(scaled_p);
+                s_fp32[i] = scaled_p;
+            }
+            
+            // Step 4: Store s to SMEM (convert fp32 to bf16)
+            // uint128_t* sS_base = (uint128_t*)plan.s_ds.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
+            // CUTE_UNROLL
+            // for (int i = 0; i < B_TOPK/2/8; ++i) {
+            //     sS_base[64*i] = *(uint128_t*)(s_fp32 + i*4);
+            // }
+            // fence_view_async_shared();
 
             int s_col_offset = (idx_in_warpgroup / 64) * 32;
             CUTE_UNROLL
@@ -304,79 +321,79 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             fence_view_async_shared();
 
         
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 5: softmax computed and s stored to SMEM\n", cta_idx);
-        }
-        
-            if (is_wg0) {
-                __threadfence_block();
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 5: softmax computed and s stored to SMEM\n", cta_idx);
             }
             
-            // Step 5: Notify WG3 that s is ready.
-            if (cta_idx == 0) {
-                plan.bar_s_ready.arrive(0u);
-            } else {
-                plan.bar_s_ready.arrive(1u);
+                if (is_wg0) {
+                    __threadfence_block();
+                }
+                
+                // Step 5: Notify WG3 that s is ready.
+                if (cta_idx == 0) {
+                    plan.bar_s_ready.arrive(0u);
+                } else {
+                    plan.bar_s_ready.arrive(1u);
+                }
+            
+            
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 6: s ready for WG3\n", cta_idx);
             }
-        
-        
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 6: s ready for WG3\n", cta_idx);
-        }
-        
-        // Step 6: Load delta from global memory
-        float delta_val = 0.0f;
-        delta_val = __ldg(delta + global_row_idx);
-        
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 7: delta loaded from global memory\n", cta_idx);
-        }
-        
-            // Step 7: Wait for WG3 to compute dP for current block
-            plan.bar_dp_ready.wait(phase);
-            ku::tcgen05_after_thread_sync();
-        
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 8: dP is ready, computing ds\n", cta_idx);
-        }
+            
+            // Step 6: Load delta from global memory
+            float delta_val = 0.0f;
+        delta_val = __ldg(delta_s + global_row_idx);
+            
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 7: delta loaded from global memory\n", cta_idx);
+            }
+            
+                // Step 7: Wait for WG3 to compute dP for current block
+                plan.bar_dp_ready.wait(phase);
+                ku::tcgen05_after_thread_sync();
+            
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 8: dP is ready, computing ds\n", cta_idx);
+            }
 
-        // Debug output dP is removed; consume dP directly from TMEM below.
-        
-        // Step 8: Load dp from TMEM
-        float2 dp[(B_TOPK/2)/2];
-        uint32_t dp_tmem_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
-        ku::tmem_ld_32dp32bNx<B_TOPK/2>(dp_tmem_addr, dp);
-        cutlass::arch::fence_view_async_tmem_load();
-        ku::tcgen05_before_thread_sync();
-        
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 9: dp loaded from TMEM\n", cta_idx);
-        }
-        
-        // Step 9: Compute ds = s * (dp - delta) * sm_scale
-        // Note: Use fp32 format of s (s_fp32), not bf16 format stored in SMEM
-        // Note: Use sm_scale (not scale which includes log2(e)) for ds computation
-        __nv_bfloat162 ds_fp32[(B_TOPK/2)/2];
-        float2 delta_float2 = make_float2(delta_val, delta_val);
-        float2 sm_scale_float2 = make_float2(sm_scale, sm_scale);
-        CUTE_UNROLL
-        for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-            // Convert s_fp32 back to float2 for computation
-            // float2 s_val = __bfloat1622float2(s_fp32[i]);
-            float2 s_val = s_fp32[i];
-            float2 dp_val = dp[i];
-            float2 dp_minus_delta = float2_sub(dp_val, delta_float2);
-            float2 ds_val = ku::float2_mul(ku::float2_mul(s_val, dp_minus_delta), sm_scale_float2);
-            ds_fp32[i] = __float22bfloat162_rn(ds_val);
-        }
+            // Debug output dP is removed; consume dP directly from TMEM below.
             
-        // Step 10: Store ds to SMEM (convert fp32 to bf16)
-        // uint128_t* sDS_base = (uint128_t*)plan.s_ds.ds.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-        // CUTE_UNROLL
-        // for (int i = 0; i < B_TOPK/2/8; ++i) {
-        //     sDS_base[64*i] = *(uint128_t*)(ds_fp32 + i*4);
-        // }
-        // fence_view_async_shared();
+            // Step 8: Load dp from TMEM
+            float2 dp[(B_TOPK/2)/2];
+            uint32_t dp_tmem_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
+            ku::tmem_ld_32dp32bNx<B_TOPK/2>(dp_tmem_addr, dp);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
+            
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 9: dp loaded from TMEM\n", cta_idx);
+            }
+            
+            // Step 9: Compute ds = s * (dp - delta) * sm_scale
+            // Note: Use fp32 format of s (s_fp32), not bf16 format stored in SMEM
+            // Note: Use sm_scale (not scale which includes log2(e)) for ds computation
+            __nv_bfloat162 ds_fp32[(B_TOPK/2)/2];
+            float2 delta_float2 = make_float2(delta_val, delta_val);
+            float2 sm_scale_float2 = make_float2(sm_scale, sm_scale);
+            CUTE_UNROLL
+            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
+                // Convert s_fp32 back to float2 for computation
+                // float2 s_val = __bfloat1622float2(s_fp32[i]);
+                float2 s_val = s_fp32[i];
+                float2 dp_val = dp[i];
+                float2 dp_minus_delta = float2_sub(dp_val, delta_float2);
+                float2 ds_val = ku::float2_mul(ku::float2_mul(s_val, dp_minus_delta), sm_scale_float2);
+                ds_fp32[i] = __float22bfloat162_rn(ds_val);
+            }
+            
+            // Step 10: Store ds to SMEM (convert fp32 to bf16)
+            // uint128_t* sDS_base = (uint128_t*)plan.s_ds.ds.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
+            // CUTE_UNROLL
+            // for (int i = 0; i < B_TOPK/2/8; ++i) {
+            //     sDS_base[64*i] = *(uint128_t*)(ds_fp32 + i*4);
+            // }
+            // fence_view_async_shared();
             int ds_col_offset = (idx_in_warpgroup / 64) * 32;
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
@@ -386,9 +403,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             fence_view_async_shared();
 
         
-        if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-            printf("[WG0 CTA%d] finish 10: ds computed and stored to SMEM\n", cta_idx);
-        }
+            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
+                printf("[WG0 CTA%d] finish 10: ds computed and stored to SMEM\n", cta_idx);
+            }
         
             if (is_wg0) {
                 __threadfence_block();
@@ -402,7 +419,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             }
 
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG0 CTA%d] k=%d finish 11: ds ready for WG3\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG0] finish 11: ds ready for WG3\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
         }
         
@@ -491,7 +509,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
             if (warp_idx == 0 && elect_one_sync()) {
                 Tensor gdQ = flat_divide(
-                    tma_params.tma_dQ.get_tma_tensor(tma_params.shape_dQ)(_, _),
+                    tma_params.tma_dQ.get_tma_tensor(tma_params.shape_dQ)(_, _, s_q_idx),
                     Tile<Int<B_H/2>>{}
                 )(_, cta_idx, _);
                 auto thr_tma_dq = tma_params.tma_dQ.get_slice(_0{});
@@ -535,7 +553,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
                 if (k_block > 0 && local_warp_idx == 0) {
                     if (blockIdx.x < 2) {
-                        printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (begin)\n", cta_idx, k_block, (k_block - 1) & 1);
+                        printf("[B%d SQ%d CTA%d] k=%d [WG1] wait bar_dq_ready phase=%d (begin)\n",
+                               blockIdx.x, s_q_idx, cta_idx, k_block, (k_block - 1) & 1);
                     }
                 }
                 if (k_block > 0) {
@@ -544,7 +563,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 }
                 if (k_block > 0 && local_warp_idx == 0) {
                     if (blockIdx.x < 2) {
-                        printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (done)\n", cta_idx, k_block, (k_block - 1) & 1);
+                        printf("[B%d SQ%d CTA%d] k=%d [WG1] wait bar_dq_ready phase=%d (done)\n",
+                               blockIdx.x, s_q_idx, cta_idx, k_block, (k_block - 1) & 1);
                     }
                 }
 
@@ -552,7 +572,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                     indices4[local_row] = __ldg(
-                        (const int4*)(gIndices + k_block * B_TOPK + cta_idx * (B_TOPK / 2)) +
+                        (const int4*)(gIndices_s + k_block * B_TOPK + cta_idx * (B_TOPK / 2)) +
                         local_row * NUM_WARPS + local_warp_idx
                     );
                 }
@@ -588,7 +608,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     fence_view_async_shared();
                     plan.bar_kv_peer_cp_async.wait(phase);
                     if (blockIdx.x < 2) {
-                        printf("[WG1 CTA%d] k=%d bar_kv_peer_cp_async wait done phase=%d\n", cta_idx, k_block, phase);
+                        printf("[B%d SQ%d CTA%d] k=%d [WG1] bar_kv_peer_cp_async wait done phase=%d\n",
+                               blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                     }
                     if (cta_idx == 0) {
                         plan.bar_kv_peer_ready.arrive(0u);
@@ -596,12 +617,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                         plan.bar_kv_peer_ready.arrive(1u);
                     }
                     if (blockIdx.x < 2) {
-                        printf("[WG1 CTA%d] k=%d bar_kv_peer_ready arrive\n", cta_idx, k_block);
+                        printf("[B%d SQ%d CTA%d] k=%d [WG1] bar_kv_peer_ready arrive\n",
+                               blockIdx.x, s_q_idx, cta_idx, k_block);
                     }
                 }
 
                 if (local_warp_idx == 0 && blockIdx.x < 2) {
-                    printf("[WG1 CTA%d] k=%d finish: KV/kv_peer ready\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG1] finish: KV/kv_peer ready\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
                 }
             }
         }
@@ -630,36 +653,38 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             const int row_global = row_base + row;
             int kv_idx = -1;
             if (row_global < topk_length) {
-                kv_idx = __ldg(gIndices + row_global);
+                kv_idx = __ldg(gIndices_s + row_global);
             }
             const bool row_valid = kv_idx >= 0 && kv_idx < s_kv;
 
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 2-pre: wait bar_dkv_part0_ready phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 2-pre: wait bar_dkv_part0_ready phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
             }
             plan.bar_dkv_part0_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 2: bar_dkv_part0_ready done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 2: bar_dkv_part0_ready done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
 
-            if (row_valid) {
-                constexpr int COLS_PER_HALF = 256 / 2;
-                constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
-                float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF;
-                CUTE_UNROLL
-                for (int chunk = 0; chunk < 4; ++chunk) {
-                    float2 dkv_data[CHUNK_SIZE / 2];
-                    ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
-                    cutlass::arch::fence_view_async_tmem_load();
-                    ku::tcgen05_before_thread_sync();
+            constexpr int COLS_PER_HALF = 256 / 2;
+            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
+            CUTE_UNROLL
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                if (row_valid) {
+                    float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                        atomicAdd(dst + i,     src[i]);
+                        atomicAdd(dst + i + 1, src[i + 1]);
+                        atomicAdd(dst + i + 2, src[i + 2]);
+                        atomicAdd(dst + i + 3, src[i + 3]);
                     }
                 }
             }
@@ -669,34 +694,35 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part0_done.arrive(1u);
             }
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 3: bar_dkv_part0_done arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 3: bar_dkv_part0_done arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
 
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 4-pre: wait bar_dkv_part1_ready phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 4-pre: wait bar_dkv_part1_ready phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
             }
             plan.bar_dkv_part1_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 4: bar_dkv_part1_ready done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 4: bar_dkv_part1_ready done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
-            if (row_valid) {
-                constexpr int COLS_PER_HALF = 256 / 2;
-                constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
-                float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF;
-                CUTE_UNROLL
-                for (int chunk = 0; chunk < 4; ++chunk) {
-                    float2 dkv_data[CHUNK_SIZE / 2];
-                    ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
-                    cutlass::arch::fence_view_async_tmem_load();
-                    ku::tcgen05_before_thread_sync();
+            CUTE_UNROLL
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                float2 dkv_data[CHUNK_SIZE / 2];
+                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                if (row_valid) {
+                    float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i,     src[i]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 1, src[i + 1]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 2, src[i + 2]);
-                        atomicAdd(dst + chunk * CHUNK_SIZE + i + 3, src[i + 3]);
+                        atomicAdd(dst + i,     src[i]);
+                        atomicAdd(dst + i + 1, src[i + 1]);
+                        atomicAdd(dst + i + 2, src[i + 2]);
+                        atomicAdd(dst + i + 3, src[i + 3]);
                     }
                 }
             }
@@ -706,23 +732,26 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part1_done.arrive(1u);
             }
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 5: bar_dkv_part1_done arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 5: bar_dkv_part1_done arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
 
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 6-pre: wait bar_dkv_part2_ready phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 6-pre: wait bar_dkv_part2_ready phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
             }
             plan.bar_dkv_part2_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 6: bar_dkv_part2_ready done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 6: bar_dkv_part2_ready done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
+            constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
+            float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
+            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
             if (row_valid) {
-                constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
-                float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
-                ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
-                cutlass::arch::fence_view_async_tmem_load();
-                ku::tcgen05_before_thread_sync();
                 float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
                 float* src = (float*)dkv_rope_data;
                 CUTE_UNROLL
@@ -739,7 +768,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part2_done.arrive(1u);
             }
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG2 CTA%d] k=%d step 7: bar_dkv_part2_done arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG2] step 7: bar_dkv_part2_done arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
         }
     }
@@ -837,46 +867,57 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 // CTA0 computes P/dP and notifies WG0.
                 if (cta_idx == 0) {
                     // Wait for WG1 KV TMA completion of current block.
-                    printf("[WG3 CTA%d] k=%d step 1-pre: wait bar_prologue_kv phase=%d\n", cta_idx, k_block, phase);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 1-pre: wait bar_prologue_kv phase=%d\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                     plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
                     plan.bar_prologue_kv.wait(phase);
                     ku::tcgen05_after_thread_sync();
-                    printf("[WG3 CTA%d] k=%d step 1: bar_prologue_kv done\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 1: bar_prologue_kv done\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
                     ku::utcmma_ss(tiled_mma_P, sQNoPE, sKNoPE, tP, true);
                     ku::utcmma_ss(tiled_mma_P, sQRoPE, sKRoPE, tP, false);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_p_ready, 1|2);
                     ku::tcgen05_after_thread_sync();
-                    printf("[WG3 CTA%d] k=%d step 2a: P done, bar_p_ready\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 2a: P done, bar_p_ready\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
 
                     ku::utcmma_ss(tiled_mma_dP, sdO, sV, tdP, true);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dp_ready, 1|2);
                     ku::tcgen05_after_thread_sync();
-                    printf("[WG3 CTA%d] k=%d step 2b: dP done, bar_dp_ready\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 2b: dP done, bar_dp_ready\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
                 }
 
                 // dKV part0: dV[0:256] + dK[0:256]
-                printf("[WG3 CTA%d] k=%d step 3-pre: wait bar_s_ready phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 3-pre: wait bar_s_ready phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                 plan.bar_s_ready.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 3: bar_s_ready done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 3: bar_s_ready done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
                 ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _0{}), tdKV, true);
 
-                printf("[WG3 CTA%d] k=%d step 4-pre: wait bar_ds_ready phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 4-pre: wait bar_ds_ready phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                 plan.bar_ds_ready.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 4: bar_ds_ready done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 4: bar_ds_ready done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
                 ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _0{}), tdKV, false);
                 ku::umma_arrive_noelect(plan.bar_dkv_part0_ready);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 5: bar_dkv_part0_ready arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 5: bar_dkv_part0_ready arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
 
                 // dQ: k==0 clear, k>0 accumulate
                 if (cta_idx == 0) {
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    printf("[WG3 CTA%d] k=%d step 6-pre: wait bar_kv_peer_ready phase=%d\n", cta_idx, k_block, phase);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 6-pre: wait bar_kv_peer_ready phase=%d\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
-                    printf("[WG3 CTA%d] k=%d step 6: bar_kv_peer_ready done\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 6: bar_kv_peer_ready done\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
 
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
@@ -886,10 +927,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
                 } else {
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    printf("[WG3 CTA%d] k=%d step 6-pre: wait bar_kv_peer_ready phase=%d\n", cta_idx, k_block, phase);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 6-pre: wait bar_kv_peer_ready phase=%d\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
-                    printf("[WG3 CTA%d] k=%d step 6: bar_kv_peer_ready done\n", cta_idx, k_block);
+                    printf("[B%d SQ%d CTA%d] k=%d [WG3] step 6: bar_kv_peer_ready done\n",
+                           blockIdx.x, s_q_idx, cta_idx, k_block);
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
 
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
@@ -900,35 +943,69 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 }
                 ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 7: bar_dq_ready arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 7: bar_dq_ready arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
 
                 // dKV part1: dV[256:512] + dK[256:512]
-                printf("[WG3 CTA%d] k=%d step 8-pre: wait bar_dkv_part0_done phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 8-pre: wait bar_dkv_part0_done phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                 plan.bar_dkv_part0_done.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 8: bar_dkv_part0_done done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 8: bar_dkv_part0_done done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
                 ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _1{}, _0{}), tdKV, true);
                 ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _1{}, _0{}), tdKV, false);
                 ku::umma_arrive_noelect(plan.bar_dkv_part1_ready);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 9: bar_dkv_part1_ready arrive\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 9: bar_dkv_part1_ready arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
 
                 // dKV part2: dK_rope
-                printf("[WG3 CTA%d] k=%d step 10-pre: wait bar_dkv_part1_done phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 10-pre: wait bar_dkv_part1_done phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                 plan.bar_dkv_part1_done.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 10: bar_dkv_part1_done done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 10: bar_dkv_part1_done done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
                 ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQ_rope_t, tdKV_RoPE, true);
                 ku::umma_arrive_noelect(plan.bar_dkv_part2_ready);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 11: bar_dkv_part2_ready arrive\n", cta_idx, k_block);
-                printf("[WG3 CTA%d] k=%d step 12-pre: wait bar_dkv_part2_done phase=%d\n", cta_idx, k_block, phase);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 11: bar_dkv_part2_ready arrive\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 12-pre: wait bar_dkv_part2_done phase=%d\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block, phase);
                 plan.bar_dkv_part2_done.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                printf("[WG3 CTA%d] k=%d step 12: bar_dkv_part2_done done\n", cta_idx, k_block);
+                printf("[B%d SQ%d CTA%d] k=%d [WG3] step 12: bar_dkv_part2_done done\n",
+                       blockIdx.x, s_q_idx, cta_idx, k_block);
             }
 
             (void)sdO_t_full;
+        } else if (warp_idx == 13) {
+            // KV valid loading warp
+            static_assert(B_TOPK == 64);
+            if (lane_idx < 8) {
+                CUTE_NO_UNROLL
+                for (int k = 0; k < num_k_blocks; ++k) {
+                    int32x8_t indices = ldg_256_indices((void*)(gIndices_s + k * B_TOPK + lane_idx * 8));
+                    auto is_valid = [&](int index) -> char {
+                        return index >= 0 && index < s_kv && index <= max_kv_i;
+                    };
+                    char is_ks_valid_mask =
+                        is_valid(indices.a7) << 7 |
+                        is_valid(indices.a6) << 6 |
+                        is_valid(indices.a5) << 5 |
+                        is_valid(indices.a4) << 4 |
+                        is_valid(indices.a3) << 3 |
+                        is_valid(indices.a2) << 2 |
+                        is_valid(indices.a1) << 1 |
+                        is_valid(indices.a0) << 0;
+
+                    plan.bar_k_valid_free.wait(k & 1 ^ 1);
+                    plan.is_k_valid[lane_idx] = is_ks_valid_mask;
+                    plan.bar_k_valid_ready.arrive();
+                }
+            }
         }
     }
 
@@ -953,13 +1030,14 @@ void launch_preprocess_delta(
     const bf16* O,
     const bf16* dO,
     float* delta,
+    int s_q,
     cudaStream_t stream
 ) {
     constexpr int B_H = 128;
-    dim3 grid(1, 1, 1);  // One block
+    dim3 grid(s_q, 1, 1);  // One block per query token
     dim3 block(B_H, 1, 1);  // 128 threads
     
-    preprocess_delta_kernel<<<grid, block, 0, stream>>>(O, dO, delta);
+    preprocess_delta_kernel<<<grid, block, 0, stream>>>(O, dO, delta, s_q);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "preprocess_delta_kernel failed with error: %s\n", cudaGetErrorString(err));
@@ -977,28 +1055,29 @@ void launch_test_mla_bwd(
     const int32_t* gIndices,
     int s_kv,
     int topk_length,
+    int s_q,
     const float* delta,
     float* dKV,
     bf16* dQ,
     cudaStream_t stream
 ) {
     // Create TMA descriptors for prologue loads (Q/KV/dO)
-    auto shape_Q_nope = cute::make_shape(B_H, D_V);
+    auto shape_Q_nope = cute::make_shape(B_H, D_V, s_q);
     auto tma_Q_nope = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)q),
-            cute::make_layout(shape_Q_nope, cute::make_stride(D_Q, cute::_1{}))
+            cute::make_layout(shape_Q_nope, cute::make_stride(D_Q, cute::_1{}, B_H * D_Q))
         ),
         SmemLayoutQNoPE{}
     );
 
-    auto shape_Q_rope = cute::make_shape(B_H, D_ROPE);
+    auto shape_Q_rope = cute::make_shape(B_H, D_ROPE, s_q);
     auto tma_Q_rope = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)q + D_V),
-            cute::make_layout(shape_Q_rope, cute::make_stride(D_Q, cute::_1{}))
+            cute::make_layout(shape_Q_rope, cute::make_stride(D_Q, cute::_1{}, B_H * D_Q))
         ),
         SmemLayoutQRoPE{}
     );
@@ -1013,22 +1092,22 @@ void launch_test_mla_bwd(
         SmemLayoutKV{}
     );
 
-    auto shape_dO = cute::make_shape(B_H, D_V);
+    auto shape_dO = cute::make_shape(B_H, D_V, s_q);
     auto tma_dO = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)dO),
-            cute::make_layout(shape_dO, cute::make_stride(D_V, cute::_1{}))
+            cute::make_layout(shape_dO, cute::make_stride(D_V, cute::_1{}, B_H * D_V))
         ),
         SmemLayoutdO{}
     );
 
-    auto shape_dQ = cute::make_shape(B_H, D_Q);
+    auto shape_dQ = cute::make_shape(B_H, D_Q, s_q);
     auto tma_dQ = cute::make_tma_copy(
         cute::SM90_TMA_STORE{},
         cute::make_tensor(
             cute::make_gmem_ptr((bf16*)dQ),
-            cute::make_layout(shape_dQ, cute::make_stride(D_Q, cute::_1{}))
+            cute::make_layout(shape_dQ, cute::make_stride(D_Q, cute::_1{}, B_H * D_Q))
         ),
         SmemLayoutQ{}
     );
@@ -1078,7 +1157,7 @@ void launch_test_mla_bwd(
 
     auto kernel = &test_mla_bwd_kernel<KernelTmaParams>;
 
-    dim3 grid(2, 1, 1);  // 2 CTAs
+    dim3 grid(2 * s_q, 1, 1);  // 2 CTAs per query token
     dim3 block(NUM_THREADS, 1, 1);
     
     // Set dynamic shared memory size
@@ -1110,7 +1189,7 @@ void launch_test_mla_bwd(
     
     printf("finish 0: Launching kernel...\n");
     cudaError_t err = cudaLaunchKernelEx(&config, kernel, 
-        q, kv, dO, lse, O, gIndices, s_kv, topk_length, delta, dKV, dQ, tma_params);
+        q, kv, dO, lse, O, gIndices, s_kv, topk_length, s_q, delta, dKV, dQ, tma_params);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
         return;
@@ -1134,17 +1213,20 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
     TORCH_CHECK(O.dtype() == torch::kBFloat16, "O must be bfloat16");
     TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
-    TORCH_CHECK(q.dim() == 2 && q.size(0) == B_H && q.size(1) == D_Q, 
-                "q shape must be [128, 576]");
+    TORCH_CHECK(q.dim() == 3 && q.size(1) == B_H && q.size(2) == D_Q, 
+                "q shape must be [s_q, 128, 576]");
     TORCH_CHECK(kv.dim() == 2 && kv.size(1) == D_K,
                 "kv shape must be [s_kv, 576]");
-    TORCH_CHECK(dO.dim() == 2 && dO.size(0) == B_H && dO.size(1) == D_V,
-                "dO shape must be [128, 512]");
-    TORCH_CHECK(lse.dim() == 1 && lse.size(0) == B_H,
-                "lse shape must be [128]");
-    TORCH_CHECK(O.dim() == 2 && O.size(0) == B_H && O.size(1) == D_V,
-                "O shape must be [128, 512]");
-    TORCH_CHECK(indices.dim() == 1, "indices must be 1D");
+    const int64_t s_q = q.size(0);
+    TORCH_CHECK(s_q > 0, "s_q must be > 0");
+    TORCH_CHECK(dO.dim() == 3 && dO.size(0) == s_q && dO.size(1) == B_H && dO.size(2) == D_V,
+                "dO shape must be [s_q, 128, 512]");
+    TORCH_CHECK(lse.dim() == 2 && lse.size(0) == s_q && lse.size(1) == B_H,
+                "lse shape must be [s_q, 128]");
+    TORCH_CHECK(O.dim() == 3 && O.size(0) == s_q && O.size(1) == B_H && O.size(2) == D_V,
+                "O shape must be [s_q, 128, 512]");
+    TORCH_CHECK(indices.dim() == 2 && indices.size(0) == s_q,
+                "indices must be [s_q, topk_length]");
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     TORCH_CHECK(kv.is_contiguous(), "kv must be contiguous");
     TORCH_CHECK(dO.is_contiguous(), "dO must be contiguous");
@@ -1153,26 +1235,26 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
     const int64_t s_kv = kv.size(0);
-    const int64_t topk_length = indices.size(0);
+    const int64_t topk_length = indices.size(1);
     TORCH_CHECK(topk_length > 0, "topk_length must be > 0");
     TORCH_CHECK(topk_length % B_TOPK == 0,
                 "topk_length must be a multiple of tile B_TOPK=64");
     TORCH_CHECK(s_kv > 0, "s_kv must be > 0");
     TORCH_CHECK(topk_length <= s_kv,
-                "indices.size(0) must be <= kv.size(0)");
+                "indices.size(1) must be <= kv.size(0)");
     
     // Create output tensors
     auto options_f32 = torch::TensorOptions()
         .dtype(torch::kFloat32)
         .device(q.device());
     
-    torch::Tensor delta = torch::empty({B_H}, options_f32);
+    torch::Tensor delta = torch::empty({s_q, B_H}, options_f32);
     auto options_bf16 = torch::TensorOptions()
         .dtype(torch::kBFloat16)
         .device(q.device());
 
     torch::Tensor dKV = torch::zeros({s_kv, D_K}, options_f32);
-    torch::Tensor dQ = torch::zeros({B_H, D_Q}, options_bf16);
+    torch::Tensor dQ = torch::zeros({s_q, B_H, D_Q}, options_bf16);
     
     // Get data pointers
     const bf16* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr<at::BFloat16>());
@@ -1190,7 +1272,8 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     
     // Preprocess delta: compute delta = sum(O * dO, dim=-1)
     printf("finish -2: Computing delta...\n");
-    launch_preprocess_delta(O_ptr, dO_ptr, delta_ptr, stream);
+    const int s_q_i = static_cast<int>(s_q);
+    launch_preprocess_delta(O_ptr, dO_ptr, delta_ptr, s_q_i, stream);
     cudaError_t err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         TORCH_CHECK(false, "Delta preprocessing failed: ", cudaGetErrorString(err));
@@ -1200,8 +1283,8 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     const int topk_length_i = static_cast<int>(topk_length);
     
     // Call kernel once; topk loop is handled inside WG0/WG1/WG2/WG3.
-    printf("finish -1: Starting single kernel launch from Python binding, topk_length=%d\n", topk_length_i);
-    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv_i, topk_length_i,
+    printf("finish -1: Starting kernel launch from Python binding, s_q=%d, topk_length=%d\n", s_q_i, topk_length_i);
+    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv_i, topk_length_i, s_q_i,
         delta_ptr, dKV_ptr, dQ_ptr, stream);
     
     // Synchronize and wait for kernel completion
