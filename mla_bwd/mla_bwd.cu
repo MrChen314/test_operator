@@ -19,16 +19,6 @@ float2 float2_sub(const float2 &a, const float2 &b) {
     return ku::float2_add(a, ku::float2_neg(b));
 }
 
-CUTE_DEVICE
-void atomic_add_float4(float* dst_ptr, const float4& v) {
-    asm volatile(
-        "red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
-        :
-        : "l"(dst_ptr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
-        : "memory"
-    );
-}
-
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -582,8 +572,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_add_float4(dst + i, v);
+                        atomicAdd(dst + i + 0, src[i + 0]);
+                        atomicAdd(dst + i + 1, src[i + 1]);
+                        atomicAdd(dst + i + 2, src[i + 2]);
+                        atomicAdd(dst + i + 3, src[i + 3]);
                     }
                 }
             }
@@ -606,8 +598,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_add_float4(dst + i, v);
+                        atomicAdd(dst + i + 0, src[i + 0]);
+                        atomicAdd(dst + i + 1, src[i + 1]);
+                        atomicAdd(dst + i + 2, src[i + 2]);
+                        atomicAdd(dst + i + 3, src[i + 3]);
                     }
                 }
             }
@@ -629,8 +623,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 float* src = (float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                    atomic_add_float4(dst + i, v);
+                    atomicAdd(dst + i + 0, src[i + 0]);
+                    atomicAdd(dst + i + 1, src[i + 1]);
+                    atomicAdd(dst + i + 2, src[i + 2]);
+                    atomicAdd(dst + i + 3, src[i + 3]);
                 }
             }
             if (cta_idx == 0) {
