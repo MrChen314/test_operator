@@ -19,6 +19,21 @@ float2 float2_sub(const float2 &a, const float2 &b) {
     return ku::float2_add(a, ku::float2_neg(b));
 }
 
+CUTE_DEVICE
+void atomic_addx4_tilelang(float* ref, const float* val_ptr) {
+    float4 add_val = {val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3]};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if ((reinterpret_cast<unsigned long long>(ref) & 0xFULL) == 0ULL) {
+        atomicAdd(reinterpret_cast<float4*>(ref), add_val);
+        return;
+    }
+#endif
+    atomicAdd(ref + 0, add_val.x);
+    atomicAdd(ref + 1, add_val.y);
+    atomicAdd(ref + 2, add_val.z);
+    atomicAdd(ref + 3, add_val.w);
+}
+
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -572,10 +587,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + i + 0, src[i + 0]);
-                        atomicAdd(dst + i + 1, src[i + 1]);
-                        atomicAdd(dst + i + 2, src[i + 2]);
-                        atomicAdd(dst + i + 3, src[i + 3]);
+                        atomic_addx4_tilelang(dst + i, src + i);
                     }
                 }
             }
@@ -598,10 +610,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + i + 0, src[i + 0]);
-                        atomicAdd(dst + i + 1, src[i + 1]);
-                        atomicAdd(dst + i + 2, src[i + 2]);
-                        atomicAdd(dst + i + 3, src[i + 3]);
+                        atomic_addx4_tilelang(dst + i, src + i);
                     }
                 }
             }
@@ -623,10 +632,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 float* src = (float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    atomicAdd(dst + i + 0, src[i + 0]);
-                    atomicAdd(dst + i + 1, src[i + 1]);
-                    atomicAdd(dst + i + 2, src[i + 2]);
-                    atomicAdd(dst + i + 3, src[i + 3]);
+                    atomic_addx4_tilelang(dst + i, src + i);
                 }
             }
             if (cta_idx == 0) {
