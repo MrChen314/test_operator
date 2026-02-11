@@ -19,6 +19,16 @@ float2 float2_sub(const float2 &a, const float2 &b) {
     return ku::float2_add(a, ku::float2_neg(b));
 }
 
+CUTE_DEVICE
+void atomic_add_float4(float* dst_ptr, const float4& v) {
+    asm volatile(
+        "red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :
+        : "l"(dst_ptr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+        : "memory"
+    );
+}
+
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -544,7 +554,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         cutlass::arch::warpgroup_reg_dealloc<80>();
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
-        uint32_t tmem_base_wg2 = plan.tmem_start_addr.data()[0];
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -573,10 +582,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + i,     src[i]);
-                        atomicAdd(dst + i + 1, src[i + 1]);
-                        atomicAdd(dst + i + 2, src[i + 2]);
-                        atomicAdd(dst + i + 3, src[i + 3]);
+                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
+                        atomic_add_float4(dst + i, v);
                     }
                 }
             }
@@ -599,10 +606,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     float* src = (float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomicAdd(dst + i,     src[i]);
-                        atomicAdd(dst + i + 1, src[i + 1]);
-                        atomicAdd(dst + i + 2, src[i + 2]);
-                        atomicAdd(dst + i + 3, src[i + 3]);
+                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
+                        atomic_add_float4(dst + i, v);
                     }
                 }
             }
@@ -624,10 +629,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 float* src = (float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    atomicAdd(dst + i,     src[i]);
-                    atomicAdd(dst + i + 1, src[i + 1]);
-                    atomicAdd(dst + i + 2, src[i + 2]);
-                    atomicAdd(dst + i + 3, src[i + 3]);
+                    float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
+                    atomic_add_float4(dst + i, v);
                 }
             }
             if (cta_idx == 0) {
@@ -724,6 +727,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 const int phase = k_block & 1;
                 const bool dq_clear = (k_block == 0);
 
+                // Pipeline dependency:
+                // Reuse dKV(0:511) TMEM buffer for part0(k) only after part1(k-1) is fully drained by WG2.
+                if (k_block > 0) {
+                    const int prev_phase = (k_block - 1) & 1;
+                    plan.bar_dkv_part1_done.wait(prev_phase);
+                    ku::tcgen05_after_thread_sync();
+                }
+
                 // CTA0 computes P/dP and notifies WG0.
                 if (cta_idx == 0) {
                     // Wait for WG1 KV TMA completion of current block.
@@ -787,12 +798,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::tcgen05_after_thread_sync();
 
                 // dKV part2: dK_rope
-                plan.bar_dkv_part1_done.wait(phase);
-                ku::tcgen05_after_thread_sync();
+                // Reuse dKV_RoPE TMEM buffer for part2(k) only after part2(k-1) is drained by WG2.
+                if (k_block > 0) {
+                    const int prev_phase = (k_block - 1) & 1;
+                    plan.bar_dkv_part2_done.wait(prev_phase);
+                    ku::tcgen05_after_thread_sync();
+                }
                 ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQ_rope_t, tdKV_RoPE, true);
                 ku::umma_arrive_noelect(plan.bar_dkv_part2_ready);
                 ku::tcgen05_after_thread_sync();
-                plan.bar_dkv_part2_done.wait(phase);
+            }
+
+            // Drain outstanding part1/part2 writes of the final k-block before TMEM free.
+            if (num_k_blocks > 0) {
+                const int final_phase = (num_k_blocks - 1) & 1;
+                plan.bar_dkv_part1_done.wait(final_phase);
+                ku::tcgen05_after_thread_sync();
+                plan.bar_dkv_part2_done.wait(final_phase);
                 ku::tcgen05_after_thread_sync();
             }
 
@@ -1082,10 +1104,6 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     // Preprocess delta: compute delta = sum(O * dO, dim=-1)
     const int s_q_i = static_cast<int>(s_q);
     launch_preprocess_delta(O_ptr, dO_ptr, delta_ptr, s_q_i, stream);
-    cudaError_t err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        TORCH_CHECK(false, "Delta preprocessing failed: ", cudaGetErrorString(err));
-    }
     
     const int s_kv_i = static_cast<int>(s_kv);
     const int topk_length_i = static_cast<int>(topk_length);
@@ -1093,13 +1111,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     // Call kernel once; topk loop is handled inside WG0/WG1/WG2/WG3.
     launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv_i, topk_length_i, s_q_i,
         delta_ptr, dKV_ptr, dQ_ptr, stream);
-    
-    // Synchronize and wait for kernel completion
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        TORCH_CHECK(false, "CUDA kernel launch failed: ", cudaGetErrorString(err));
-    }
-    
+
     return std::make_tuple(dQ, dKV);
 }
 

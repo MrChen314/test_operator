@@ -139,7 +139,7 @@ def bench_cuda_kernel_tflops(
     def fn():
         mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
 
-    ms = do_bench(fn, rep=100, warmup=10)
+    ms = do_bench(fn, rep=50, warmup=10)
     tflops = per_token_flop * S / (ms * 1e-3) / 1e12
     print(f"cuda_kernel average time: {ms:.3f} ms")
     print(f"cuda_kernel bwd tflops: {tflops:.3f}")
