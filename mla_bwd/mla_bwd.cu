@@ -7,6 +7,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/cuda_host_adapter.hpp>
 #include <math_constants.h>
+#include <cstdint>
 
 using namespace test_operator::mla_bwd;
 using cutlass::arch::fence_barrier_init;
@@ -20,13 +21,10 @@ float2 float2_sub(const float2 &a, const float2 &b) {
 }
 
 CUTE_DEVICE
-void atomic_addx4_tilelang(float* ref, const float* val_ptr) {
-    float4 add_val = {val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3]};
+void atomic_addx4_tilelang(float* ref, const float4& add_val) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if ((reinterpret_cast<unsigned long long>(ref) & 0xFULL) == 0ULL) {
-        atomicAdd(reinterpret_cast<float4*>(ref), add_val);
-        return;
-    }
+    atomicAdd(reinterpret_cast<float4*>(ref), add_val);
+    return;
 #endif
     atomicAdd(ref + 0, add_val.x);
     atomicAdd(ref + 1, add_val.y);
@@ -559,6 +557,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         cutlass::arch::warpgroup_reg_dealloc<80>();
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
+        static_assert(D_K % 4 == 0, "D_K must be 16B aligned in float units.");
+        static_assert(D_V % 4 == 0, "D_V must be 16B aligned in float units.");
+        static_assert((D_ROPE / 2) % 4 == 0, "D_ROPE/2 must be 16B aligned in float units.");
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -578,16 +579,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
-                float2 dkv_data[CHUNK_SIZE / 2];
+                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
                 ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
                 if (row_valid) {
                     float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
-                    float* src = (float*)dkv_data;
+                    const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomic_addx4_tilelang(dst + i, src + i);
+                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
+                        atomic_addx4_tilelang(dst + i, v);
                     }
                 }
             }
@@ -601,16 +603,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             ku::tcgen05_after_thread_sync();
             CUTE_UNROLL
             for (int chunk = 0; chunk < 4; ++chunk) {
-                float2 dkv_data[CHUNK_SIZE / 2];
+                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
                 ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
                 if (row_valid) {
                     float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
-                    float* src = (float*)dkv_data;
+                    const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        atomic_addx4_tilelang(dst + i, src + i);
+                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
+                        atomic_addx4_tilelang(dst + i, v);
                     }
                 }
             }
@@ -623,16 +626,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             plan.bar_dkv_part2_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
-            float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
+            alignas(16) float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
             ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
             if (row_valid) {
                 float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
-                float* src = (float*)dkv_rope_data;
+                const float* src = (const float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    atomic_addx4_tilelang(dst + i, src + i);
+                    float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
+                    atomic_addx4_tilelang(dst + i, v);
                 }
             }
             if (cta_idx == 0) {
@@ -1099,6 +1103,8 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     float* delta_ptr = delta.data_ptr<float>();
     float* dKV_ptr = dKV.data_ptr<float>();
     bf16* dQ_ptr = reinterpret_cast<bf16*>(dQ.data_ptr<at::BFloat16>());
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(dKV_ptr) & 0xFULL) == 0,
+                "dKV base pointer must be 16-byte aligned for float4 atomicAdd");
     
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
