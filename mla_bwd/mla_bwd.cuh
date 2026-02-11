@@ -7,6 +7,7 @@
 #include <cutlass/arch/barrier.h>
 #include <kerutils/kerutils.cuh>
 #include <cutlass/arch/arch.h>
+#include <cuda.h>
 
 using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 
@@ -34,6 +35,7 @@ struct TmaParams {
     TMA_dO tma_dO;
     Shape_dQ shape_dQ;
     TMA_dQ tma_dQ;
+    CUtensorMap tensor_map_kv;
 };
 
 // ============================================================================
@@ -268,7 +270,7 @@ static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
 template<typename TmaParamsType>
 __global__ __launch_bounds__(test_operator::mla_bwd::NUM_THREADS, 1) void test_mla_bwd_kernel(
     const test_operator::mla_bwd::bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
-    const test_operator::mla_bwd::bf16* __restrict__ kv,      // [topk_length, D_K]
+    const test_operator::mla_bwd::bf16* __restrict__ kv,      // [s_kv, D_K]
     const test_operator::mla_bwd::bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
     const float* __restrict__ lse,     // [B_H] = [128] (log-sum-exp for softmax)
     const test_operator::mla_bwd::bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
@@ -276,7 +278,7 @@ __global__ __launch_bounds__(test_operator::mla_bwd::NUM_THREADS, 1) void test_m
     int s_kv,                        // KV sequence length
     int topk_length,                 // TopK length
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
-    float* __restrict__ dKV,          // [topk_length, D_K]
+    float* __restrict__ dKV,          // [s_kv, D_K]
     test_operator::mla_bwd::bf16* __restrict__ dQ,  // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 );

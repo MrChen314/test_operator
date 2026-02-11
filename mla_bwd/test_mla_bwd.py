@@ -24,19 +24,21 @@ def build_reference(
     indices: torch.Tensor,
 ):
     B_H, D_Q = q.shape
-    B_TOPK, D_K = kv.shape
+    S_KV, D_K = kv.shape
+    B_TOPK = indices.numel()
     D_V = dO.shape[1]
     D_ROPE = D_Q - D_V
 
-    k = kv[:, :D_K].float()
-    v = kv[:, :D_V].float()
+    all_k = kv.float()
+    all_v = kv[:, :D_V].float()
+    safe_indices = indices.clamp(0, S_KV - 1).to(torch.long)
+    valid_mask = (indices >= 0) & (indices < S_KV)
+    k = all_k.index_select(0, safe_indices)
+    v = all_v.index_select(0, safe_indices)
 
     # P and dP are intermediate values used to derive ds.
     P_ref = torch.matmul(q.float(), k.transpose(-2, -1))
-    s_kv = B_TOPK
-    topk_length = B_TOPK
-    mask = (indices >= 0) & (indices < s_kv) & (torch.arange(B_TOPK, device="cuda") < topk_length)
-    mask_expanded = mask.unsqueeze(0).expand(B_H, B_TOPK)
+    mask_expanded = valid_mask.unsqueeze(0).expand(B_H, B_TOPK)
     P_ref = torch.where(mask_expanded, P_ref, torch.tensor(float("-inf"), device="cuda", dtype=torch.float32))
 
     dP_ref = torch.matmul(dO.float(), v.transpose(-2, -1))
@@ -53,9 +55,20 @@ def build_reference(
     dV_ref = torch.matmul(s_ref.to(torch.bfloat16).float().T, dO.float())
     dK_nope_ref = torch.matmul(ds_bf16.float().T, q[:, :D_V].float())
     dK_rope_ref = torch.matmul(ds_bf16.float().T, q[:, D_V:].float())
-    dKV_ref = torch.cat([dV_ref + dK_nope_ref, dK_rope_ref], dim=-1)
+    dKV_topk_ref = torch.cat([dV_ref + dK_nope_ref, dK_rope_ref], dim=-1)
+    dKV_ref = torch.zeros((S_KV, D_K), device=kv.device, dtype=torch.float32)
+    if valid_mask.all():
+        dKV_ref.index_add_(0, safe_indices, dKV_topk_ref)
+    else:
+        valid_pos = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_pos.numel() > 0:
+            dKV_ref.index_add_(
+                0,
+                safe_indices.index_select(0, valid_pos),
+                dKV_topk_ref.index_select(0, valid_pos),
+            )
 
-    assert dKV_ref.shape == (B_TOPK, D_K)
+    assert dKV_ref.shape == (S_KV, D_K)
     assert dQ_ref.shape == (B_H, D_Q)
     assert dK_rope_ref.shape[1] == D_ROPE
     return dQ_ref, dKV_ref
@@ -82,28 +95,27 @@ def test_mla_bwd():
 
     B_H = 128
     D_Q = 576
-    B_TOPK = 256
+    B_TOPK = 2 * 1024
+    S_KV = 4 * 1024
     D_K = 576
     D_V = 512
 
     print(f"q shape: [{B_H}, {D_Q}]")
-    print(f"kv shape: [{B_TOPK}, {D_K}]")
+    print(f"kv shape: [{S_KV}, {D_K}]")
     print(f"dO shape: [{B_H}, {D_V}]")
     print(f"dQ shape: [{B_H}, {D_Q}]")
-    print(f"dKV shape: [{B_TOPK}, {D_K}]")
+    print(f"dKV shape: [{S_KV}, {D_K}]")
+    print(f"indices shape: [{B_TOPK}]")
     print()
 
     torch.manual_seed(42)
     q = torch.randn(B_H, D_Q, dtype=torch.bfloat16, device="cuda")
-    kv = torch.randn(B_TOPK, D_K, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(S_KV, D_K, dtype=torch.bfloat16, device="cuda")
     dO = torch.randn(B_H, D_V, dtype=torch.bfloat16, device="cuda")
     lse = torch.randn(B_H, dtype=torch.float32, device="cuda") * 2.0 + 5.0
     O = torch.randn(B_H, D_V, dtype=torch.bfloat16, device="cuda")
 
-    S_KV = B_TOPK
-    indices = torch.full((B_TOPK,), S_KV, dtype=torch.int32, device="cuda")
-    valid_indices = torch.randperm(S_KV, device="cuda")[:B_TOPK]
-    indices[: len(valid_indices)] = valid_indices
+    indices = torch.randperm(S_KV, device="cuda")[:B_TOPK].to(torch.int32)
 
     dQ_max_diff, dQ_rel_diff, dKV_max_diff, dKV_rel_diff = run_one_case(
         "Random normal", q, kv, dO, lse, O, indices
@@ -130,7 +142,8 @@ def test_different_inputs():
 
     B_H = 128
     D_Q = 576
-    B_TOPK = 256
+    B_TOPK = 2 * 1024
+    S_KV = 4 * 1024
     D_K = 576
     D_V = 512
 
@@ -151,15 +164,12 @@ def test_different_inputs():
     for name, q_gen, kv_gen, dO_gen in test_cases:
         try:
             q = q_gen(B_H, D_Q, dtype=torch.bfloat16, device="cuda")
-            kv = kv_gen(B_TOPK, D_K, dtype=torch.bfloat16, device="cuda")
+            kv = kv_gen(S_KV, D_K, dtype=torch.bfloat16, device="cuda")
             dO = dO_gen(B_H, D_V, dtype=torch.bfloat16, device="cuda")
             lse = torch.randn(B_H, dtype=torch.float32, device="cuda") * 2.0 + 5.0
             O = torch.randn(B_H, D_V, dtype=torch.bfloat16, device="cuda")
 
-            S_KV = B_TOPK
-            indices = torch.full((B_TOPK,), S_KV, dtype=torch.int32, device="cuda")
-            valid_indices = torch.randperm(S_KV, device="cuda")[:B_TOPK]
-            indices[: len(valid_indices)] = valid_indices
+            indices = torch.randperm(S_KV, device="cuda")[:B_TOPK].to(torch.int32)
 
             _, dQ_rel_diff, _, dKV_rel_diff = run_one_case(name, q, kv, dO, lse, O, indices)
 

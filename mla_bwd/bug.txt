@@ -1,15 +1,42 @@
-finish 18: Kernel execution completed and synchronized
-Random normal:
-  dQ  max_diff=7.812500e-03, rel_diff=1.156330e-05
-  dKV max_diff=5.569540e+03, rel_diff=1.563004e-01
-============================================================
-Precision Validation (dQ/dKV)
-============================================================
-PASS dQ  rel_diff=1.156330e-05, threshold=1.00e-02
-FAIL dKV rel_diff=1.563004e-01, threshold=1.00e-02
-dQ  max_diff=7.812500e-03
-dKV max_diff=5.569540e+03
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# python test_mla_bwd.py 
+CUDA Device: CF-NG-BZZ2-O
+CUDA Capability: (10, 0)
 
 ============================================================
-Some tests FAILED!
+Testing mla_bwd kernel (dQ/dKV only)
 ============================================================
+q shape: [128, 576]
+kv shape: [4096, 576]
+dO shape: [128, 512]
+dQ shape: [128, 576]
+dKV shape: [4096, 576]
+indices shape: [2048]
+
+finish -2: Computing delta...
+finish -1: Starting single kernel launch from Python binding, topk_length=2048
+finish 0: Launching kernel...
+finish 17: Kernel launch completed
+[CTA 0] finish 1: Kernel started
+[CTA 0] finish 2: TMEM allocated
+[WG2 CTA1] finish 1: WG2 started
+[WG2 CTA0] finish 1: WG2 started
+[WG3 CTA1] finish 1: TMEM tensors allocated
+[WG1 CTA1] finish 1: starting KV tile loop
+[WG3 CTA0] finish 1: TMEM tensors allocated
+[WG1 CTA0] finish 1: starting KV tile loop
+[WG0 CTA1] finish 1: LSE loaded from global memory
+[WG0 CTA0] finish 1: LSE loaded from global memory
+[WG2 CTA0] k=0 step 2-pre: wait bar_dkv_part0_ready phase=0
+[WG3 CTA0] k=0 step 1-pre: wait bar_prologue_kv phase=0
+[WG3 CTA0] k=0 step 1: bar_prologue_kv done
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 192, in <module>
+    passed = test_mla_bwd()
+             ^^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 120, in test_mla_bwd
+    dQ_max_diff, dQ_rel_diff, dKV_max_diff, dKV_rel_diff = run_one_case(
+                                                           ^^^^^^^^^^^^^
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/test_mla_bwd.py", line 79, in run_one_case
+    dQ_cuda, dKV_cuda = mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: CUDA kernel launch failed: an illegal instruction was encountered

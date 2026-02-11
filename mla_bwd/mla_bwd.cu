@@ -89,7 +89,7 @@ __global__ void preprocess_delta_kernel(
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     const bf16* __restrict__ q,      // [B_H, D_Q] = [128, 576]
-    const bf16* __restrict__ kv,     // [topk_length, D_K]
+    const bf16* __restrict__ kv,     // [s_kv, D_K]
     const bf16* __restrict__ dO,     // [B_H, D_V] = [128, 512]
     const float* __restrict__ lse,   // [B_H] = [128] (log-sum-exp for softmax)
     const bf16* __restrict__ O,     // [B_H, D_V] = [128, 512] (forward output O)
@@ -97,7 +97,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     int s_kv,                        // KV sequence length
     int topk_length,                 // TopK length
     const float* __restrict__ delta,  // [B_H] = [128] (delta = sum(O * dO))
-    float* __restrict__ dKV,          // [topk_length, D_K] (dKV gradient, float32 for atomic add)
+    float* __restrict__ dKV,          // [s_kv, D_K] (dKV gradient, float32 for atomic add)
     bf16* __restrict__ dQ,            // [B_H, D_Q] = [128, 576] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 ) {
@@ -125,23 +125,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     const bool is_wg3 = (warpgroup_idx == 3);
     const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);
     (void)O;
-    (void)gIndices;
-    (void)s_kv;
 
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(tma_params.tma_KV.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dQ.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
     }
     
     if (tid == 0 && cta_idx == 0 && blockIdx.x == 0) {
         printf("[CTA %d] finish 1: Kernel started\n", cta_idx);
     }
 
-    Tensor sKV_full = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKV{});
-    
     // Initialize barriers (warp 0 in CTA0)
     if (warp_idx == 0 && elect_one_sync()) {
         plan.bar_prologue_q_nope.init(1);
@@ -200,13 +196,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
-
-            // KV k=0 tile from [topk_length, D_K], split by CTA on first dim.
-            Tensor gKV = flat_divide(
-                tma_params.tma_KV.get_tma_tensor(tma_params.shape_KV)(_, _),
-                Tile<Int<B_TOPK/2>>{}
-            )(_, cta_idx, _);
-            ku::launch_tma_copy(tma_params.tma_KV, gKV, sKV_full, plan.bar_prologue_kv, TMA::CacheHintSm90::EVICT_FIRST);
 
             // dO: [B_H, D_V] split by CTA on first dim
             Tensor gdO = flat_divide(
@@ -527,80 +516,93 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // ========================================
     if (is_wg1) {
         cutlass::arch::warpgroup_reg_dealloc<96>();
+        const int local_warp_idx = warp_idx - 4;  // WG1 has global warps [4, 7]
+        constexpr int NUM_WARPS = 4;
+        constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
+        constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
         
         if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
             printf("[WG1 CTA%d] finish 1: starting KV tile loop\n", cta_idx);
         }
-        
-        // KV global tensor split into 32-row CTA tiles.
-        auto gKV_tiles = flat_divide(
-            tma_params.tma_KV.get_tma_tensor(tma_params.shape_KV)(_, _),
-            Tile<Int<B_TOPK/2>>{}
-        );
-        
-        // KV loop (tile=64): k=0 uses prologue KV; k>0 issues new TMA load per block.
-        constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
-        CUTE_NO_UNROLL
-        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-            const int phase = k_block & 1;
-            const int kv_tile_idx = k_block * 2 + cta_idx;
 
-            if (k_block > 0 && idx_in_warpgroup == 0) {
-                if (blockIdx.x < 2) {
-                    printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (begin)\n", cta_idx, k_block, (k_block - 1) & 1);
-                }
-                // Keep producer/consumer order between iterations.
-                plan.bar_dq_ready.wait((k_block - 1) & 1);
-                ku::tcgen05_after_thread_sync();
-                if (blockIdx.x < 2) {
-                    printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (done)\n", cta_idx, k_block, (k_block - 1) & 1);
-                }
-            }
+        // Use lane0 of each warp (4 warps in WG1) to issue gather4 TMA loads.
+        if (elect_one_sync()) {
+            bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
 
-            if (idx_in_warpgroup == 0) {
-                // Use the prologue KV transaction for k==0, and launch a new KV tile TMA for k>0.
-                if (k_block > 0) {
-                    Tensor gKV = gKV_tiles(_, kv_tile_idx, _);
-                    ku::launch_tma_copy(tma_params.tma_KV, gKV, sKV_full, plan.bar_prologue_kv, TMA::CacheHintSm90::EVICT_FIRST);
+            CUTE_NO_UNROLL
+            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+                const int phase = k_block & 1;
+
+                if (k_block > 0 && local_warp_idx == 0) {
                     if (blockIdx.x < 2) {
-                        printf("[WG1 CTA%d] k=%d launch_tma_copy KV tile=%d\n", cta_idx, k_block, kv_tile_idx);
+                        printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (begin)\n", cta_idx, k_block, (k_block - 1) & 1);
                     }
                 }
-            }
-            ku::tcgen05_after_thread_sync();
+                if (k_block > 0) {
+                    // Keep producer/consumer order between iterations for all producer warps.
+                    plan.bar_dq_ready.wait((k_block - 1) & 1);
+                }
+                if (k_block > 0 && local_warp_idx == 0) {
+                    if (blockIdx.x < 2) {
+                        printf("[WG1 CTA%d] k=%d wait bar_dq_ready phase=%d (done)\n", cta_idx, k_block, (k_block - 1) & 1);
+                    }
+                }
 
-            // Load kv_peer from peer CTA using cp_async every iteration.
-            if (idx_in_warpgroup == 0) {
-                plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
-            }
-            if (idx_in_warpgroup == 0) {
-                bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
-                transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
-                kerutils::cp_async_bulk_shared_cta_to_shared_cluster(
-                    peer_kv_peer_ptr,
-                    plan.u.q_kv.k_nope.data(),
-                    sizeof(bf16) * KV_PEER_ELEMENTS,
-                    *peer_bar_ptr
-                );
-            }
-            fence_view_async_shared();
-            if (idx_in_warpgroup == 0) {
-                plan.bar_kv_peer_cp_async.wait(phase);
-                if (blockIdx.x < 2) {
-                    printf("[WG1 CTA%d] k=%d bar_kv_peer_cp_async wait done phase=%d\n", cta_idx, k_block, phase);
+                int4 indices4[NUM_LOCAL_ROWS_PER_WARP];
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    indices4[local_row] = __ldg(
+                        (const int4*)(gIndices + k_block * B_TOPK + cta_idx * (B_TOPK / 2)) +
+                        local_row * NUM_WARPS + local_warp_idx
+                    );
                 }
-                if (cta_idx == 0) {
-                    plan.bar_kv_peer_ready.arrive(0u);
-                } else {
-                    plan.bar_kv_peer_ready.arrive(1u);
-                }
-                if (blockIdx.x < 2) {
-                    printf("[WG1 CTA%d] k=%d bar_kv_peer_ready arrive\n", cta_idx, k_block);
-                }
-            }
 
-            if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
-                printf("[WG1 CTA%d] k=%d finish: KV/kv_peer ready\n", cta_idx, k_block);
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    CUTE_UNROLL
+                    for (int local_col = 0; local_col < D_K / 64; ++local_col) {
+                        ku::tma_gather4_cta_group_2<true>(
+                            &(tma_params.tensor_map_kv),
+                            plan.bar_prologue_kv,
+                            sKV_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
+                            local_col * 64,
+                            indices4[local_row],
+                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                        );
+                    }
+                }
+                // Load kv_peer from peer CTA using cp_async every iteration.
+                if (local_warp_idx == 0) {
+                    // Wait until WG3 has consumed this K block for P, then copy to kv_peer.
+                    plan.bar_p_ready.wait(phase);
+
+                    plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
+                    bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
+                    transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
+                    kerutils::cp_async_bulk_shared_cta_to_shared_cluster(
+                        peer_kv_peer_ptr,
+                        plan.u.q_kv.k_nope.data(),
+                        sizeof(bf16) * KV_PEER_ELEMENTS,
+                        *peer_bar_ptr
+                    );
+                    fence_view_async_shared();
+                    plan.bar_kv_peer_cp_async.wait(phase);
+                    if (blockIdx.x < 2) {
+                        printf("[WG1 CTA%d] k=%d bar_kv_peer_cp_async wait done phase=%d\n", cta_idx, k_block, phase);
+                    }
+                    if (cta_idx == 0) {
+                        plan.bar_kv_peer_ready.arrive(0u);
+                    } else {
+                        plan.bar_kv_peer_ready.arrive(1u);
+                    }
+                    if (blockIdx.x < 2) {
+                        printf("[WG1 CTA%d] k=%d bar_kv_peer_ready arrive\n", cta_idx, k_block);
+                    }
+                }
+
+                if (local_warp_idx == 0 && blockIdx.x < 2) {
+                    printf("[WG1 CTA%d] k=%d finish: KV/kv_peer ready\n", cta_idx, k_block);
+                }
             }
         }
     }
@@ -626,6 +628,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             const int phase = k_block & 1;
             const int row_base = k_block * B_TOPK;
             const int row_global = row_base + row;
+            int kv_idx = -1;
+            if (row_global < topk_length) {
+                kv_idx = __ldg(gIndices + row_global);
+            }
+            const bool row_valid = kv_idx >= 0 && kv_idx < s_kv;
 
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
                 printf("[WG2 CTA%d] k=%d step 2-pre: wait bar_dkv_part0_ready phase=%d\n", cta_idx, k_block, phase);
@@ -636,10 +643,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 printf("[WG2 CTA%d] k=%d step 2: bar_dkv_part0_ready done\n", cta_idx, k_block);
             }
 
-            if (row_global < topk_length) {
+            if (row_valid) {
                 constexpr int COLS_PER_HALF = 256 / 2;
                 constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
-                float* dst = dKV + row_global * D_K + half * COLS_PER_HALF;
+                float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF;
                 CUTE_UNROLL
                 for (int chunk = 0; chunk < 4; ++chunk) {
                     float2 dkv_data[CHUNK_SIZE / 2];
@@ -673,10 +680,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
                 printf("[WG2 CTA%d] k=%d step 4: bar_dkv_part1_ready done\n", cta_idx, k_block);
             }
-            if (row_global < topk_length) {
+            if (row_valid) {
                 constexpr int COLS_PER_HALF = 256 / 2;
                 constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
-                float* dst = dKV + row_global * D_K + 256 + half * COLS_PER_HALF;
+                float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF;
                 CUTE_UNROLL
                 for (int chunk = 0; chunk < 4; ++chunk) {
                     float2 dkv_data[CHUNK_SIZE / 2];
@@ -710,13 +717,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             if (idx_in_warpgroup == 0 && blockIdx.x < 2) {
                 printf("[WG2 CTA%d] k=%d step 6: bar_dkv_part2_ready done\n", cta_idx, k_block);
             }
-            if (row_global < topk_length) {
+            if (row_valid) {
                 constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
                 float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
                 ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-                float* dst = dKV + row_global * D_K + D_V + half * ROPE_COLS_PER_HALF;
+                float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
                 float* src = (float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
@@ -996,7 +1003,7 @@ void launch_test_mla_bwd(
         SmemLayoutQRoPE{}
     );
 
-    auto shape_KV = cute::make_shape(topk_length, D_K);
+    auto shape_KV = cute::make_shape(s_kv, D_K);
     auto tma_KV = cute::make_tma_copy(
         cute::SM100_TMA_2SM_LOAD_NOSPLIT{},
         cute::make_tensor(
@@ -1026,6 +1033,32 @@ void launch_test_mla_bwd(
         SmemLayoutQ{}
     );
 
+    CUtensorMap tensor_map_kv;
+    {
+        uint64_t size[2] = {(uint64_t)D_K, (unsigned long)s_kv};  // [D_K, s_kv]
+        uint64_t stride[1] = {(uint64_t)D_K * sizeof(bf16)};
+        uint32_t box_size[2] = {64, 1};
+        uint32_t elem_stride[2] = {1, 1};
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_kv,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            const_cast<bf16*>(kv),
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        if (res != CUresult::CUDA_SUCCESS) {
+            fprintf(stderr, "cuTensorMapEncodeTiled failed with error code: %d\n", static_cast<int>(res));
+            return;
+        }
+    }
+
     using KernelTmaParams = TmaParams<
         decltype(shape_Q_nope), decltype(tma_Q_nope),
         decltype(shape_Q_rope), decltype(tma_Q_rope),
@@ -1039,7 +1072,8 @@ void launch_test_mla_bwd(
         shape_Q_rope, tma_Q_rope,
         shape_KV, tma_KV,
         shape_dO, tma_dO,
-        shape_dQ, tma_dQ
+        shape_dQ, tma_dQ,
+        tensor_map_kv
     };
 
     auto kernel = &test_mla_bwd_kernel<KernelTmaParams>;
@@ -1103,7 +1137,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     TORCH_CHECK(q.dim() == 2 && q.size(0) == B_H && q.size(1) == D_Q, 
                 "q shape must be [128, 576]");
     TORCH_CHECK(kv.dim() == 2 && kv.size(1) == D_K,
-                "kv shape must be [topk_length, 576]");
+                "kv shape must be [s_kv, 576]");
     TORCH_CHECK(dO.dim() == 2 && dO.size(0) == B_H && dO.size(1) == D_V,
                 "dO shape must be [128, 512]");
     TORCH_CHECK(lse.dim() == 1 && lse.size(0) == B_H,
@@ -1118,12 +1152,14 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     TORCH_CHECK(O.is_contiguous(), "O must be contiguous");
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
 
+    const int64_t s_kv = kv.size(0);
     const int64_t topk_length = indices.size(0);
     TORCH_CHECK(topk_length > 0, "topk_length must be > 0");
     TORCH_CHECK(topk_length % B_TOPK == 0,
                 "topk_length must be a multiple of tile B_TOPK=64");
-    TORCH_CHECK(kv.size(0) == topk_length,
-                "kv.size(0) must equal indices.size(0)");
+    TORCH_CHECK(s_kv > 0, "s_kv must be > 0");
+    TORCH_CHECK(topk_length <= s_kv,
+                "indices.size(0) must be <= kv.size(0)");
     
     // Create output tensors
     auto options_f32 = torch::TensorOptions()
@@ -1135,7 +1171,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
         .dtype(torch::kBFloat16)
         .device(q.device());
 
-    torch::Tensor dKV = torch::zeros({topk_length, D_K}, options_f32);
+    torch::Tensor dKV = torch::zeros({s_kv, D_K}, options_f32);
     torch::Tensor dQ = torch::zeros({B_H, D_Q}, options_bf16);
     
     // Get data pointers
@@ -1160,12 +1196,12 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
         TORCH_CHECK(false, "Delta preprocessing failed: ", cudaGetErrorString(err));
     }
     
-    const int s_kv = static_cast<int>(kv.size(0));
+    const int s_kv_i = static_cast<int>(s_kv);
     const int topk_length_i = static_cast<int>(topk_length);
     
     // Call kernel once; topk loop is handled inside WG0/WG1/WG2/WG3.
     printf("finish -1: Starting single kernel launch from Python binding, topk_length=%d\n", topk_length_i);
-    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv, topk_length_i,
+    launch_test_mla_bwd(q_ptr, kv_ptr, dO_ptr, lse_ptr, O_ptr, indices_ptr, s_kv_i, topk_length_i,
         delta_ptr, dKV_ptr, dQ_ptr, stream);
     
     // Synchronize and wait for kernel completion
