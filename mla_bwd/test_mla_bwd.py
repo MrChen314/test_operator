@@ -112,6 +112,40 @@ def run_one_case(
     return dQ_max_diff, dQ_rel_diff, dKV_max_diff, dKV_rel_diff
 
 
+def bench_cuda_kernel_tflops(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    dO: torch.Tensor,
+    lse: torch.Tensor,
+    O: torch.Tensor,
+    indices: torch.Tensor,
+):
+    # Reference: tilelang/examples/deepseek_v32/sparse_mla_bwd.py per_token_flop
+    S, H, D_Q = q.shape
+    topk = indices.shape[1]
+    D_V = dO.shape[2]
+    per_token_flop = 2 * sum(
+        [
+            H * D_V * topk,
+            H * D_Q * topk,
+            H * D_Q * topk,
+            H * D_Q * topk,
+            H * D_V * topk,
+        ]
+    )
+
+    from tilelang.profiler import do_bench
+
+    def fn():
+        mla_bwd_cuda.mla_bwd(q, kv, dO, lse, O, indices)
+
+    ms = do_bench(fn, rep=100, warmup=10)
+    tflops = per_token_flop * S / (ms * 1e-3) / 1e12
+    print(f"cuda_kernel average time: {ms:.3f} ms")
+    print(f"cuda_kernel bwd tflops: {tflops:.3f}")
+    return ms, tflops
+
+
 def test_mla_bwd():
     print("=" * 60)
     print("Testing mla_bwd kernel (dQ/dKV, sequence length > 1)")
@@ -165,6 +199,11 @@ def test_mla_bwd():
     print(f"{'PASS' if ok_dKV else 'FAIL'} dKV rel_diff={dKV_rel_diff:.6e}, threshold={rel_diff_threshold:.2e}")
     print(f"dQ  max_diff={dQ_max_diff:.6e}")
     print(f"dKV max_diff={dKV_max_diff:.6e}")
+
+    print("=" * 60)
+    print("CUDA Kernel Benchmark")
+    print("=" * 60)
+    bench_cuda_kernel_tflops(q, kv, dO, lse, O, indices)
     return ok_dQ and ok_dKV
 
 
