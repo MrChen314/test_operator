@@ -1,26 +1,4 @@
 root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
-      SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
-                                                  ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cuh(36): error: expected an expression
-      SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
-                                                                                                         ^
-
-/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cuh(35): error: no instance of overloaded function "test_operator::dkv_mma::make_tiled_mma" matches the argument list
-            argument types are: (<error-type>, <error-type>, <error-type>, const int, const int, cute::UMMA::Major, <error-type>)
-  using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
-                                     ^
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/atom/mma_atom.hpp(531): note #3322-D: number of parameters of function template "cute::make_tiled_mma(const cute::MMA_Atom<MMA_Op> &, const MMAThrLayout &, const Permutations &)" does not match the call
-  make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
-  ^
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/atom/mma_atom.hpp(548): note #3322-D: number of parameters of function template "cute::make_tiled_mma(const MMA_Op &, const MMAThrLayout &, const Permutations &)" does not match the call
-  make_tiled_mma(MMA_Op const&,
-  ^
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-            module->_forward_populate_default_args(std::move(arguments)));
-            ^
-
 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
 
 /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
@@ -47,7 +25,29 @@ Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
                   module.to(
                   ^
 
-7 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu".
+/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/atom/mma_traits_sm100.hpp(502): error: static assertion failed with "UMMA_1SM M-mode size should be 64 or 128."
+        static_assert(M_MMA == 64 || M_MMA == 128, "UMMA_1SM M-mode size should be 64 or 128.");
+        ^
+          detected during:
+            instantiation of "auto cute::UMMA::tmem_frg<ValueType, StorageType, N_SM, TmemAlloc>::make(const TmemShape &) [with ValueType=test_operator::dkv_mma::bf16, StorageType=test_operator::dkv_mma::bf16, N_SM=1, TmemAlloc=cute::UMMA::TmemAllocMode::NonInterleaved, TmemShape=cute::tuple<cute::tuple<cute::C<32>, cute::C<16>>, cute::_1, cute::_4>]" at line 974
+            instantiation of "auto cute::MakeTensor<cute::UMMA::tmem_frg<ValueType, StorageType, N_SM, TmemAlloc>>::operator()(const Shape &) [with ValueType=test_operator::dkv_mma::bf16, StorageType=test_operator::dkv_mma::bf16, N_SM=1, TmemAlloc=cute::UMMA::TmemAllocMode::NonInterleaved, Shape=cute::Layout<cute::tuple<cute::tuple<cute::C<32>, cute::C<16>>, cute::_1, cute::_4>, cute::tuple<cute::tuple<cute::C<1>, cute::C<32>>, cute::C<0>, cute::C<512>>>]" at line 401 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/tensor_impl.hpp
+            instantiation of "auto cute::make_tensor<T,Args...>(const Args &...) [with T=cute::UMMA::tmem_frg<test_operator::dkv_mma::bf16, test_operator::dkv_mma::bf16, 1, cute::UMMA::TmemAllocMode::NonInterleaved>, Args=<cute::Layout<cute::tuple<cute::tuple<cute::C<32>, cute::C<16>>, cute::_1, cute::_4>, cute::tuple<cute::tuple<cute::C<1>, cute::C<32>>, cute::C<0>, cute::C<512>>>>]" at line 457 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/tensor_impl.hpp
+            instantiation of "auto cute::make_fragment_like<NewT,Layout>(const Layout &) [with NewT=cute::UMMA::tmem_frg<test_operator::dkv_mma::bf16, test_operator::dkv_mma::bf16, 1, cute::UMMA::TmemAllocMode::NonInterleaved>, Layout=cute::tuple<cute::tuple<cute::C<32>, cute::C<16>>, cute::_1, cute::_4>]" at line 165 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/atom/mma_atom.hpp
+            instantiation of "auto cute::MMA_Atom<cute::MMA_Traits<MMAOperation, Args...>>::make_fragment_A(ATensor &&) [with MMAOperation=cute::SM100_MMA_F16BF16_WS_TS_NOELECT<test_operator::dkv_mma::bf16, test_operator::dkv_mma::bf16, float, 32, 256, cute::UMMA::Major::K, cute::UMMA::Major::MN, cute::UMMA::ScaleIn::One, cute::UMMA::ScaleIn::One>, Args=<>, ATensor=cute::tuple<cute::tuple<cute::C<32>, cute::C<16>>, cute::_1, cute::_4>]" at line 113 of /home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu(112): error: cannot deduce "auto" type
+      auto tS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
+      ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu(116): error: cannot deduce "auto" type
+      auto tDS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
+      ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu(120): error: cannot deduce "auto" type
+      auto tDS_dKV_rope = tiled_mma_dKV_rope.get_slice(_0{}).make_fragment_A(
+      ^
+
+4 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/dkv_mma/test_dkv_mma.cu".
 ninja: build stopped: subcommand failed.
 Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
