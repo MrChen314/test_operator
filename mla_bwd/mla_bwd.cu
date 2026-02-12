@@ -16,20 +16,13 @@ using cutlass::arch::NamedBarrier;
 
 // Helper function: float2 subtraction using float2_add and float2_neg
 CUTE_DEVICE
-float2 float2_sub(const float2 &a, const float2 &b) {
+float2 float2_sub(const float2& a, const float2& b) {
     return ku::float2_add(a, ku::float2_neg(b));
 }
 
 CUTE_DEVICE
-void atomic_addx4_tilelang(float* ref, const float4& add_val) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    atomicAdd(reinterpret_cast<float4*>(ref), add_val);
-    return;
-#endif
-    atomicAdd(ref + 0, add_val.x);
-    atomicAdd(ref + 1, add_val.y);
-    atomicAdd(ref + 2, add_val.z);
-    atomicAdd(ref + 3, add_val.w);
+void tma_reduce_add_f32(void const* src_ptr, void* dst_ptr, int32_t store_bytes) {
+    kerutils::tma_bulk_reduce_add(src_ptr, dst_ptr, store_bytes);
 }
 
 // bf16x8 structure for vectorized operations
@@ -114,22 +107,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     int topk_length,                 // TopK length
     int s_q,                         // Query sequence length
     const float* __restrict__ delta,  // [s_q, B_H] (delta = sum(O * dO))
-    float* __restrict__ dKV,          // [s_kv, D_K] (dKV gradient, float32 for atomic add)
+    float* __restrict__ dKV,          // [s_kv, D_K] (dKV gradient, float32 reduce-add)
     bf16* __restrict__ dQ,            // [s_q, B_H, D_Q] (dQ gradient, bf16)
     __grid_constant__ const TmaParamsType tma_params
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
-    // Use cute namespace inside kernel to avoid conflicts with PyTorch's at::Layout
     using namespace cute;
-    
+
     extern __shared__ char smem_raw[];
     SharedMemoryPlan& plan = *reinterpret_cast<SharedMemoryPlan*>(smem_raw);
-    
+
     const int cta_idx = blockIdx.x % 2;  // 0 or 1
     const int s_q_idx = blockIdx.x / 2;
     const int max_kv_i = s_q_idx;
     const int tid = threadIdx.x;
-    const int warp_idx = cutlass::canonical_warp_idx_sync();  // Global warp index
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
     if (s_q_idx >= s_q) {
         return;
@@ -177,238 +169,176 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_dkv_part0_done.init(128);
         plan.bar_dkv_part1_done.init(128);
         plan.bar_dkv_part2_done.init(128);
-        // WG1-WG3 barriers for kv_peer cp_async
-        plan.bar_kv_peer_cp_async.init(1);      // cp_async transaction barrier
-        plan.bar_kv_peer_ready.init(1);         // WG1 notifies WG3 kv_peer is ready
-        // WG3-WG0 barrier for dQ computation
-        plan.bar_k_valid_ready.init(8);
+        // WG1-WG3 barriers for peer KV read/backfill
+        plan.bar_kv_peer_ready.init(1);
+        plan.bar_k_valid_ready.init(B_TOPK / 8);
         plan.bar_k_valid_free.init(128);
-        plan.bar_dq_ready.init(1);              // WG3 notifies WG0 dQ is ready
+        plan.bar_dq_ready.init(1);
         fence_barrier_init();
     }
-    
-    // Cluster sync before accessing peer SMEM - all CTAs must participate
+
     __syncthreads();
     cluster_sync();
-    
-    // Construct SMEM Tensors
-    // Q and K are split into NoPE and RoPE parts
-    // Q NoPE: [B_H/2, D_V] = [64, 512], Q RoPE: [B_H/2, D_ROPE] = [64, 64]
-    // K NoPE: [B_TOPK/2, D_V] = [32, 512], K RoPE: [B_TOPK/2, D_ROPE] = [32, 64]
+
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPE{});
-    Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKNoPE{});
-    Tensor sKRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPE{});
+    Tensor sKV = make_tensor(make_smem_ptr(plan.u.q_kv.kv.data()), SmemLayoutKV{});
+    Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.kv.data()), SmemLayoutKNoPE{});
+    Tensor sKRoPE = make_tensor(
+        make_smem_ptr(plan.u.q_kv.kv.data() + cosize_v<SmemLayoutKNoPE>),
+        SmemLayoutKRoPE{}
+    );
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
-    // kv_peer: [B_TOPK/2, D_K] = [32, 576] for cross-CTA K loading
-    Tensor sKV_peer = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKV{});
+    Tensor sdKV = make_tensor(make_smem_ptr(plan.sdKV.data()), SmemLayoutdKV{});
+    bf16* peer_kv_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv.data());
+    Tensor sKVPeer = make_tensor(make_smem_ptr(peer_kv_ptr), SmemLayoutKV{});
+    float* peer_sdKV_ptr = kerutils::get_peer_addr(plan.sdKV.data());
+    Tensor sdKVPeer = make_tensor(make_smem_ptr(peer_sdKV_ptr), SmemLayoutdKV{});
 
-    // Launch prologue TMA loads and allocate TMEM (warp 0 in each CTA)
     if (warp_idx == 0) {
         if (elect_one_sync()) {
-            // Q_NoPE: [B_H, D_V] split by CTA on first dim
             Tensor gQNoPE = flat_divide(
                 tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_nope, gQNoPE, sQNoPE, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
 
-            // Q_RoPE: [B_H, D_ROPE] split by CTA on first dim
             Tensor gQRoPE = flat_divide(
                 tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQRoPE, sQRoPE, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
 
-            // dO: [B_H, D_V] split by CTA on first dim
             Tensor gdO = flat_divide(
                 tma_params.tma_dO.get_tma_tensor(tma_params.shape_dO)(_, _, s_q_idx),
                 Tile<Int<B_H/2>>{}
             )(_, cta_idx, _);
             ku::launch_tma_copy(tma_params.tma_dO, gdO, sdO, plan.bar_prologue_dO, TMA::CacheHintSm90::EVICT_FIRST);
-
-            // arrive_and_expect_tx is issued in MMA warp before actual use
         }
 
         TMEM::Allocator2Sm().allocate(512, plan.tmem_start_addr.data());
         TMEM::Allocator2Sm().release_allocation_lock();
     }
-    __syncthreads();  // Wait for TMEM allocation
+    __syncthreads();
 
-    // ========================================
-    // Warpgroup 0: Softmax and dS Computation (WG0)
-    // Responsibility: Compute softmax(P), load delta, compute ds
-    // ========================================
+    // WG0: softmax/ds, write S/dS into TMEM.
     if (is_wg0) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
-        
-        // Load LSE from global memory (needed for softmax computation)
-        float row_lse = 0.0f;
-        const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
-        row_lse = __ldg(lse_s + global_row_idx);
 
-        const float sm_scale = 1.0f / sqrtf(576.0f);  // softmax scale
-        const float scale = sm_scale * 1.44269504f;  // sm_scale * log2(e) for exp2
-        Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
-        Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutS{});
-        
+        const int row_in_cta = idx_in_warpgroup % (B_H / 2);
+        const int topk_half = idx_in_warpgroup / (B_H / 2);  // 0 or 1
+        const int global_row_idx = cta_idx * (B_H / 2) + row_in_cta;
+        const float row_lse = __ldg(lse_s + global_row_idx);
+        const float sm_scale = 1.0f / sqrtf(float(D_QK));
+        const float scale_log2e = sm_scale * 1.44269504f;
+
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
 
-            // Step 1: Wait for WG3 to compute P for current block
             plan.bar_p_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-            
-            // Step 2: Load P from TMEM (current tile) for softmax
+
+            const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
+            const uint32_t lane_addr = tmem_base + (row_in_cta << 16);
+            const uint32_t p_addr = lane_addr + tmem_cols::P;
             float2 p[(B_TOPK/2)/2];
-            uint32_t tmem_base = plan.tmem_start_addr.data()[0];
-            uint32_t tmem_lane = idx_in_warpgroup % (B_H/2);  // 0-63
-            uint32_t tmem_col = tmem_cols::P;
-            uint32_t tmem_addr = tmem_base + (tmem_lane << 16) + tmem_col;
-            
-            ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_addr, p);
+            ku::tmem_ld_32dp32bNx<B_TOPK/2>(p_addr, p);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
             plan.bar_k_valid_ready.wait(phase);
-            uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+            uint16_t is_k_valid = *reinterpret_cast<uint16_t*>(plan.is_k_valid + topk_half * (B_TOPK / 16));
             float* p_float = (float*)p;
             CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
-                if (!(is_k_valid_lo >> i & 1))
+            for (int i = 0; i < (B_TOPK/2); ++i) {
+                if (((is_k_valid >> i) & 1) == 0) {
                     p_float[i] = -CUDART_INF_F;
+                }
             }
             plan.bar_k_valid_free.arrive();
 
-            // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
-            // Compute softmax values: s = exp2(P*scale - LSE)
             float2 s_fp32[(B_TOPK/2)/2];
+            __nv_bfloat162 s_bf16[(B_TOPK/2)/2];
             float2 neg_lse = make_float2(-row_lse, -row_lse);
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                float2 scaled_p = ku::float2_fma(p[i], make_float2(scale, scale), neg_lse);
+                float2 scaled_p = ku::float2_fma(p[i], make_float2(scale_log2e, scale_log2e), neg_lse);
                 scaled_p.x = exp2f(scaled_p.x);
                 scaled_p.y = exp2f(scaled_p.y);
-                // s_fp32[i] = __float22bfloat162_rn(scaled_p);
                 s_fp32[i] = scaled_p;
+                s_bf16[i] = __float22bfloat162_rn(scaled_p);
             }
-            
-            // Step 4: Store s to SMEM (convert fp32 to bf16)
-            // uint128_t* sS_base = (uint128_t*)plan.s_ds.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-            // CUTE_UNROLL
-            // for (int i = 0; i < B_TOPK/2/8; ++i) {
-            //     sS_base[64*i] = *(uint128_t*)(s_fp32 + i*4);
-            // }
-            // fence_view_async_shared();
 
-            int s_col_offset = (idx_in_warpgroup / 64) * 32;
+            uint32_t s_packed[(B_TOPK/2)/2];
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                sS(i*2+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].x);
-                sS(i*2+1+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].y);
+                s_packed[i] = *reinterpret_cast<uint32_t*>(&s_bf16[i]);
             }
-            fence_view_async_shared();
+            ku::tmem_st_32dp32bNx<(B_TOPK/2)/2>(lane_addr + tmem_cols::S, s_packed);
+            cutlass::arch::fence_view_async_tmem_store();
 
-            if (is_wg0) {
-                __threadfence_block();
-            }
-            
-            // Step 5: Notify WG3 that s is ready.
             if (cta_idx == 0) {
                 plan.bar_s_ready.arrive(0u);
             } else {
                 plan.bar_s_ready.arrive(1u);
             }
 
-            // Step 6: Load delta from global memory
-            float delta_val = 0.0f;
-            delta_val = __ldg(delta_s + global_row_idx);
-            
-            // Step 7: Wait for WG3 to compute dP for current block
+            float delta_val = __ldg(delta_s + global_row_idx);
             plan.bar_dp_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
 
-            // Debug output dP is removed; consume dP directly from TMEM below.
-            // Step 8: Load dp from TMEM
             float2 dp[(B_TOPK/2)/2];
-            uint32_t dp_tmem_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
-            ku::tmem_ld_32dp32bNx<B_TOPK/2>(dp_tmem_addr, dp);
+            ku::tmem_ld_32dp32bNx<B_TOPK/2>(lane_addr + tmem_cols::dP, dp);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
-            
-            // Step 9: Compute ds = s * (dp - delta) * sm_scale
-            // Note: Use fp32 format of s (s_fp32), not bf16 format stored in SMEM
-            // Note: Use sm_scale (not scale which includes log2(e)) for ds computation
-            __nv_bfloat162 ds_fp32[(B_TOPK/2)/2];
+
+            __nv_bfloat162 ds_bf16[(B_TOPK/2)/2];
             float2 delta_float2 = make_float2(delta_val, delta_val);
             float2 sm_scale_float2 = make_float2(sm_scale, sm_scale);
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                // Convert s_fp32 back to float2 for computation
-                // float2 s_val = __bfloat1622float2(s_fp32[i]);
-                float2 s_val = s_fp32[i];
-                float2 dp_val = dp[i];
-                float2 dp_minus_delta = float2_sub(dp_val, delta_float2);
-                float2 ds_val = ku::float2_mul(ku::float2_mul(s_val, dp_minus_delta), sm_scale_float2);
-                ds_fp32[i] = __float22bfloat162_rn(ds_val);
+                float2 ds_val = ku::float2_mul(
+                    ku::float2_mul(s_fp32[i], float2_sub(dp[i], delta_float2)),
+                    sm_scale_float2
+                );
+                ds_bf16[i] = __float22bfloat162_rn(ds_val);
             }
-            
-            // Step 10: Store ds to SMEM (convert fp32 to bf16)
-            // uint128_t* sDS_base = (uint128_t*)plan.s_ds.ds.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-            // CUTE_UNROLL
-            // for (int i = 0; i < B_TOPK/2/8; ++i) {
-            //     sDS_base[64*i] = *(uint128_t*)(ds_fp32 + i*4);
-            // }
-            // fence_view_async_shared();
-            int ds_col_offset = (idx_in_warpgroup / 64) * 32;
+
+            uint32_t ds_packed[(B_TOPK/2)/2];
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                sDS(i*2+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].x);
-                sDS(i*2+1+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].y);
+                ds_packed[i] = *reinterpret_cast<uint32_t*>(&ds_bf16[i]);
             }
-            fence_view_async_shared();
-        
-            if (is_wg0) {
-                __threadfence_block();
-            }
-            
-            // Step 11: Notify WG3 that ds is ready.
+            ku::tmem_st_32dp32bNx<(B_TOPK/2)/2>(lane_addr + tmem_cols::dS, ds_packed);
+            cutlass::arch::fence_view_async_tmem_store();
+
             if (cta_idx == 0) {
                 plan.bar_ds_ready.arrive(0u);
             } else {
                 plan.bar_ds_ready.arrive(1u);
             }
         }
-        
-        // ========================================
-        // WG0 Step 12-13: Wait for dQ and transfer to global memory
-        // ========================================
-        // Step 12: Wait for WG3 to complete all dQ accumulations
+
         const int final_phase = (num_k_blocks - 1) & 1;
         plan.bar_dq_ready.wait(final_phase);
         ku::tcgen05_after_thread_sync();
-        
-        // Step 13: Read dQ (fp32) from TMEM, convert to bf16 in SMEM, then TMA-store to global memory
-        // dQ shape: [B_H, D_Q] = [128, 576], each CTA handles [B_H/2, D_Q] = [64, 576]
-        {
-            constexpr int dQ_ROWS = B_H / 2;  // 64
-            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;            // 128 floats/thread per NoPE tile-half
-            constexpr int NOPE_CHUNKS = 8;
-            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16 floats/chunk
-            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;                 // 8 float2/chunk
-            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;                      // 16 float2/row
 
+        {
+            constexpr int dQ_ROWS = B_H / 2;
+            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;
+            constexpr int NOPE_CHUNKS = 8;
+            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;
+            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;
+            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;
             Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dq.data()), SmemLayoutQ{});
 
-            int row_in_cta = idx_in_warpgroup % dQ_ROWS;   // 0-63
-            int col_half = idx_in_warpgroup / dQ_ROWS;     // 0 or 1
+            int row = idx_in_warpgroup % dQ_ROWS;
+            int col_half = idx_in_warpgroup / dQ_ROWS;
 
-            uint32_t tmem_base_dq = plan.tmem_start_addr.data()[0];
-            uint32_t tmem_addr_dq0 = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ;
-            uint32_t tmem_addr_dq1 = tmem_base_dq + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+            uint32_t tmem_base = plan.tmem_start_addr.data()[0];
+            uint32_t tmem_addr_dq0 = tmem_base + (row << 16) + tmem_cols::dQ;
+            uint32_t tmem_addr_dq1 = tmem_base + (row << 16) + (tmem_cols::dQ + 128);
 
-            // dQ_NoPE part0: cols [0, 255]
             CUTE_UNROLL
             for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
                 const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
@@ -420,12 +350,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 CUTE_UNROLL
                 for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
                     int col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
-                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
-                    sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
+                    sdQ(row, col) = bf16(dq_chunk[i].x);
+                    sdQ(row, col + 1) = bf16(dq_chunk[i].y);
                 }
             }
 
-            // dQ_NoPE part1: cols [256, 511]
             CUTE_UNROLL
             for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
                 const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
@@ -437,14 +366,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 CUTE_UNROLL
                 for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
                     int col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
-                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
-                    sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
+                    sdQ(row, col) = bf16(dq_chunk[i].x);
+                    sdQ(row, col + 1) = bf16(dq_chunk[i].y);
                 }
             }
 
-            // dQ_RoPE: cols [512, 575]
             float2 dq_rope[ROPE_FLOAT2_PER_ROW];
-            uint32_t tmem_addr_dq_rope = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+            uint32_t tmem_addr_dq_rope = tmem_base + (row << 16) + tmem_cols::dQ_RoPE;
             ku::tmem_ld_32dp32bNx<D_ROPE/2>(tmem_addr_dq_rope, dq_rope);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
@@ -452,8 +380,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             CUTE_UNROLL
             for (int i = 0; i < ROPE_FLOAT2_PER_ROW; ++i) {
                 int col = D_V + col_half * (D_ROPE / 2) + i * 2;
-                sdQ(row_in_cta, col) = bf16(dq_rope[i].x);
-                sdQ(row_in_cta, col + 1) = bf16(dq_rope[i].y);
+                sdQ(row, col) = bf16(dq_rope[i].x);
+                sdQ(row, col + 1) = bf16(dq_rope[i].y);
             }
 
             fence_view_async_shared();
@@ -475,31 +403,28 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             }
         }
     }
-    
-    // ========================================
-    // Warpgroup 1: KV Loading (WG1)
-    // Responsibility: Maintain per-block KV tile and kv_peer transfer
-    // ========================================
+
+    // WG1: KV gather + peer half load to RMEM + local backfill.
     if (is_wg1) {
-        cutlass::arch::warpgroup_reg_dealloc<96>();
-        const int local_warp_idx = warp_idx - 4;  // WG1 has global warps [4, 7]
+        const int local_warp_idx = warp_idx - 4;
+        const int thread_in_wg = idx_in_warpgroup;
         constexpr int NUM_WARPS = 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
-        constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
+        constexpr int PEER_COLS = D_K / 2;
+        constexpr int PEER_ELEMS = (B_TOPK / 2) * PEER_COLS;
+        constexpr int PEER_CACHE_ELEMS = (PEER_ELEMS + 128 - 1) / 128;
+        bf16 peer_cache[PEER_CACHE_ELEMS];
 
-        // Use lane0 of each warp (4 warps in WG1) to issue gather4 TMA loads.
-        if (elect_one_sync()) {
-            bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
+        CUTE_NO_UNROLL
+        for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+            const int phase = k_block & 1;
+            if (k_block > 0) {
+                plan.bar_dq_ready.wait((k_block - 1) & 1);
+                ku::tcgen05_after_thread_sync();
+            }
 
-            CUTE_NO_UNROLL
-            for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
-                const int phase = k_block & 1;
-
-                if (k_block > 0) {
-                    // Keep producer/consumer order between iterations for all producer warps.
-                    plan.bar_dq_ready.wait((k_block - 1) & 1);
-                }
-
+            if (elect_one_sync()) {
+                bf16* sKV_base = plan.u.q_kv.kv.data() + local_warp_idx * 4 * 64;
                 int4 indices4[NUM_LOCAL_ROWS_PER_WARP];
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -523,74 +448,91 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                         );
                     }
                 }
-                // Load kv_peer from peer CTA using cp_async every iteration.
-                if (local_warp_idx == 0) {
-                    // Wait until WG3 has consumed this K block for P, then copy to kv_peer.
-                    plan.bar_p_ready.wait(phase);
+            }
 
-                    plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
-                    bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
-                    transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
-                    kerutils::cp_async_bulk_shared_cta_to_shared_cluster(
-                        peer_kv_peer_ptr,
-                        plan.u.q_kv.k_nope.data(),
-                        sizeof(bf16) * KV_PEER_ELEMENTS,
-                        *peer_bar_ptr
-                    );
-                    fence_view_async_shared();
-                    plan.bar_kv_peer_cp_async.wait(phase);
-                    if (cta_idx == 0) {
-                        plan.bar_kv_peer_ready.arrive(0u);
-                    } else {
-                        plan.bar_kv_peer_ready.arrive(1u);
-                    }
+            plan.bar_p_ready.wait(phase);
+            ku::tcgen05_after_thread_sync();
+
+            const int src_col_base = (cta_idx == 0 ? 0 : D_K / 2);
+            const int dst_col_base = (cta_idx == 0 ? D_K / 2 : 0);
+            CUTE_UNROLL
+            for (int i = 0; i < PEER_CACHE_ELEMS; ++i) {
+                int linear = thread_in_wg + i * 128;
+                if (linear < PEER_ELEMS) {
+                    int row = linear / PEER_COLS;
+                    int col = linear % PEER_COLS;
+                    peer_cache[i] = sKVPeer(row, src_col_base + col);
+                }
+            }
+
+            plan.bar_dp_ready.wait(phase);
+            ku::tcgen05_after_thread_sync();
+
+            CUTE_UNROLL
+            for (int i = 0; i < PEER_CACHE_ELEMS; ++i) {
+                int linear = thread_in_wg + i * 128;
+                if (linear < PEER_ELEMS) {
+                    int row = linear / PEER_COLS;
+                    int col = linear % PEER_COLS;
+                    sKV(row, dst_col_base + col) = peer_cache[i];
+                }
+            }
+            fence_view_async_shared();
+
+            if (thread_in_wg == 0) {
+                if (cta_idx == 0) {
+                    plan.bar_kv_peer_ready.arrive(0u);
+                } else {
+                    plan.bar_kv_peer_ready.arrive(1u);
                 }
             }
         }
     }
-    
-    // ========================================
-    // Warpgroup 2: dKV Transfer (WG2)
-    // Responsibility: Read dKV from TMEM and atomicAdd to global memory
-    // ========================================
+
+    // WG2: TMEM -> sdKV, peer-merge, cp.reduce.async.bulk add to global.
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_dealloc<80>();
-        const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
-        const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
-        static_assert(D_K % 4 == 0, "D_K must be 16B aligned in float units.");
-        static_assert(D_V % 4 == 0, "D_V must be 16B aligned in float units.");
-        static_assert((D_ROPE / 2) % 4 == 0, "D_ROPE/2 must be 16B aligned in float units.");
+        const int row = idx_in_warpgroup % B_TOPK;
+        const int seg = idx_in_warpgroup / B_TOPK;  // 0..3
+        const bool seg_leader = (seg == 0);
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
             const int row_base = k_block * B_TOPK;
             const int row_global = row_base + row;
-            int kv_idx = -1;
-            if (row_global < topk_length) {
-                kv_idx = __ldg(gIndices_s + row_global);
-            }
-            const bool row_valid = kv_idx >= 0 && kv_idx < s_kv;
+            const bool owner = ((k_block & 1) ? (cta_idx == 0) : (cta_idx == 1));
+            const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
+            const uint32_t lane_addr = tmem_base + (row << 16);
 
+            // part0: [0, 256)
             plan.bar_dkv_part0_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-
-            constexpr int COLS_PER_HALF = 256 / 2;
-            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
-            CUTE_UNROLL
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+            {
+                float2 dkv_data[64 / 2];
+                ku::tmem_ld_32dp32bNx<64>(lane_addr + tmem_cols::dKV + seg * 64, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-                if (row_valid) {
-                    float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
-                    const float* src = (const float*)dkv_data;
-                    CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_addx4_tilelang(dst + i, v);
-                    }
+                const float* src = reinterpret_cast<const float*>(dkv_data);
+                CUTE_UNROLL
+                for (int i = 0; i < 64; ++i) {
+                    sdKV(row, seg * 64 + i) = src[i];
+                }
+            }
+            if (owner) {
+                CUTE_UNROLL
+                for (int i = 0; i < 64; ++i) {
+                    sdKV(row, seg * 64 + i) += sdKVPeer(row, seg * 64 + i);
+                }
+            }
+            if (owner && seg_leader) {
+                int kv_idx = -1;
+                if (row_global < topk_length) {
+                    kv_idx = __ldg(gIndices_s + row_global);
+                }
+                if (kv_idx >= 0 && kv_idx < s_kv) {
+                    tma_reduce_add_f32(&sdKV(row, 0), dKV + (int64_t)kv_idx * D_K, 256 * (int)sizeof(float));
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
                 }
             }
             if (cta_idx == 0) {
@@ -599,22 +541,35 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part0_done.arrive(1u);
             }
 
+            // part1: [256, 512)
             plan.bar_dkv_part1_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-            CUTE_UNROLL
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
+            {
+                float2 dkv_data[64 / 2];
+                ku::tmem_ld_32dp32bNx<64>(lane_addr + tmem_cols::dKV + seg * 64, dkv_data);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-                if (row_valid) {
-                    float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
-                    const float* src = (const float*)dkv_data;
-                    CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_addx4_tilelang(dst + i, v);
-                    }
+                const float* src = reinterpret_cast<const float*>(dkv_data);
+                CUTE_UNROLL
+                for (int i = 0; i < 64; ++i) {
+                    sdKV(row, 256 + seg * 64 + i) = src[i];
+                }
+            }
+            if (owner) {
+                CUTE_UNROLL
+                for (int i = 0; i < 64; ++i) {
+                    sdKV(row, 256 + seg * 64 + i) += sdKVPeer(row, 256 + seg * 64 + i);
+                }
+            }
+            if (owner && seg_leader) {
+                int kv_idx = -1;
+                if (row_global < topk_length) {
+                    kv_idx = __ldg(gIndices_s + row_global);
+                }
+                if (kv_idx >= 0 && kv_idx < s_kv) {
+                    tma_reduce_add_f32(&sdKV(row, 256), dKV + (int64_t)kv_idx * D_K + 256, 256 * (int)sizeof(float));
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
                 }
             }
             if (cta_idx == 0) {
@@ -623,20 +578,35 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part1_done.arrive(1u);
             }
 
+            // part2: [512, 576)
             plan.bar_dkv_part2_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-            constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
-            alignas(16) float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
-            ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-            if (row_valid) {
-                float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
-                const float* src = (const float*)dkv_rope_data;
+            {
+                float2 dkv_rope_data[16 / 2];
+                ku::tmem_ld_32dp32bNx<16>(lane_addr + tmem_cols::dKV_RoPE + seg * 16, dkv_rope_data);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                const float* src = reinterpret_cast<const float*>(dkv_rope_data);
                 CUTE_UNROLL
-                for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                    atomic_addx4_tilelang(dst + i, v);
+                for (int i = 0; i < 16; ++i) {
+                    sdKV(row, 512 + seg * 16 + i) = src[i];
+                }
+            }
+            if (owner) {
+                CUTE_UNROLL
+                for (int i = 0; i < 16; ++i) {
+                    sdKV(row, 512 + seg * 16 + i) += sdKVPeer(row, 512 + seg * 16 + i);
+                }
+            }
+            if (owner && seg_leader) {
+                int kv_idx = -1;
+                if (row_global < topk_length) {
+                    kv_idx = __ldg(gIndices_s + row_global);
+                }
+                if (kv_idx >= 0 && kv_idx < s_kv) {
+                    tma_reduce_add_f32(&sdKV(row, 512), dKV + (int64_t)kv_idx * D_K + 512, 64 * (int)sizeof(float));
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
                 }
             }
             if (cta_idx == 0) {
@@ -647,14 +617,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         }
     }
 
-    // ========================================
-    // Warpgroup 3: Matrix Multiplication (WG3)
-    // Responsibility: Compute P, dP, and dKV
-    // ========================================
+    // WG3: compute P/dP/dKV/dQ.
     if (is_wg3) {
         cutlass::arch::warpgroup_reg_alloc<184>();
 
-        // Allocate TMEM tensors for P and dP
         TiledMMA_P tiled_mma_P{};
         TiledMMA_dP tiled_mma_dP{};
         Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_H/2>, Int<B_TOPK>>{});
@@ -662,7 +628,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         tP.data().get() = tmem_cols::P;
         tdP.data().get() = tmem_cols::dP;
 
-        // Allocate TMEM tensors for dKV
         TiledMMA_dKV tiled_mma_dKV{};
         TiledMMA_dKV_RoPE tiled_mma_dKV_RoPE{};
         Tensor tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<256>>{});
@@ -670,13 +635,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         Tensor tdKV_RoPE = partition_fragment_C(tiled_mma_dKV_RoPE, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
         tdKV_RoPE.data().get() = tmem_cols::dKV_RoPE;
 
-        // Extract V from memory: V uses the same layout as K_NoPE
-        Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutV{});
+        Tensor tS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
+            partition_shape_A(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<B_H/2>>{})
+        );
+        tS_dKV.data().get() = tmem_cols::S;
+        Tensor tDS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
+            partition_shape_A(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<B_H/2>>{})
+        );
+        tDS_dKV.data().get() = tmem_cols::dS;
+        Tensor tDS_dKV_rope = tiled_mma_dKV_RoPE.get_slice(_0{}).make_fragment_A(
+            partition_shape_A(tiled_mma_dKV_RoPE, Shape<Int<B_TOPK>, Int<B_H/2>>{})
+        );
+        tDS_dKV_rope.data().get() = tmem_cols::dS;
 
-        // Loop body is executed by one elected warp in each CTA.
+        Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.kv.data()), SmemLayoutV{});
+
         if (warp_idx == 12 && elect_one_sync()) {
             if (cta_idx == 0) {
-                // Q and dO prologue synchronization is consumed in WG3 before any MMA use.
                 plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
                 plan.bar_prologue_q_rope.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
                 plan.bar_prologue_dO.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
@@ -686,22 +661,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::tcgen05_after_thread_sync();
             }
 
-            // S and dS tensors for MMA A operand
-            Tensor sS_mma = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
-            Tensor sDS_mma = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdS{});
-
-            // dO transposed: full [D_V, B_H/2] = [512, 64], then flat_divide into [256, 64] tiles
             Tensor sdO_t_full = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutQTilesTransposed<D_V/64>{});
             auto sdO_t_div = flat_divide(sdO_t_full, Shape<Int<256>, Int<B_H/2>>{});
-
-            // Q NoPE transposed: full [D_V, B_H/2] = [512, 64], then flat_divide into [256, 64] tiles
             Tensor sQ_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.q_nope.data()), SmemLayoutQTilesTransposed<D_V/64>{});
             auto sQ_t_div = flat_divide(sQ_t_full, Shape<Int<256>, Int<B_H/2>>{});
-
-            // Q RoPE transposed: [D_ROPE, B_H/2] = [64, 64]
             Tensor sQ_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPETransposed{});
 
-            // Allocate TMEM tensors for dQ
             TiledMMA_dQ tiled_mma_dQ{};
             TiledMMA_dQ_RoPE tiled_mma_dQ_RoPE{};
             Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H/2>, Int<256>>{});
@@ -711,20 +676,27 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE, Shape<Int<B_H/2>, Int<D_ROPE>>{});
             tdQ_RoPE.data().get() = tmem_cols::dQ_RoPE;
 
-            // dS transposed tensor for MMA A operand: [B_H/2, B_TOPK] -> A matrix
-            Tensor sDS_t = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdSTransposed{});
-            auto sDS_t_div = flat_divide(sDS_t, Shape<Int<B_H/2>, Int<B_TOPK/2>>{});
+            Tensor tDS_dQ = tiled_mma_dQ.get_slice(_0{}).make_fragment_A(
+                partition_shape_A(tiled_mma_dQ, Shape<Int<B_H>, Int<B_TOPK>>{})
+            );
+            tDS_dQ.data().get() = tmem_cols::dS;
+            auto tDS_dQ_div = flat_divide(tDS_dQ, Shape<Int<B_H>, Int<B_TOPK/2>>{});
+            Tensor tDS_dQ_rope = tiled_mma_dQ_RoPE.get_slice(_0{}).make_fragment_A(
+                partition_shape_A(tiled_mma_dQ_RoPE, Shape<Int<B_H>, Int<B_TOPK>>{})
+            );
+            tDS_dQ_rope.data().get() = tmem_cols::dS;
+            auto tDS_dQ_rope_div = flat_divide(tDS_dQ_rope, Shape<Int<B_H>, Int<B_TOPK/2>>{});
 
-            // K NoPE/RoPE transposed
-            Tensor sK_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
+            Tensor sK_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.kv.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
             auto sK_nope_t_div = flat_divide(sK_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
-            Tensor sK_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPETransposed{});
-
-            // K_peer transposed
-            Tensor sK_peer_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
+            Tensor sK_rope_t = make_tensor(
+                make_smem_ptr(plan.u.q_kv.kv.data() + cosize_v<SmemLayoutKNoPE>),
+                SmemLayoutKRoPETransposed{}
+            );
+            Tensor sK_peer_nope_t_full = make_tensor(make_smem_ptr(peer_kv_ptr), SmemLayoutKVTilesTransposed<D_V/64>{});
             auto sK_peer_nope_t_div = flat_divide(sK_peer_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
             Tensor sK_peer_rope_t = make_tensor(
-                make_smem_ptr(plan.u.q_kv.kv_peer.data() + (B_TOPK/2) * D_V),
+                make_smem_ptr(peer_kv_ptr + cosize_v<SmemLayoutKNoPE>),
                 SmemLayoutKRoPETransposed{}
             );
 
@@ -733,17 +705,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 const int phase = k_block & 1;
                 const bool dq_clear = (k_block == 0);
 
-                // Pipeline dependency:
-                // Reuse dKV(0:511) TMEM buffer for part0(k) only after part1(k-1) is fully drained by WG2.
                 if (k_block > 0) {
                     const int prev_phase = (k_block - 1) & 1;
                     plan.bar_dkv_part1_done.wait(prev_phase);
                     ku::tcgen05_after_thread_sync();
                 }
 
-                // CTA0 computes P/dP and notifies WG0.
                 if (cta_idx == 0) {
-                    // Wait for WG1 KV TMA completion of current block.
                     plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
                     plan.bar_prologue_kv.wait(phase);
                     ku::tcgen05_after_thread_sync();
@@ -757,65 +725,47 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     ku::tcgen05_after_thread_sync();
                 }
 
-                // dKV part0: dV[0:256] + dK[0:256]
                 plan.bar_s_ready.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _0{}, _0{}), tdKV, true);
-
                 plan.bar_ds_ready.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _0{}, _0{}), tdKV, false);
+                ku::utcmma_ts(tiled_mma_dKV, tS_dKV, sdO_t_div(_, _, _0{}, _0{}), tdKV, true);
+                ku::utcmma_ts(tiled_mma_dKV, tDS_dKV, sQ_t_div(_, _, _0{}, _0{}), tdKV, false);
                 ku::umma_arrive_noelect(plan.bar_dkv_part0_ready);
                 ku::tcgen05_after_thread_sync();
 
-                // dQ: k==0 clear, k>0 accumulate
                 if (cta_idx == 0) {
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
+
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
 
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
-
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_rope_t, tdQ_RoPE, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
-                } else {
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    plan.bar_kv_peer_ready.wait(phase);
-                    ku::tcgen05_after_thread_sync();
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
-
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
-
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_rope_t, tdQ_RoPE, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_peer_rope_t, tdQ_RoPE, false);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _1{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
+                    ku::utcmma_ts(tiled_mma_dQ_RoPE, tDS_dQ_rope_div(_, _, _0{}), sK_rope_t, tdQ_RoPE, dq_clear);
+                    ku::utcmma_ts(tiled_mma_dQ_RoPE, tDS_dQ_rope_div(_, _, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
                 }
                 ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();
 
-                // dKV part1: dV[256:512] + dK[256:512]
                 plan.bar_dkv_part0_done.wait(phase);
                 ku::tcgen05_after_thread_sync();
-                ku::utcmma_ss(tiled_mma_dKV, sS_mma, sdO_t_div(_, _, _1{}, _0{}), tdKV, true);
-                ku::utcmma_ss(tiled_mma_dKV, sDS_mma, sQ_t_div(_, _, _1{}, _0{}), tdKV, false);
+                ku::utcmma_ts(tiled_mma_dKV, tS_dKV, sdO_t_div(_, _, _1{}, _0{}), tdKV, true);
+                ku::utcmma_ts(tiled_mma_dKV, tDS_dKV, sQ_t_div(_, _, _1{}, _0{}), tdKV, false);
                 ku::umma_arrive_noelect(plan.bar_dkv_part1_ready);
                 ku::tcgen05_after_thread_sync();
 
-                // dKV part2: dK_rope
-                // Reuse dKV_RoPE TMEM buffer for part2(k) only after part2(k-1) is drained by WG2.
                 if (k_block > 0) {
                     const int prev_phase = (k_block - 1) & 1;
                     plan.bar_dkv_part2_done.wait(prev_phase);
                     ku::tcgen05_after_thread_sync();
                 }
-                ku::utcmma_ss(tiled_mma_dKV_RoPE, sDS_mma, sQ_rope_t, tdKV_RoPE, true);
+                ku::utcmma_ts(tiled_mma_dKV_RoPE, tDS_dKV_rope, sQ_rope_t, tdKV_RoPE, true);
                 ku::umma_arrive_noelect(plan.bar_dkv_part2_ready);
                 ku::tcgen05_after_thread_sync();
             }
 
-            // Drain outstanding part1/part2 writes of the final k-block before TMEM free.
             if (num_k_blocks > 0) {
                 const int final_phase = (num_k_blocks - 1) & 1;
                 plan.bar_dkv_part1_done.wait(final_phase);
@@ -826,9 +776,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
             (void)sdO_t_full;
         } else if (warp_idx == 13) {
-            // KV valid loading warp
-            static_assert(B_TOPK == 64);
-            if (lane_idx < 8) {
+            static_assert(B_TOPK == 32);
+            if (lane_idx < (B_TOPK / 8)) {
                 CUTE_NO_UNROLL
                 for (int k = 0; k < num_k_blocks; ++k) {
                     int32x8_t indices = ldg_256_indices((void*)(gIndices_s + k * B_TOPK + lane_idx * 8));
@@ -853,11 +802,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         }
     }
 
-    // All threads must sync before proceeding
     __syncthreads();
     cluster_sync();
-    
-    // Free TMEM
+
     if (warp_idx == 0 && elect_one_sync()) {
         TMEM::Allocator2Sm().free(plan.tmem_start_addr.data()[0], 512);
     }
@@ -1075,7 +1022,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     const int64_t topk_length = indices.size(1);
     TORCH_CHECK(topk_length > 0, "topk_length must be > 0");
     TORCH_CHECK(topk_length % B_TOPK == 0,
-                "topk_length must be a multiple of tile B_TOPK=64");
+                "topk_length must be a multiple of tile B_TOPK=32");
     TORCH_CHECK(s_kv > 0, "s_kv must be > 0");
     TORCH_CHECK(topk_length <= s_kv,
                 "indices.size(1) must be <= kv.size(0)");
@@ -1104,7 +1051,7 @@ std::tuple<torch::Tensor, torch::Tensor> mla_bwd_forward(
     float* dKV_ptr = dKV.data_ptr<float>();
     bf16* dQ_ptr = reinterpret_cast<bf16*>(dQ.data_ptr<at::BFloat16>());
     TORCH_CHECK((reinterpret_cast<uintptr_t>(dKV_ptr) & 0xFULL) == 0,
-                "dKV base pointer must be 16-byte aligned for float4 atomicAdd");
+                "dKV base pointer must be 16-byte aligned for cp.reduce.async.bulk add.f32");
     
     // Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();

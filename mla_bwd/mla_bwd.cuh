@@ -53,7 +53,7 @@ static constexpr bool HAVE_ROPE = (D_QK == 576);    // 是否启用 RoPE
 // 2CTA 相关常量定义
 // ============================================================================
 static constexpr int B_H = 128;                     // Query head 块大小 (2CTA 共享，每个 CTA 处理 B_H/2=64 行)
-static constexpr int B_TOPK = 32;                    // 编译期 tile 大小。运行时 topk 由 kernel 内按 64 分块循环处理
+static constexpr int B_TOPK = 32;                    // 编译期 tile 大小。运行时 topk 由 kernel 内按 32 分块循环处理
 static constexpr int NUM_THREADS = 4 * 128; // 4个 WarpGroup，每个128线程
 
 // SMEM Layout definitions (from config.h)
@@ -126,11 +126,14 @@ using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
+// dKV accumulation buffer in SMEM: [B_TOPK, D_K] float
+using SmemLayoutdKV = Layout<Shape<Int<B_TOPK>, Int<D_K>>, Stride<Int<D_K>, _1>>;
+
 // ============================================================================
 // TiledMMA 定义 (2CTA 模式)
 // ============================================================================
 // TiledMMA_P: 用于计算 P = Q @ K^T
-// 2CTA 模式: [B_H, B_TOPK] = [128, 64]
+// 2CTA 模式: [B_H, B_TOPK] = [128, 32]
 // 每个 CTA 处理 B_H/2 = 64 行，共同完成完整的 MMA
 // 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
 using TiledMMA_P = decltype(make_tiled_mma(
@@ -138,8 +141,8 @@ using TiledMMA_P = decltype(make_tiled_mma(
 ));
 
 // TiledMMA_dP: 用于计算 dP = dO @ V^T
-// 2CTA 模式: [B_H, B_TOPK] = [128, 64]
-// dO: [B_H/2, D_V] = [64, 512], V: [B_TOPK/2, D_V] = [32, 512]
+// 2CTA 模式: [B_H, B_TOPK] = [128, 32]
+// dO: [B_H/2, D_V] = [64, 512], V: [B_TOPK/2, D_V] = [16, 512]
 // 指令: utcmma_ss (SMEM-SMEM), 2x1SM 协作
 using TiledMMA_dP = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
@@ -242,9 +245,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dkv_part0_done;           // WG2通知WG3 dKV_part0传输完成
     transac_bar_t bar_dkv_part1_done;           // WG2通知WG3 dKV_part1传输完成
     transac_bar_t bar_dkv_part2_done;           // WG2通知WG3 dKV_part2传输完成
-    // WG1-WG3 同步屏障 (kv_peer cp_async)
-    transac_bar_t bar_kv_peer_cp_async;         // cp_async传输kv_peer的transaction barrier
-    transac_bar_t bar_kv_peer_ready;            // WG1通知WG3 kv_peer加载完成
+    // WG1-WG3 同步屏障 (peer KV read/backfill)
+    transac_bar_t bar_kv_peer_ready;            // WG1通知WG3 peer-K数据已就绪
     // WG3-WG0 同步屏障 (dQ computation)
     transac_bar_t bar_dq_ready;                 // WG3通知WG0 dQ计算完成
 
@@ -254,6 +256,8 @@ struct alignas(128) SharedMemoryPlan {
 
 // SMEM size
 static constexpr size_t SMEM_SIZE = sizeof(SharedMemoryPlan);
+static_assert(SMEM_SIZE <= cutlass::arch::sm100_smem_capacity_bytes,
+              "SharedMemoryPlan exceeds SM100 SMEM capacity");
 
 }  // namespace test_operator::mla_bwd
 
