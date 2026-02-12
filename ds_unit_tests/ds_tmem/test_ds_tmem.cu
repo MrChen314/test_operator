@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 
 #include <cmath>
+#include <cstring>
 
 namespace test_operator::ds_tmem {
 
@@ -131,10 +132,24 @@ void launch_test_ds_tmem(
         return;
     }
 
-    test_ds_tmem_kernel<<<grid, block, SMEM_SIZE, stream>>>(p, dp, lse, delta, s_out, ds_out);
-    cudaError_t err = cudaGetLastError();
+    cudaLaunchConfig_t config;
+    memset(&config, 0, sizeof(config));
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = SMEM_SIZE;
+    config.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = 2;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    cudaError_t err = cudaLaunchKernelEx(&config, test_ds_tmem_kernel, p, dp, lse, delta, s_out, ds_out);
     if (err != cudaSuccess) {
-        fprintf(stderr, "test_ds_tmem_kernel launch failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "cudaLaunchKernelEx failed: %s\n", cudaGetErrorString(err));
     }
 }
 

@@ -4,7 +4,7 @@
 #include <kerutils/kerutils.cuh>
 #include <torch/extension.h>
 
-using namespace test_operator::dkv_mma;
+namespace test_operator::dkv_mma {
 
 __global__ void test_dkv_mma_kernel(
     const bf16* __restrict__ s,
@@ -283,6 +283,8 @@ torch::Tensor run_dkv_mma(
     return dkv_out;
 }
 
+}  // namespace test_operator::dkv_mma
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_dkv_mma", &run_dkv_mma, "Run TiledMMA_dKV TS unit test kernel");
+    m.def("run_dkv_mma", &test_operator::dkv_mma::run_dkv_mma, "Run TiledMMA_dKV TS unit test kernel");
 }

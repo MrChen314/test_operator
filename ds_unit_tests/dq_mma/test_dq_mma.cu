@@ -4,7 +4,7 @@
 #include <kerutils/kerutils.cuh>
 #include <torch/extension.h>
 
-using namespace test_operator::dq_mma;
+namespace test_operator::dq_mma {
 
 __global__ void test_dq_mma_kernel(
     const bf16* __restrict__ ds,
@@ -276,6 +276,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_mma(
     return std::make_tuple(dq_nope_part0, dq_nope_part1, dq_rope);
 }
 
+}  // namespace test_operator::dq_mma
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_dq_mma", &run_dq_mma, "Run TiledMMA_dQ TS unit test kernel (3 utcmma_ts calls)");
+    m.def("run_dq_mma", &test_operator::dq_mma::run_dq_mma, "Run TiledMMA_dQ TS unit test kernel (3 utcmma_ts calls)");
 }
