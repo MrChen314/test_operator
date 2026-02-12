@@ -17,6 +17,7 @@ static constexpr int D_Q = 576;
 static constexpr int D_K = D_Q;
 static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int NUM_THREADS = 128;
+static constexpr int MMA_M = 64;
 
 template <int NUM_TILES>
 using SmemLayoutQTilesTransposed = decltype(coalesce(tile_to_shape(
@@ -30,18 +31,22 @@ using SmemLayoutQNoPETransposed = SmemLayoutQTilesTransposed<D_V / 64>;   // [51
 using SmemLayoutQRoPETransposed = SmemLayoutQTilesTransposed<1>;          // [64, 64]
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_TOPK, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, MMA_M, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dKV_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_TOPK, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, MMA_M, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 struct tmem_cols {
-    static constexpr int dKV = 288;
-    static constexpr int dKV_RoPE = 416;
-    static constexpr int S = 464;
-    static constexpr int dS = 472;
+    // dKV [64,256] tile, reused for part0 and part1
+    static constexpr int dKV = 0;        // 128 cols
+    // dKV RoPE [64,64]
+    static constexpr int dKV_RoPE = 128; // 32 cols
+    // S and dS are padded to [64,64] for TS A-fragment compatibility
+    static constexpr int S = 160;        // 32 cols
+    static constexpr int dS = 192;       // 32 cols
+    static_assert(dS + 32 <= 512, "TMEM column overflow");
 };
 
 struct alignas(128) SharedMemory {

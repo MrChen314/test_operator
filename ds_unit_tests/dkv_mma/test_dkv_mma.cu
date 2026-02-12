@@ -73,52 +73,59 @@ __global__ void test_dkv_mma_kernel(
     }
     __syncthreads();
 
-    const int row = tid % (B_H / 2);         // 0..63
-    const int topk_half = tid / (B_H / 2);   // 0..1
-
+    const uint32_t tmem_base = smem.tmem_start_addr;
     const uint16_t* s_u16 = reinterpret_cast<const uint16_t*>(s);
     const uint16_t* ds_u16 = reinterpret_cast<const uint16_t*>(ds);
 
-    uint32_t s_pack[8];
-    uint32_t ds_pack[8];
+    // TS A-fragment for WS MMA requires M=64. Pad topk 32 -> 64 with zeros in TMEM.
+    if (tid < MMA_M) {
+        const int row = tid;  // 0..63
+        const uint32_t lane_addr = tmem_base + (row << 16);
 
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int col = topk_half * 16 + i * 2;
-        const int base = row * B_TOPK + col;
-        s_pack[i] = static_cast<uint32_t>(s_u16[base + 0]) |
-                    (static_cast<uint32_t>(s_u16[base + 1]) << 16);
-        ds_pack[i] = static_cast<uint32_t>(ds_u16[base + 0]) |
-                     (static_cast<uint32_t>(ds_u16[base + 1]) << 16);
+        uint32_t s_pack[32];
+        uint32_t ds_pack[32];
+
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int col = i * 2;
+            const int base = row * B_TOPK + col;
+            s_pack[i] = static_cast<uint32_t>(s_u16[base + 0]) |
+                        (static_cast<uint32_t>(s_u16[base + 1]) << 16);
+            ds_pack[i] = static_cast<uint32_t>(ds_u16[base + 0]) |
+                         (static_cast<uint32_t>(ds_u16[base + 1]) << 16);
+        }
+        #pragma unroll
+        for (int i = 16; i < 32; ++i) {
+            s_pack[i] = 0u;
+            ds_pack[i] = 0u;
+        }
+
+        ku::tmem_st_32dp32bNx<32>(lane_addr + tmem_cols::S, s_pack);
+        cutlass::arch::fence_view_async_tmem_store();
+        ku::tmem_st_32dp32bNx<32>(lane_addr + tmem_cols::dS, ds_pack);
+        cutlass::arch::fence_view_async_tmem_store();
     }
-
-    const uint32_t tmem_base = smem.tmem_start_addr;
-    const uint32_t lane_addr = tmem_base + (row << 16);
-    ku::tmem_st_32dp32bNx<8>(lane_addr + tmem_cols::S, s_pack);
-    cutlass::arch::fence_view_async_tmem_store();
-    ku::tmem_st_32dp32bNx<8>(lane_addr + tmem_cols::dS, ds_pack);
-    cutlass::arch::fence_view_async_tmem_store();
 
     __syncthreads();
 
     TiledMMA_dKV tiled_mma_dKV{};
     TiledMMA_dKV_RoPE tiled_mma_dKV_rope{};
 
-    auto tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<256>>{});
+    auto tdKV = partition_fragment_C(tiled_mma_dKV, Shape<Int<MMA_M>, Int<256>>{});
     tdKV.data().get() = tmem_cols::dKV;
-    auto tdKV_rope = partition_fragment_C(tiled_mma_dKV_rope, Shape<Int<B_TOPK>, Int<D_ROPE>>{});
+    auto tdKV_rope = partition_fragment_C(tiled_mma_dKV_rope, Shape<Int<MMA_M>, Int<D_ROPE>>{});
     tdKV_rope.data().get() = tmem_cols::dKV_RoPE;
 
     auto tS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<B_H / 2>>{}));
+        partition_shape_A(tiled_mma_dKV, Shape<Int<MMA_M>, Int<B_H / 2>>{}));
     tS_dKV.data().get() = tmem_cols::S;
 
     auto tDS_dKV = tiled_mma_dKV.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_dKV, Shape<Int<B_TOPK>, Int<B_H / 2>>{}));
+        partition_shape_A(tiled_mma_dKV, Shape<Int<MMA_M>, Int<B_H / 2>>{}));
     tDS_dKV.data().get() = tmem_cols::dS;
 
     auto tDS_dKV_rope = tiled_mma_dKV_rope.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_dKV_rope, Shape<Int<B_TOPK>, Int<B_H / 2>>{}));
+        partition_shape_A(tiled_mma_dKV_rope, Shape<Int<MMA_M>, Int<B_H / 2>>{}));
     tDS_dKV_rope.data().get() = tmem_cols::dS;
 
     auto sdO_t_div = flat_divide(sdO_t_full, Shape<Int<256>, Int<B_H / 2>>{});

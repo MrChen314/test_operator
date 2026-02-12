@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 MODULES = [
     ("ds_tmem", "test_ds_tmem.py"),
+    ("wg1_peer_kv_copy", "test_wg1_peer_kv_copy.py"),
     ("dkv_mma", "test_dkv_mma.py"),
     ("dq_mma", "test_dq_mma.py"),
 ]
