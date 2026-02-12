@@ -6,7 +6,7 @@
 
 #include <cmath>
 
-using namespace test_operator::ds_tmem;
+namespace test_operator::ds_tmem {
 
 __global__ void test_ds_tmem_kernel(
     const float* __restrict__ p,
@@ -172,6 +172,8 @@ std::tuple<torch::Tensor, torch::Tensor> run_ds_tmem(torch::Tensor p, torch::Ten
     return std::make_tuple(s_out, ds_out);
 }
 
+}  // namespace test_operator::ds_tmem
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_ds_tmem", &run_ds_tmem, "Run ds->TMEM test kernel");
+    m.def("run_ds_tmem", &test_operator::ds_tmem::run_ds_tmem, "Run ds->TMEM test kernel");
 }
