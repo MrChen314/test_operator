@@ -3,6 +3,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/bfloat16.h>
 #include <cutlass/cluster_launch.hpp>
+#include <kerutils/kerutils.cuh>
 
 namespace test_operator::dq_mma {
 
