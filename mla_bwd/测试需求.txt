@@ -154,7 +154,6 @@
 
 
 要求5（代码重构）
-注意：当前环境不是gpu，无法进行编译，你只需要给出重构plan并重构代码，后续会在服务器执行
 参考路径：
     /Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/gemm.cuh
     /Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/fwd/head128/phase1.cuh
