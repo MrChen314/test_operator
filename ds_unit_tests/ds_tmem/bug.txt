@@ -1,0 +1,101 @@
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(154): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(158): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(171): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(173): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cu(126): error: more than one instance of overloaded function "test_ds_tmem_kernel" matches the required type
+          test_ds_tmem_kernel,
+          ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cu(134): error: more than one instance of overloaded function "test_ds_tmem_kernel" matches the argument list:
+            function "test_ds_tmem_kernel(const float *, const float *, const float *, const float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *)" (declared at line 11)
+            function "test_operator::ds_tmem::test_ds_tmem_kernel(const float *, const float *, const float *, const float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *)" (declared at line 28 of /home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cuh)
+            argument types are: (const float *, const float *, const float *, const float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *)
+      test_ds_tmem_kernel<<<grid, block, SMEM_SIZE, stream>>>(p, dp, lse, delta, s_out, ds_out);
+      ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cu(163): error: more than one instance of overloaded function "launch_test_ds_tmem" matches the argument list:
+            function "launch_test_ds_tmem(const float *, const float *, const float *, const float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *, cudaStream_t)" (declared at line 113)
+            function "test_operator::ds_tmem::launch_test_ds_tmem(const float *, const float *, const float *, const float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *, cudaStream_t)" (declared at line 37 of /home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cuh)
+            argument types are: (float *, float *, float *, float *, test_operator::ds_tmem::bf16 *, test_operator::ds_tmem::bf16 *, cudaStream_t)
+      launch_test_ds_tmem(
+      ^
+
+3 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/test_ds_tmem.cu".
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
+    subprocess.run(
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_operator/ds_unit_tests/ds_tmem/setup.py", line 56, in <module>
+    setup(
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
+    return distutils.core.setup(**attrs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
+    return run_commands(dist)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
+    dist.run_commands()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+    self.run_command(cmd)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
+    super().run_command(command)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+    cmd_obj.run()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
+    _build_ext.run(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+    self.build_extensions()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
+    build_ext.build_extensions(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
+    self._build_extensions_serial()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
+    self.build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
+    _build_ext.build_extension(self, ext)
+  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
+    super().build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
+    objects = self.compiler.compile(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
+    _write_ninja_file_and_compile_objects(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
+    _run_ninja_build(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error compiling objects for extension
