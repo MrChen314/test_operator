@@ -159,15 +159,16 @@
     /Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/fwd/head128/phase1.cuh
 1.b_topk从64减少到了32，我只更改了部分相关配置，你需要全局更新下b_topk相关代码及注释
 2.现在dKV的传输是通过atomicAdd累加到全局内存，速度很慢；新方案是将B_topk从64减少到32，然后SMEM能空出来（sdKV），让dKV通过TMA store reduce（reduce add）的方式异步传输
-    3.1 将mla_bwd.cu中进行mma操作的顺序调整下：先算dQ，再算dKV part0、1、2
-    3.2 dKV每计算完一个part，就通知WG2传输cta0和cta1的dKV数据
-        3.2.1k为奇数时，cta0读取cta1(peer)的sdKV，然后累加到自己的sdKV上
-        3.2.2k为偶数时，cta1读取cta0(peer)的sdKV，然后累加到自己的sdKV上
-        3.2.3累加完再通过tma进行传输，这样cta0和cta1交叉着传
-        3.2.4你可以判断下是dKV3个part都计算完，再统一传；还是每算完一个part传一个part，哪种方式快
+    3.1 dKV每计算完一个part，就通知WG2传输cta0和cta1的dKV数据
+        3.1.1k为奇数时，cta0读取cta1(peer)的sdKV，然后累加到自己的sdKV上
+        3.1.2k为偶数时，cta1读取cta0(peer)的sdKV，然后累加到自己的sdKV上
+        3.1.3累加完再通过tma进行传输，这样cta0和cta1交叉着传
+        3.1.4你可以判断下是dKV3个part都计算完，再统一传；还是每算完一个part传一个part，哪种方式快
 3.将s和ds从加载到smem修改成加载到tmem
 4.kv_peer先不加载到smem，先从对端smem加载到local_rmem（寄存器）
     4.1 cta0加载cta1的前288维，cta1加载cta0的后288维
     4.2 等dp的mma计算结束，cta0将rmem存入plan.u.q_kv.kv的后288维，cta1将rmem存入plan.u.q_kv.kv的前288维，注意这里地址映射要对准
     4.3 计算dQ改用SM100_MMA_F16BF16_2x1SM_SS_NOELECT，因为此时A矩阵ds shape是[64,32]，B矩阵k shape已经从[16,576]经过对端加载变为[32,288]
         4.3.1 SM100_MMA_F16BF16_2x1SM_SS_NOELECT要求N维度<=256，这里的N是两个cta拼接后的，所以实际上每个cta的N<=128。因此计算dQ的mma要做3次：N拆为128、128、32
+        4.3.2 使用SM100_MMA_F16BF16_2x1SM_SS_NOELECT计算dQ，就不需要cta0和cta1的分支了，参考算p和dp，只需要cta0发起mma操作
+5.mla_bwd.cuh中已经修改好TiledMMA使用ts的版本，tmem和smem也都修改好，不要改动这些布局，但可以往smem里添额外的layout等
