@@ -1,0 +1,143 @@
+通过preprocess_delta.cuh预计算delta
+cuda实现将tilelang的bwd、postprocess放在一个kernel中
+共有4个WG
+
+WG0：
+1.等待WG3计算好p
+2.使用ku::tmem_ld_32dp32bNx指令将tmem_cols.p读取到寄存器，然后计算softmax(p) -> 通过exp2(P*scale - LSE)获得softmax值s(fp32)
+3.if (k>0) {
+    等待WG3计算好dKV_part1和dKV_part2
+    }
+4.将s存到tmem_cols.S，存入的是bf16格式。存好后，告知WG3信息：s已经准备好
+5.从全局内存读取需要的delta，参考/Users/chenql/Desktop/workspace/operator/docs/Flash-Attention主Kernel中Delta的加载策略.md
+6.等待WG3计算好dp
+7.计算ds，ds = s * (dp - delta) * scale；注意公式里的s用3中算好的fp32格式的值，而不是存到TMEM里面的bf16格式
+8.将ds从fp32转换到bf16，存储ds到SharedMemoryPlan.ds，存好后，告知WG3信息：ds已经准备好
+9.待所有循环结束后，使用tma指令输出dQ到全局内存
+
+WG1:
+1.等待WG3计算好dQ，循环加载KV
+
+WG2:
+1.等待WG3计算好dKV_part0
+2.进行dKV_part0到全局内存的传输(0-255维)
+    指令：atom.add.v4
+    数据：读取tmem_cols.dKV
+3.告知WG3信息：dKV_part0已经传输完成
+4.等待WG3计算好dKV_part1
+5.使用tmem_ld_32dp32bNx命令从tmem读取dKV_part1
+6.告知WG3信息：dKV_part1已经读取完成
+5.进行dKV_part1到全局内存的传输(256-511维)
+    指令：atom.add.v4
+    数据：读取tmem_cols.dKV
+6.告知WG3信息：dKV_part1已经传输完成
+7.等待WG3计算好dKV_part2
+8.进行dKV_part2到全局内存的传输(512-575维)
+    指令：atom.add.v4
+    数据：读取tmem_cols.dKV_RoPE
+9.告知WG3信息：dKV_part2已经传输完成
+
+WG3:
+1.if (k>0) {
+    等待WG2读取完dKV_part1
+    }
+2.等待WG1传输完KV，执行QK矩阵乘，使用utcmma_ss（qk都在SMEM）输出到TMEM的P
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.u.q_kv.q
+    输入2：SharedMemoryPlan.u.q_kv.kv
+    输出：tmem_cols.p
+    注意：对tmem_cols.p执行clear_accum
+
+3.告知WG0信息：p已经准备好
+4.计算dp
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.dO
+    输入2：SharedMemoryPlan.u.q_kv.kv中的v部分
+    输出：tmem_cols.dp
+    注意：对tmem_cols.dp执行clear_accum
+
+5.告知WG0信息：dp已经准备好
+4.if (0 < k < num_k_blocks-1) {
+    1.等待WG2传输完dKV_part1
+    }
+5.计算dKV_part0: dV = s^T @ dO(0-255维)
+    指令：utcmma_ts
+    输入1：tmem_cols.s
+    输入2：SharedMemoryPlan.dO(0-255维)
+    输出：tmem_cols.dKV
+    输出shape：[128, 256]
+    注意：对tmem_cols.dKV执行clear_accum
+
+6.等待WG0计算好ds
+7.计算dKV_part0: dK_nope = ds^T @ q(0-255维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.q(0-255维)
+    输出：tmem_cols.dKV
+    输出shape：[128, 256]
+    形式：累加
+
+8.告知WG2信息：dKV_part0计算完成
+
+9.计算dQ_part0: dq += ds @ k(0-255维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.kv(0-255维)
+    输出：tmem_cols.dQ(0-255维)
+    输出shape：[128, 256]
+    形式：累加
+
+10.计算dQ_part1: dq += ds @ k(256-511维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.kv(256-511维)
+    输出：tmem_cols.dQ(256-511维)
+    输出shape：[128, 256]
+    形式：累加
+
+11.计算dQ_part2: dq += ds @ k(512-575维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.kv(512-575维)
+    输出：tmem_cols.dQ_RoPE(512-575维)
+    输出shape：[128, 64]
+    形式：累加
+
+12.告知WG1信息：dQ计算完成，可加载下一轮KV
+13.等待WG2传输完dKV_part0
+14.计算dKV_part1_0: dV = s^T @ dO(256-511维)
+    指令：utcmma_ts
+    输入1：tmem_cols.s
+    输入2：SharedMemoryPlan.dO(256-511维)
+    输出：tmem_cols.dKV
+    输出shape：[128, 256]
+    注意：对tmem_cols.dKV执行clear_accum
+
+15.计算dKV_part1_1: dK_nope = ds^T @ q(256-511维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.q(256-511维)
+    输出：tmem_cols.dKV
+    输出shape：[128, 256]
+    形式：累加
+
+16.当dKV_part1_0和dKV_part1_1都计算完成 {
+    告知WG0信息：dKV_part1计算完成
+    告知WG2信息：dKV_part1计算完成
+    }
+
+17.if (0 < k < num_k_blocks-1) {
+    1.等待WG2传输完dKV_part2
+    }
+18.等待dKV_part1_0计算完成
+19.计算dKV_part2: dK_rope = ds^T @ q(512-575维)
+    指令：utcmma_ss
+    输入1：SharedMemoryPlan.ds
+    输入2：SharedMemoryPlan.u.q_kv.q(512-575维)
+    输出：tmem_cols.dKV_RoPE
+    输出shape：[128, 64]
+    注意：对tmem_cols.dKV_RoPE执行clear_accum
+
+20.告知WG2信息：dKV_part2计算完成
+21.告知WG0信息：dKV_part2计算完成
+

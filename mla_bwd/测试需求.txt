@@ -151,3 +151,12 @@
 5.test_mla_bwd.py增加对dQ的精度对比，torch_ref = ds@K
 
 注：所有生成的文件都在/test_operator/mla_bwd 目录下
+
+
+要求5
+参考路径：
+    /Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/kerutils/include/kerutils/device/sm100/gemm.cuh
+    /Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/fwd/head128/phase1.cuh
+1.dO从smem换到了TMEM，参考phase1.cuh，将dO先传到SMEM然后传到TMEM
+2.涉及到dO的mma有dp=dO@V和dV=s@dO，现在dO在tmem所以mma要使用ts，根据gemm.cuh选择合适的mma。其中dV=s@dO，因为gpu不支持st的mma，所以我想到的方案是先改成dO.T@s，在算dK_nope时，也使用q_nope.T@ds，最终从tmem读取输出到全局内存时，形状再重新映射；你可以思考还有没有其他替代方案
+3.

@@ -53,7 +53,7 @@ static constexpr bool HAVE_ROPE = (D_QK == 576);    // 是否启用 RoPE
 // 2CTA 相关常量定义
 // ============================================================================
 static constexpr int B_H = 128;                     // Query head 块大小 (2CTA 共享，每个 CTA 处理 B_H/2=64 行)
-static constexpr int B_TOPK = 64;                    // 编译期 tile 大小。运行时 topk 由 kernel 内按 64 分块循环处理
+static constexpr int B_TOPK = 32;                    // 编译期 tile 大小。运行时 topk 由 kernel 内按 64 分块循环处理
 static constexpr int NUM_THREADS = 4 * 128; // 4个 WarpGroup，每个128线程
 
 // SMEM Layout definitions (from config.h)
@@ -174,20 +174,23 @@ struct tmem_cols {
     
     // dKV NoPE 累加器: dKey/dValue 梯度累加 (NoPE 部分)
     // 由于 资源限制，分成两部分计算
-    // Shape: [B_TOPK, 256] × 2 = [64, 512], 每部分需要 64*256/128 = 128 列
+    // Shape: [B_TOPK, 256] × 2 = [32, 512], 每部分需要 32*256/128 = 64 列
     static constexpr int dKV = 288;      
 
     // dKV RoPE 累加器: dKey/dValue 梯度累加 (RoPE 部分)
-    // Shape: [B_TOPK, D_ROPE] = [64, 64], 需要 64*64/128 = 32 列
-    static constexpr int dKV_RoPE = 416;
-    
-    // P 矩阵: Attention Scores
-    // 2CTA 模式: 每个 CTA 存储 [B_H/2, B_TOPK] = [64, 64], 需要 64*64/128 = 32 列
-    static constexpr int P = 448;
+    // Shape: [B_TOPK, D_ROPE] = [32, 64], 需要 32*64/128 = 16 列
+    static constexpr int dKV_RoPE = 352;
 
-    // dP 矩阵: dAttention Scores
-    // 2CTA 模式: 每个 CTA 存储 [B_H/2, B_TOPK] = [64, 64], 需要 32 列
-    static constexpr int dP = 480;
+    // dP 矩阵: dAttention Scores（复用dKV RoPE）
+    // 2CTA 模式: 每个 CTA 存储 [B_H/2, B_TOPK] = [64, 32], 需要 16 列
+    static constexpr int dP = 352;
+
+    // P 矩阵: Attention Scores
+    // 2CTA 模式: 每个 CTA 存储 [B_H/2, B_TOPK] = [64, 32], 需要 64*32/128 = 16 列
+    static constexpr int P = 368;
+
+    // dO 矩阵(bf16)：[64, 512], 需要 128 列
+    static constexpr int dO = 384;
 };
 
 
@@ -198,9 +201,8 @@ struct alignas(128) SharedMemoryPlan {
         // Q + KV 计算阶段: Q 和 KV 同时驻留
         struct {
             // KV 缓冲区 (每个 CTA 加载 B_TOPK/2 行)
-            array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;    // [B_TOPK/2, D_V] = [32, 512] bf16
-            array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;    // [B_TOPK/2, D_ROPE] = [32, 64] bf16
-            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;    // [B_TOPK/2, D_K] = [32, 576] bf16
+            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv;    // [B_TOPK/2, D_K] = [16, 576] bf16
+            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;    // [B_TOPK/2, D_K] = [16, 576] bf16
             // Q 缓冲区 (每个 CTA 处理 B_H/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;      // [B_H/2, D_V] = [64, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
@@ -210,8 +212,8 @@ struct alignas(128) SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;    // [B_H/2, D_Q] = [64, 576] bf16
     } u;
     
-    // dO 缓冲区: 全程驻留 (每个 CTA 处理 B_H/2 行)
-    array_aligned<bf16, cosize_v<SmemLayoutdO>> dO;                     // [B_H/2, D_V] bf16
+    // sdKV 缓冲区: 全程驻留 (每个 CTA 处理 B_H/2 行)
+    array_aligned<float, cosize_v<SmemLayoutdKV>> sdKV;                     // [B_TOPK, D_K] float32
 
     struct {
         // S 矩阵：softmax值，bf16 [B_H/2, B_TOPK]
