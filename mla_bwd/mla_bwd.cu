@@ -680,23 +680,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 partition_shape_A(tiled_mma_dQ, Shape<Int<B_H>, Int<B_TOPK>>{})
             );
             tDS_dQ.data().get() = tmem_cols::dS;
-            auto tDS_dQ_div = flat_divide(tDS_dQ, Shape<Int<B_H>, Int<B_TOPK/2>>{});
             Tensor tDS_dQ_rope = tiled_mma_dQ_RoPE.get_slice(_0{}).make_fragment_A(
                 partition_shape_A(tiled_mma_dQ_RoPE, Shape<Int<B_H>, Int<B_TOPK>>{})
             );
             tDS_dQ_rope.data().get() = tmem_cols::dS;
-            auto tDS_dQ_rope_div = flat_divide(tDS_dQ_rope, Shape<Int<B_H>, Int<B_TOPK/2>>{});
 
             Tensor sK_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.kv.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
             auto sK_nope_t_div = flat_divide(sK_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
             Tensor sK_rope_t = make_tensor(
                 make_smem_ptr(plan.u.q_kv.kv.data() + cosize_v<SmemLayoutKNoPE>),
-                SmemLayoutKRoPETransposed{}
-            );
-            Tensor sK_peer_nope_t_full = make_tensor(make_smem_ptr(peer_kv_ptr), SmemLayoutKVTilesTransposed<D_V/64>{});
-            auto sK_peer_nope_t_div = flat_divide(sK_peer_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
-            Tensor sK_peer_rope_t = make_tensor(
-                make_smem_ptr(peer_kv_ptr + cosize_v<SmemLayoutKNoPE>),
                 SmemLayoutKRoPETransposed{}
             );
 
@@ -735,16 +727,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::tcgen05_after_thread_sync();
 
                 if (cta_idx == 0) {
-                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
-
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
-
-                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
-                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ_div(_, _, _1{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
-                    ku::utcmma_ts(tiled_mma_dQ_RoPE, tDS_dQ_rope_div(_, _, _0{}), sK_rope_t, tdQ_RoPE, dq_clear);
-                    ku::utcmma_ts(tiled_mma_dQ_RoPE, tDS_dQ_rope_div(_, _, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ, sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
+                    ku::utcmma_ts(tiled_mma_dQ, tDS_dQ, sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
+                    ku::utcmma_ts(tiled_mma_dQ_RoPE, tDS_dQ_rope, sK_rope_t, tdQ_RoPE, dq_clear);
                 }
                 ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();

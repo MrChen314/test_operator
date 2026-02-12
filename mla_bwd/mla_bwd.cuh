@@ -149,11 +149,11 @@ using TiledMMA_dP = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_dQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::MN, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
