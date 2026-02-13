@@ -7,7 +7,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = Path(__file__).parent.absolute()
-flash_mla_dir = this_dir.parent.parent / "FlashMLA"
+flash_mla_dir = this_dir.parent.parent.parent / "FlashMLA"
 
 assert flash_mla_dir.exists(), f"FlashMLA directory not found: {flash_mla_dir}"
 
