@@ -798,7 +798,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
             // dS transposed tensor for MMA A operand: [B_H/2, B_TOPK] -> A matrix
             Tensor sDS_t = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdSTransposed{});
-            auto sDS_t_div = flat_divide(sDS_t, Shape<Int<B_H/2>, Int<B_TOPK/2>>{});
 
             // K tiles for dQ are staged by WG1 into k_calc_dq in three parts.
             Tensor sK_calc_part0 = make_tensor(
@@ -813,12 +812,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 make_smem_ptr(plan.u.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> * 2),
                 SmemLayoutKCalcDQPartRoPE{}
             );
-            transac_bar_t* bar_kv_part0_ready =
-                (cta_idx == 0) ? &plan.bar_kv_part0_ready : kerutils::get_peer_addr(&plan.bar_kv_part0_ready);
-            transac_bar_t* bar_kv_part1_ready =
-                (cta_idx == 0) ? &plan.bar_kv_part1_ready : kerutils::get_peer_addr(&plan.bar_kv_part1_ready);
-            transac_bar_t* bar_kv_part2_ready =
-                (cta_idx == 0) ? &plan.bar_kv_part2_ready : kerutils::get_peer_addr(&plan.bar_kv_part2_ready);
 
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -860,40 +853,29 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::umma_arrive_noelect(plan.bar_dkv_part0_ready);
                 ku::tcgen05_after_thread_sync();
 
-                // dQ: consume WG1-staged K parts in order (k==0 clear, k>0 accumulate).
                 if (cta_idx == 0) {
-                    bar_kv_part0_ready->arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
-                }
-                bar_kv_part0_ready->wait(phase);
-                ku::tcgen05_after_thread_sync();
-                if (cta_idx == 0) {
-                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part0, tdQ_part0, dq_clear);
-                } else {
-                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part0, tdQ_part0, dq_clear);
-                }
+                    // 2x1SM dQ discipline:
+                    // - Only CTA0 consumes kv_part barriers and launches dQ MMA.
+                    // - CTA1 does not wait these barriers directly; it only follows the sync below.
+                    // This matches WG1 tma_gather4_cta_group_2 signaling and avoids split CTA0/CTA1 dQ launches.
+                    // dQ: consume WG1-staged K parts in order (k==0 clear, k>0 accumulate).
+                    plan.bar_kv_part0_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
+                    plan.bar_kv_part0_ready.wait(phase);
+                    ku::tcgen05_after_thread_sync();
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part0, tdQ_part0, dq_clear);
 
-                if (cta_idx == 0) {
-                    bar_kv_part1_ready->arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
-                }
-                bar_kv_part1_ready->wait(phase);
-                ku::tcgen05_after_thread_sync();
-                if (cta_idx == 0) {
-                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part1, tdQ_part1, dq_clear);
-                } else {
-                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part1, tdQ_part1, dq_clear);
-                }
+                    plan.bar_kv_part1_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
+                    plan.bar_kv_part1_ready.wait(phase);
+                    ku::tcgen05_after_thread_sync();
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part1, tdQ_part1, dq_clear);
 
-                if (cta_idx == 0) {
-                    bar_kv_part2_ready->arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
+                    plan.bar_kv_part2_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
+                    plan.bar_kv_part2_ready.wait(phase);
+                    ku::tcgen05_after_thread_sync();
+                    ku::utcmma_ss(tiled_mma_dQ_RoPE_2cta, sDS_t, sK_calc_part2, tdQ_RoPE, dq_clear);
+                    // dQ readiness must be broadcast to both CTAs so WG1 in each CTA can advance.
+                    ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dq_ready, 1|2);
                 }
-                bar_kv_part2_ready->wait(phase);
-                ku::tcgen05_after_thread_sync();
-                if (cta_idx == 0) {
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part2, tdQ_RoPE, dq_clear);
-                } else {
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part2, tdQ_RoPE, dq_clear);
-                }
-                ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();
 
                 // dKV part1: dV[256:512] + dK[256:512]
