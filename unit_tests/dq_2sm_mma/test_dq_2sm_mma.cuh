@@ -28,6 +28,14 @@ static constexpr int B_H = 128;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_THREADS = 128;
 
+using SmemLayoutS = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_INTER_Atom<bf16>{},
+    Shape<Int<B_TOPK>, Int<B_H / 2>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutdS = SmemLayoutS;
+
 using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
     UMMA::Layout_MN_INTER_Atom<bf16>{},
     Shape<Int<B_H / 2>, Int<B_TOPK>>{},

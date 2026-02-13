@@ -49,6 +49,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     __syncthreads();
     cluster_sync();
 
+    Tensor sDS = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdS{});
     Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
 
     constexpr int DS_ROWS_PER_CTA = B_H / 2;
@@ -58,7 +59,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         const int row = linear_idx / DS_COLS;
         const int col = linear_idx % DS_COLS;
         const int global_row = cta_idx * DS_ROWS_PER_CTA + row;
-        sDS_t(row, col) = ds[global_row * DS_COLS + col];
+        // Match mla_bwd flow: producer writes dS with SmemLayoutdS, consumer reads with dSTransposed view.
+        sDS(col, row) = ds[global_row * DS_COLS + col];
     }
     fence_view_async_shared();
     __syncthreads();
@@ -69,7 +71,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf(
             "[DBG][B%d CTA%d WG0] ds smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) gmem(row=%d,0..3)=(%.6f,%.6f,%.6f,%.6f)\n",
             blockIdx.x, cta_idx,
-            (float)sDS_t(0, 0), (float)sDS_t(0, 1), (float)sDS_t(0, 2), (float)sDS_t(0, 3),
+            (float)sDS(0, 0), (float)sDS(1, 0), (float)sDS(2, 0), (float)sDS(3, 0),
             row0,
             (float)ds[row0 * DS_COLS + 0], (float)ds[row0 * DS_COLS + 1],
             (float)ds[row0 * DS_COLS + 2], (float)ds[row0 * DS_COLS + 3]
