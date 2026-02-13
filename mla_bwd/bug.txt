@@ -1,35 +1,101 @@
-root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# python test_mla_bwd.py
-CUDA Device: CF-NG-BZZ2-O
-CUDA Capability: (10, 0)
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+          detected during:
+            instantiation of "auto cute::tile_to_shape(const cute::Layout<Shape, Stride> &, const TrgShape &, const ModeOrder &) [with Shape=cute::tuple<cute::_8, cute::_64>, Stride=cute::tuple<cute::_64, cute::_1>, TrgShape=cute::tuple<cute::C<288>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 552 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout_composed.hpp
+            instantiation of "auto cute::tile_to_shape(const cute::ComposedLayout<A, O, B> &, const Shape &, const ModeOrder &) [with A=cute::Swizzle<3, 4, 3>, O=cute::smem_ptr_flag_bits<16>, B=cute::Layout<cute::tuple<cute::_8, cute::_64>, cute::tuple<cute::_64, cute::_1>>, Shape=cute::tuple<cute::C<288>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 119 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh
 
-============================================================
-Testing mla_bwd kernel (dQ/dKV, sequence length > 1)
-============================================================
-q shape: [4096, 128, 576]
-kv shape: [8192, 576]
-dO shape: [4096, 128, 512]
-lse shape: [4096, 128]
-O shape: [4096, 128, 512]
-indices shape: [4096, 2048]
-dQ shape: [4096, 128, 576]
-dKV shape: [8192, 576]
+/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout.hpp(1792): error: static assertion failed with "tile_to_shape: block shape does not divide the target shape."
+      static_assert(decltype(evenly_divides(target_shape, block_shape))::value, "tile_to_shape: block shape does not divide the target shape.")
+      ^
+          detected during:
+            instantiation of "auto cute::tile_to_shape(const cute::Layout<Shape, Stride> &, const TrgShape &, const ModeOrder &) [with Shape=cute::tuple<cute::_8, cute::_64>, Stride=cute::tuple<cute::_64, cute::_1>, TrgShape=cute::tuple<cute::C<128>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 552 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout_composed.hpp
+            instantiation of "auto cute::tile_to_shape(const cute::ComposedLayout<A, O, B> &, const Shape &, const ModeOrder &) [with A=cute::Swizzle<3, 4, 3>, O=cute::smem_ptr_flag_bits<16>, B=cute::Layout<cute::tuple<cute::_8, cute::_64>, cute::tuple<cute::_64, cute::_1>>, Shape=cute::tuple<cute::C<128>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 125 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh
 
-Random normal:
-  dQ  max_diff=1.600000e+01, rel_diff=3.623962e-05
-  dKV max_diff=6.297230e+02, rel_diff=1.540470e-01
-============================================================
-Precision Validation (dQ/dKV)
-============================================================
-PASS dQ  rel_diff=3.623962e-05, threshold=1.00e-02
-FAIL dKV rel_diff=1.540470e-01, threshold=1.00e-02
-dQ  max_diff=1.600000e+01
-dKV max_diff=6.297230e+02
-============================================================
-CUDA Kernel Benchmark
-============================================================
-cuda_kernel average time: 30.304 ms
-cuda_kernel bwd tflops: 195.018
+/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout.hpp(1792): error: static assertion failed with "tile_to_shape: block shape does not divide the target shape."
+      static_assert(decltype(evenly_divides(target_shape, block_shape))::value, "tile_to_shape: block shape does not divide the target shape.")
+      ^
+          detected during:
+            instantiation of "auto cute::tile_to_shape(const cute::Layout<Shape, Stride> &, const TrgShape &, const ModeOrder &) [with Shape=cute::tuple<cute::_8, cute::_64>, Stride=cute::tuple<cute::_64, cute::_1>, TrgShape=cute::tuple<cute::C<32>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 552 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout_composed.hpp
+            instantiation of "auto cute::tile_to_shape(const cute::ComposedLayout<A, O, B> &, const Shape &, const ModeOrder &) [with A=cute::Swizzle<3, 4, 3>, O=cute::smem_ptr_flag_bits<16>, B=cute::Layout<cute::tuple<cute::_8, cute::_64>, cute::tuple<cute::_64, cute::_1>>, Shape=cute::tuple<cute::C<32>, cute::C<32>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 131 of /home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh
 
-============================================================
-Some tests FAILED!
-============================================================
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(154): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(158): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(169): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(171): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(173): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+3 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/mla_bwd.cu".
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
+    subprocess.run(
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_operator/mla_bwd/setup.py", line 73, in <module>
+    setup(
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
+    return distutils.core.setup(**attrs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
+    return run_commands(dist)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
+    dist.run_commands()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+    self.run_command(cmd)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
+    super().run_command(command)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+    cmd_obj.run()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
+    _build_ext.run(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+    self.build_extensions()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
+    build_ext.build_extensions(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
+    self._build_extensions_serial()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
+    self.build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
+    _build_ext.build_extension(self, ext)
+  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
+    super().build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
+    objects = self.compiler.compile(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
+    _write_ninja_file_and_compile_objects(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
+    _run_ninja_build(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error compiling objects for extension
