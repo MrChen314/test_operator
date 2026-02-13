@@ -14,6 +14,7 @@ namespace test_operator::dq_2sm_mma {
 template <typename Params>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const bf16* __restrict__ ds,
+    const bf16* __restrict__ kv,
     const int32_t* __restrict__ indices,
     float* __restrict__ dQ_out,
     __grid_constant__ const Params params
@@ -27,6 +28,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int cta_idx = blockIdx.x % 2;
     const int tid = threadIdx.x;
     const int warp_idx = tid / 32;
+    const int idx_in_warpgroup = tid % 128;
+    const bool dbg_print = (blockIdx.x < 2) && (idx_in_warpgroup == 0);
+
+    if (dbg_print) {
+        printf(
+            "[DBG][B%d CTA%d WG0] enter idx0..3=(%d,%d,%d,%d)\n",
+            blockIdx.x, cta_idx,
+            indices[0], indices[1], indices[2], indices[3]
+        );
+    }
 
     if (warp_idx == 0 && elect_one_sync()) {
         smem.bar_kv_part0_ready.init(1);
@@ -52,6 +63,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     fence_view_async_shared();
     __syncthreads();
     cluster_sync();
+
+    if (dbg_print) {
+        const int row0 = cta_idx * DS_ROWS_PER_CTA;
+        printf(
+            "[DBG][B%d CTA%d WG0] ds smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) gmem(row=%d,0..3)=(%.6f,%.6f,%.6f,%.6f)\n",
+            blockIdx.x, cta_idx,
+            (float)sDS_t(0, 0), (float)sDS_t(0, 1), (float)sDS_t(0, 2), (float)sDS_t(0, 3),
+            row0,
+            (float)ds[row0 * DS_COLS + 0], (float)ds[row0 * DS_COLS + 1],
+            (float)ds[row0 * DS_COLS + 2], (float)ds[row0 * DS_COLS + 3]
+        );
+    }
 
     if (warp_idx == 0) {
         TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
@@ -153,19 +176,59 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             SmemLayoutKCalcDQPartRoPE{}
         );
 
+        // kv_part0 expects bytes from both CTAs combined via cta_group::2 + USE_CTA0_MBAR:
+        // 2 * (B_TOPK/2 rows) * 128 cols * sizeof(bf16) = B_TOPK * 128 * sizeof(bf16).
         smem.bar_kv_part0_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
         smem.bar_kv_part0_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+        if (dbg_print) {
+            const int kv_idx = indices[0];
+            printf(
+                "[DBG][B%d CTA%d WG0] part0 k_smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx=%d,col0..3)=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(1, 0),
+                (float)sK_calc_part0(2, 0), (float)sK_calc_part0(3, 0),
+                kv_idx,
+                (float)kv[kv_idx * D_K + 0], (float)kv[kv_idx * D_K + 1],
+                (float)kv[kv_idx * D_K + 2], (float)kv[kv_idx * D_K + 3]
+            );
+        }
         ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part0, tdQ_part0, true);
 
+        // kv_part1 has the same footprint as part0 (another 128-column slice).
         smem.bar_kv_part1_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
         smem.bar_kv_part1_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+        if (dbg_print) {
+            const int kv_idx = indices[0];
+            printf(
+                "[DBG][B%d CTA%d WG0] part1 k_smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx=%d,col256..259)=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(1, 0),
+                (float)sK_calc_part1(2, 0), (float)sK_calc_part1(3, 0),
+                kv_idx,
+                (float)kv[kv_idx * D_K + 256], (float)kv[kv_idx * D_K + 257],
+                (float)kv[kv_idx * D_K + 258], (float)kv[kv_idx * D_K + 259]
+            );
+        }
         ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part1, tdQ_part1, true);
 
+        // kv_part2 is the 32-column RoPE slice, again aggregated across both CTAs.
         smem.bar_kv_part2_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
         smem.bar_kv_part2_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+        if (dbg_print) {
+            const int kv_idx = indices[0];
+            printf(
+                "[DBG][B%d CTA%d WG0] part2 k_smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx=%d,col512..515)=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(1, 0),
+                (float)sK_calc_part2(2, 0), (float)sK_calc_part2(3, 0),
+                kv_idx,
+                (float)kv[kv_idx * D_K + 512], (float)kv[kv_idx * D_K + 513],
+                (float)kv[kv_idx * D_K + 514], (float)kv[kv_idx * D_K + 515]
+            );
+        }
         ku::utcmma_ss(tiled_mma_dQ_rope_2cta, sDS_t, sK_calc_part2, tdQ_rope, true);
 
         ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_ready, 1 | 2);
@@ -238,6 +301,26 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     }
 
     __syncthreads();
+    if (dbg_print) {
+        const int row_g = cta_idx * dQ_ROWS_PER_CTA;
+        float ref0 = 0.0f;
+        float ref256 = 0.0f;
+        float ref512 = 0.0f;
+        CUTE_UNROLL
+        for (int k = 0; k < B_TOPK; ++k) {
+            const int kv_idx = indices[k];
+            const float ds_v = (float)ds[row_g * B_TOPK + k];
+            ref0 += ds_v * (float)kv[kv_idx * D_K + 0];
+            ref256 += ds_v * (float)kv[kv_idx * D_K + 256];
+            ref512 += ds_v * (float)kv[kv_idx * D_K + 512];
+        }
+        printf(
+            "[DBG][B%d CTA%d WG0] dQ row%d col0/256/512 out=(%.6f,%.6f,%.6f) ref=(%.6f,%.6f,%.6f)\n",
+            blockIdx.x, cta_idx, row_g,
+            dQ_out[row_g * D_Q + 0], dQ_out[row_g * D_Q + 256], dQ_out[row_g * D_Q + 512],
+            ref0, ref256, ref512
+        );
+    }
     cluster_sync();
 
     if (warp_idx == 0 && elect_one_sync()) {
@@ -245,6 +328,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     }
 #else
     (void)ds;
+    (void)kv;
     (void)indices;
     (void)dQ_out;
     (void)params;
@@ -366,6 +450,7 @@ torch::Tensor run_dq_2sm_mma(
         &config,
         kernel,
         ds_ptr,
+        kv_ptr,
         indices_ptr,
         dq_ptr,
         params

@@ -87,6 +87,7 @@ static constexpr size_t SMEM_SIZE = sizeof(SharedMemory);
 template <typename Params>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const bf16* __restrict__ ds,      // [B_H, B_TOPK] = [128, 64]
+    const bf16* __restrict__ kv,      // [s_kv, D_K]
     const int32_t* __restrict__ indices,  // [B_TOPK] = [64]
     float* __restrict__ dQ_out,       // [B_H, D_Q] = [128, 576]
     __grid_constant__ const Params params
@@ -99,4 +100,3 @@ torch::Tensor run_dq_2sm_mma(
 );
 
 }  // namespace test_operator::dq_2sm_mma
-

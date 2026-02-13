@@ -24,6 +24,30 @@ def run_case(case_name: str, ds: torch.Tensor, kv: torch.Tensor, indices: torch.
 
     max_diff, rel_diff = calc_diff(dq_cuda, dq_ref)
     print(f"[{case_name}] max_diff={max_diff:.6e}, rel_diff={rel_diff:.6e}")
+
+    seg0_max, seg0_rel = calc_diff(dq_cuda[:, :256], dq_ref[:, :256])
+    seg1_max, seg1_rel = calc_diff(dq_cuda[:, 256:512], dq_ref[:, 256:512])
+    seg2_max, seg2_rel = calc_diff(dq_cuda[:, 512:], dq_ref[:, 512:])
+    print(
+        f"[{case_name}] seg0(0:256) max={seg0_max:.6e} rel={seg0_rel:.6e} | "
+        f"seg1(256:512) max={seg1_max:.6e} rel={seg1_rel:.6e} | "
+        f"seg2(512:576) max={seg2_max:.6e} rel={seg2_rel:.6e}"
+    )
+
+    sample_cols = [0, 1, 2, 3, 256, 257, 512, 513]
+    row0_cuda = dq_cuda[0, sample_cols].detach().cpu()
+    row0_ref = dq_ref[0, sample_cols].detach().cpu()
+    row64_cuda = dq_cuda[64, sample_cols].detach().cpu()
+    row64_ref = dq_ref[64, sample_cols].detach().cpu()
+    print(f"[{case_name}] indices[0:8]={indices[:8].detach().cpu().tolist()}")
+    print(f"[{case_name}] row0 cuda={row0_cuda.tolist()}")
+    print(f"[{case_name}] row0 ref ={row0_ref.tolist()}")
+    print(f"[{case_name}] row64 cuda={row64_cuda.tolist()}")
+    print(f"[{case_name}] row64 ref ={row64_ref.tolist()}")
+
+    row_diff = torch.max(torch.abs(dq_cuda - dq_ref), dim=1).values
+    worst_rows = torch.topk(row_diff, k=4).indices.detach().cpu().tolist()
+    print(f"[{case_name}] worst_rows={worst_rows} row_max_diff={[row_diff[i].item() for i in worst_rows]}")
     return rel_diff < 1e-3
 
 
@@ -57,4 +81,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
