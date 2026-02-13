@@ -662,11 +662,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
                         const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
                         sSDKV(row, col) = src[i];
+                    }
+                    fence_view_async_shared();
+                    // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
+                    cluster_sync();
+                    CUTE_UNROLL
+                    for (int i = 0; i < CHUNK_SIZE; ++i) {
+                        const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
                         float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
                         red_add_peer_sdkv(peer_ptr, src[i]);
                     }
                 }
-                fence_view_async_shared();
+                // Ensure peer red.cluster.shared writes are visible before local flush.
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                cluster_sync();
                 flush_sdkv_stage(stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
@@ -691,11 +700,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
                         const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
                         sSDKV(row, col) = src[i];
+                    }
+                    fence_view_async_shared();
+                    // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
+                    cluster_sync();
+                    CUTE_UNROLL
+                    for (int i = 0; i < CHUNK_SIZE; ++i) {
+                        const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
                         float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
                         red_add_peer_sdkv(peer_ptr, src[i]);
                     }
                 }
-                fence_view_async_shared();
+                // Ensure peer red.cluster.shared writes are visible before local flush.
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                cluster_sync();
                 flush_sdkv_stage(256 + stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
@@ -718,11 +736,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 for (int i = 0; i < ROPE_COLS_PER_HALF; ++i) {
                     const int col = half * ROPE_COLS_PER_HALF + i;
                     sSDKV(row, col) = src[i];
+                }
+                fence_view_async_shared();
+                // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
+                cluster_sync();
+                CUTE_UNROLL
+                for (int i = 0; i < ROPE_COLS_PER_HALF; ++i) {
+                    const int col = half * ROPE_COLS_PER_HALF + i;
                     float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
                     red_add_peer_sdkv(peer_ptr, src[i]);
                 }
             }
-            fence_view_async_shared();
+            // Ensure peer red.cluster.shared writes are visible before local flush.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            cluster_sync();
             flush_sdkv_stage(D_V, D_ROPE, kv_idx, row_valid);
             if (cta_idx == 0) {
                 plan.bar_dkv_part2_done.arrive(0u);
