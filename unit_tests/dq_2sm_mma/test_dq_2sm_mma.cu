@@ -278,15 +278,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             float smem_dot0 = 0.0f;
             float smem_dot256 = 0.0f;
             float smem_dot512 = 0.0f;
+            float smem_dot0_alt = 0.0f;
+            float smem_dot256_alt = 0.0f;
+            float smem_dot512_fd32 = 0.0f;
             float gmem_dot0 = 0.0f;
             float gmem_dot256 = 0.0f;
             float gmem_dot512 = 0.0f;
             CUTE_UNROLL
             for (int k = 0; k < B_TOPK; ++k) {
                 const float ds_v = (float)sDS_t(0, k);
+                smem_dot0_alt += ds_v * (float)sK_calc_part0(k, 0);
+                smem_dot256_alt += ds_v * (float)sK_calc_part1(k, 0);
                 smem_dot0 += ds_v * (float)sK_calc_part0(0, k);
                 smem_dot256 += ds_v * (float)sK_calc_part1(0, k);
                 smem_dot512 += ds_v * (float)sK_calc_part2(0, k);
+                if (k < 32) {
+                    smem_dot512_fd32 += ds_v * (float)sK_calc_part2(k, 0);
+                }
 
                 const int kv_idx = indices[k];
                 const float ds_ref = (float)ds[k];
@@ -295,8 +303,29 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 gmem_dot512 += ds_ref * (float)kv[kv_idx * D_K + 512];
             }
             printf(
-                "[DBG][B%d CTA%d WG0] dot_pre row0 col0/256/512 smem=(%.6f,%.6f,%.6f) gmem=(%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx, smem_dot0, smem_dot256, smem_dot512, gmem_dot0, gmem_dot256, gmem_dot512
+                "[DBG][B%d CTA%d WG0] dot_pre row0 col0/256/512 smem_sd=(%.6f,%.6f,%.6f) "
+                "smem_fd=(%.6f,%.6f,%.6f[32]) gmem=(%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                smem_dot0, smem_dot256, smem_dot512,
+                smem_dot0_alt, smem_dot256_alt, smem_dot512_fd32,
+                gmem_dot0, gmem_dot256, gmem_dot512
+            );
+
+            const int idx31 = indices[31];
+            const int idx32 = indices[32];
+            const int idx63 = indices[63];
+            printf(
+                "[DBG][B%d CTA%d WG0] k_boundary part0 smem(31,0)=%.6f smem(32,0)=%.6f smem(63,0)=%.6f "
+                "kv(idx31/32/63,col0)=(%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part0(31, 0), (float)sK_calc_part0(32, 0), (float)sK_calc_part0(63, 0),
+                (float)kv[idx31 * D_K + 0], (float)kv[idx32 * D_K + 0], (float)kv[idx63 * D_K + 0]
+            );
+            printf(
+                "[DBG][B%d CTA%d WG0] ds_t boundary row0 k31/32/63=(%.6f,%.6f,%.6f) gmem ds row0 k31/32/63=(%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sDS_t(0, 31), (float)sDS_t(0, 32), (float)sDS_t(0, 63),
+                (float)ds[31], (float)ds[32], (float)ds[63]
             );
         }
         ku::utcmma_ss(tiled_mma_dQ_rope_2cta, sDS_t, sK_calc_part2, tdQ_rope, true);

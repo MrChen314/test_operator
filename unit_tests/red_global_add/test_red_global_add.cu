@@ -14,6 +14,13 @@ using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 using cutlass::arch::fence_barrier_init;
 using cutlass::arch::fence_view_async_shared;
 
+struct WG2BarrierStorage {
+    transac_bar_t bar_sdkv_peer_load_ready;
+    transac_bar_t bar_sdkv_peer_red_done;
+};
+
+constexpr size_t WG2_SMEM_BYTES = ADD_ROWS * GLOBAL_COLS * sizeof(float);
+
 __device__ __forceinline__ float4 load_float4(const float* src) {
     return float4{src[0], src[1], src[2], src[3]};
 }
@@ -102,10 +109,11 @@ __global__ void accumulate_wg2_cluster_kernel(
         return;
     }
 
-    // Minimal WG2-style staging buffer in SMEM: [64, 256].
     extern __shared__ float s_sdkv[];
-    __shared__ transac_bar_t bar_sdkv_peer_load_ready;
-    __shared__ transac_bar_t bar_sdkv_peer_red_done;
+    __shared__ __align__(16) uint8_t wg2_barrier_storage[sizeof(WG2BarrierStorage)];
+    WG2BarrierStorage& wg2_barriers = *reinterpret_cast<WG2BarrierStorage*>(wg2_barrier_storage);
+    transac_bar_t& bar_sdkv_peer_load_ready = wg2_barriers.bar_sdkv_peer_load_ready;
+    transac_bar_t& bar_sdkv_peer_red_done = wg2_barriers.bar_sdkv_peer_red_done;
 
     const float* src = (cta_idx == 0) ? add1 : add2;
     constexpr int HALF_COLS = GLOBAL_COLS / 2;
@@ -253,11 +261,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_red_global_add(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "accumulate_fused_kernel failed: ", cudaGetErrorString(err));
 
-    constexpr int WG2_SMEM_BYTES = ADD_ROWS * GLOBAL_COLS * static_cast<int>(sizeof(float));
     cudaError_t attr_err = cudaFuncSetAttribute(
         (const void*)accumulate_wg2_cluster_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        WG2_SMEM_BYTES
+        static_cast<int>(WG2_SMEM_BYTES)
     );
     TORCH_CHECK(attr_err == cudaSuccess,
                 "accumulate_wg2_cluster_kernel cudaFuncSetAttribute failed: ",
