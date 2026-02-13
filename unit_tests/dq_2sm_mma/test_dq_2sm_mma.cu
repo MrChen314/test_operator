@@ -47,7 +47,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         const int row = linear_idx / DS_COLS;
         const int col = linear_idx % DS_COLS;
         const int global_row = cta_idx * DS_ROWS_PER_CTA + row;
-        sDS_t(row, col) = __ldg(ds + global_row * DS_COLS + col);
+        sDS_t(row, col) = ds[global_row * DS_COLS + col];
     }
     fence_view_async_shared();
     __syncthreads();
@@ -384,4 +384,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Unit test kernel for dQ path with TMA kv_part staging and 2SM MMA"
     );
 }
-

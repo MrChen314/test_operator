@@ -1,0 +1,101 @@
+root@tjzj-inf-sci-k8s-bzz2-0203:/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+  static __attribute__((device)) __inline__ unsigned short __ldg(const unsigned short *ptr) { unsigned short ret; asm volatile ("ld.global.nc.u16 %0, [%1];" : "=h"(ret) : "l" (ptr)); return ret; }
+                                                           ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(122): note #3326-D: function "__ldg(const unsigned char *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ unsigned char __ldg(const unsigned char *ptr) { unsigned int ret; asm volatile ("ld.global.nc.u8 %0, [%1];" : "=r"(ret) : "l" (ptr)); return (unsigned char)ret; }
+                                                          ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(120): note #3326-D: function "__ldg(const longlong2 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ longlong2 __ldg(const longlong2 *ptr) { longlong2 ret; asm volatile ("ld.global.nc.v2.s64 {%0,%1}, [%2];" : "=l"(ret.x), "=l"(ret.y) : "l" (ptr)); return ret; }
+                                                      ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(119): note #3326-D: function "__ldg(const int4 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ int4 __ldg(const int4 *ptr) { int4 ret; asm volatile ("ld.global.nc.v4.s32 {%0,%1,%2,%3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l" (ptr)); return ret; }
+                                                 ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(118): note #3326-D: function "__ldg(const int2 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ int2 __ldg(const int2 *ptr) { int2 ret; asm volatile ("ld.global.nc.v2.s32 {%0,%1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l" (ptr)); return ret; }
+                                                 ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(117): note #3326-D: function "__ldg(const short4 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ short4 __ldg(const short4 *ptr) { short4 ret; asm volatile ("ld.global.nc.v4.s16 {%0,%1,%2,%3}, [%4];" : "=h"(ret.x), "=h"(ret.y), "=h"(ret.z), "=h"(ret.w) : "l" (ptr)); return ret; }
+                                                   ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(116): note #3326-D: function "__ldg(const short2 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ short2 __ldg(const short2 *ptr) { short2 ret; asm volatile ("ld.global.nc.v2.s16 {%0,%1}, [%2];" : "=h"(ret.x), "=h"(ret.y) : "l" (ptr)); return ret; }
+                                                   ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(115): note #3326-D: function "__ldg(const char4 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ char4 __ldg(const char4 *ptr) { char4 ret; int4 tmp; asm volatile ("ld.global.nc.v4.s8 {%0,%1,%2,%3}, [%4];" : "=r"(tmp.x), "=r"(tmp.y), "=r"(tmp.z), "=r"(tmp.w) : "l" (ptr)); ret.x = (char)tmp.x; ret.y = (char)tmp.y; ret.z = (char)tmp.z; ret.w = (char)tmp.w; return ret; }
+                                                  ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(114): note #3326-D: function "__ldg(const char2 *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ char2 __ldg(const char2 *ptr) { char2 ret; int2 tmp; asm volatile ("ld.global.nc.v2.s8 {%0,%1}, [%2];" : "=r"(tmp.x), "=r"(tmp.y) : "l" (ptr)); ret.x = (char)tmp.x; ret.y = (char)tmp.y; return ret; }
+                                                  ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(113): note #3326-D: function "__ldg(const long long *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ long long __ldg(const long long *ptr) { unsigned long long ret; asm volatile ("ld.global.nc.s64 %0, [%1];" : "=l"(ret) : "l" (ptr)); return (long long)ret; }
+                                                      ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(112): note #3326-D: function "__ldg(const int *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ int __ldg(const int *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s32 %0, [%1];" : "=r"(ret) : "l" (ptr)); return (int)ret; }
+                                                ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(111): note #3326-D: function "__ldg(const short *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ short __ldg(const short *ptr) { unsigned short ret; asm volatile ("ld.global.nc.s16 %0, [%1];" : "=h"(ret) : "l" (ptr)); return (short)ret; }
+                                                  ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(110): note #3326-D: function "__ldg(const signed char *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ signed char __ldg(const signed char *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s8 %0, [%1];" : "=r"(ret) : "l" (ptr)); return (signed char)ret; }
+                                                        ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(109): note #3326-D: function "__ldg(const char *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ char __ldg(const char *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s8 %0, [%1];" : "=r"(ret) : "l" (ptr)); return (char)ret; }
+                                                 ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(102): note #3326-D: function "__ldg(const unsigned long *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ unsigned long __ldg(const unsigned long *ptr) { unsigned long ret; asm volatile ("ld.global.nc.u64 %0, [%1];" : "=l"(ret) : "l" (ptr)); return ret; }
+                                                          ^
+/usr/local/cuda/include/sm_32_intrinsics.hpp(101): note #3326-D: function "__ldg(const long *)" does not match because argument #1 does not match parameter
+  static __attribute__((device)) __inline__ long __ldg(const long *ptr) { unsigned long ret; asm volatile ("ld.global.nc.s64 %0, [%1];" : "=l"(ret) : "l" (ptr)); return (long)ret; }
+                                                 ^
+
+1 error detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu".
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
+    subprocess.run(
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/setup.py", line 57, in <module>
+    setup(
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
+    return distutils.core.setup(**attrs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
+    return run_commands(dist)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
+    dist.run_commands()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+    self.run_command(cmd)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
+    super().run_command(command)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+    cmd_obj.run()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
+    _build_ext.run(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+    self.build_extensions()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
+    build_ext.build_extensions(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
+    self._build_extensions_serial()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
+    self.build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
+    _build_ext.build_extension(self, ext)
+  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
+    super().build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
+    objects = self.compiler.compile(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
+    _write_ninja_file_and_compile_objects(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
+    _run_ninja_build(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error compiling objects for extension
