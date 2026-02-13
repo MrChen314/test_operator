@@ -279,6 +279,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dkv_part0_done;           // WG2通知WG3 dKV_part0传输完成
     transac_bar_t bar_dkv_part1_done;           // WG2通知WG3 dKV_part1传输完成
     transac_bar_t bar_dkv_part2_done;           // WG2通知WG3 dKV_part2传输完成
+    transac_bar_t bar_sdkv_peer_load_ready;     // WG2<->WG2: 对端TMEM->SMEM写入完成
+    transac_bar_t bar_sdkv_peer_red_done;       // WG2<->WG2: 对端peer red完成
     // WG1-WG3 同步屏障 (dQ K tiles)
     transac_bar_t bar_kv_part0_ready;           // WG1通知WG3 kv_part0 (cols 0-255) 准备完成
     transac_bar_t bar_kv_part1_ready;           // WG1通知WG3 kv_part1 (cols 256-511) 准备完成

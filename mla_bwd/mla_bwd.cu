@@ -187,6 +187,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_dkv_part0_done.init(128);
         plan.bar_dkv_part1_done.init(128);
         plan.bar_dkv_part2_done.init(128);
+        plan.bar_sdkv_peer_load_ready.init(128);
+        plan.bar_sdkv_peer_red_done.init(128);
         // WG1-WG3 barriers for dQ K tiles
         plan.bar_kv_part0_ready.init(1);
         plan.bar_kv_part1_ready.init(1);
@@ -610,6 +612,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         static_assert((D_ROPE / 2) % 4 == 0, "D_ROPE/2 must be 16B aligned in float units.");
 
         Tensor sSDKV = make_tensor(make_smem_ptr(plan.u.q_kv.sdkv.data()), SmemLayoutsdKV{});
+        const uint32_t peer_cta_idx = static_cast<uint32_t>(cta_idx ^ 1);
+        int peer_load_phase = 0;
+        int peer_red_phase = 0;
+
+        auto sync_peer_load_ready = [&]() {
+            plan.bar_sdkv_peer_load_ready.arrive(peer_cta_idx);
+            plan.bar_sdkv_peer_load_ready.wait(peer_load_phase);
+            peer_load_phase ^= 1;
+        };
+
+        auto sync_peer_red_done = [&]() {
+            plan.bar_sdkv_peer_red_done.arrive(peer_cta_idx);
+            plan.bar_sdkv_peer_red_done.wait(peer_red_phase);
+            peer_red_phase ^= 1;
+        };
 
         auto flush_sdkv_stage = [&](int global_col_base, int stage_cols, int kv_idx, bool row_valid) {
             if (!row_valid) {
@@ -665,7 +682,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     }
                     fence_view_async_shared();
                     // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
-                    cluster_sync();
+                    sync_peer_load_ready();
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
                         const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
@@ -674,8 +691,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     }
                 }
                 // Ensure peer red.cluster.shared writes are visible before local flush.
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                cluster_sync();
+                fence_view_async_shared();
+                sync_peer_red_done();
                 flush_sdkv_stage(stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
@@ -703,7 +720,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     }
                     fence_view_async_shared();
                     // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
-                    cluster_sync();
+                    sync_peer_load_ready();
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
                         const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
@@ -712,8 +729,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     }
                 }
                 // Ensure peer red.cluster.shared writes are visible before local flush.
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                cluster_sync();
+                fence_view_async_shared();
+                sync_peer_red_done();
                 flush_sdkv_stage(256 + stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
@@ -739,7 +756,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 }
                 fence_view_async_shared();
                 // Ensure peer CTA has completed TMEM->SMEM staging before cross-CTA reduction.
-                cluster_sync();
+                sync_peer_load_ready();
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; ++i) {
                     const int col = half * ROPE_COLS_PER_HALF + i;
@@ -748,8 +765,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 }
             }
             // Ensure peer red.cluster.shared writes are visible before local flush.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            cluster_sync();
+            fence_view_async_shared();
+            sync_peer_red_done();
             flush_sdkv_stage(D_V, D_ROPE, kv_idx, row_valid);
             if (cta_idx == 0) {
                 plan.bar_dkv_part2_done.arrive(0u);
