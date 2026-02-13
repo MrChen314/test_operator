@@ -114,20 +114,20 @@ using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
 using SmemLayoutKVTilesTransposed_KMajor = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<288>, Int<B_TOPK/2>>{},
-    Step<_2, _1>{}
+    Shape<Int<288>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutKCalcDQPartNoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<128>, Int<B_TOPK/2>>{},
-    Step<_2, _1>{}
+    Shape<Int<128>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutKCalcDQPartRoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<D_ROPE/2>, Int<B_TOPK/2>>{},
-    Step<_2, _1>{}
+    Shape<Int<D_ROPE/2>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutsdKV = Layout<
@@ -178,11 +178,11 @@ using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_dQ_2cta = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H/2, 256, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 using TiledMMA_dQ_RoPE_2cta = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
@@ -238,7 +238,7 @@ struct alignas(128) SharedMemoryPlan {
             array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
         } q_kv;
 
-        array_aligned<bf16, cosize_v<SmemLayoutKVTilesTransposed_KMajor>> k_calc_dq;    // [B_TOPK, D_K/2] = [64, 288] bf16
+        array_aligned<bf16, cosize_v<SmemLayoutKVTilesTransposed_KMajor>> k_calc_dq;    // [288, B_TOPK] = [288, 64] bf16
 
         // dQ 输出阶段 (与 KV 空间复用；注意不能与Q复用，会影响dKV精度)
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;    // [B_H/2, D_Q] = [64, 576] bf16

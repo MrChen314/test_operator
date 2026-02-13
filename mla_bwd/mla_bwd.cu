@@ -789,11 +789,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             // Allocate TMEM tensors for dQ (2CTA kernels)
             TiledMMA_dQ_2cta tiled_mma_dQ_2cta{};
             TiledMMA_dQ_RoPE_2cta tiled_mma_dQ_RoPE_2cta{};
-            Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H/2>, Int<256>>{});
+            Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H>, Int<256>>{});
             tdQ_part0.data().get() = tmem_cols::dQ;
-            Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H/2>, Int<256>>{});
+            Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H>, Int<256>>{});
             tdQ_part1.data().get() = tmem_cols::dQ + 128;
-            Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE_2cta, Shape<Int<B_H/2>, Int<D_ROPE>>{});
+            Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE_2cta, Shape<Int<B_H>, Int<D_ROPE>>{});
             tdQ_RoPE.data().get() = tmem_cols::dQ_RoPE;
 
             // dS transposed tensor for MMA A operand: [B_H/2, B_TOPK] -> A matrix
