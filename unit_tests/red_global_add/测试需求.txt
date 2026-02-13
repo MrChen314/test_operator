@@ -1,0 +1,13 @@
+对atomic_add_float4进行最小单测，按照WG2使用atomic_add_float4的方式
+
+要求：
+1.py共生成3种tensor
+    1.1 global_tensor，shape是[128,256]，copy成3份：global_tensor1\2\3
+    1.2 两个随机累加值tensor：add1和add2，shape是[64,256]
+    1.3 indices，shape是[64]，值从0-127，用于累计值到global_tensor的映射
+
+2.对比精度时，一共对比3个值
+    2.1 torch_ref的累加值: global_tensor1+add1+add2
+    2.2 cta0读取add1，cta1读取add2，根据indices累加到global_tensor2
+    2.3 cta0读取add1和add2，先将add1和add2累加成add3，然后再累加到global_tensor3
+    注意上面的+是形式，需要通过indices映射累加

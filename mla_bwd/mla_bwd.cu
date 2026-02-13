@@ -32,6 +32,16 @@ void atomic_addx4_tilelang(float* ref, const float4& add_val) {
     atomicAdd(ref + 3, add_val.w);
 }
 
+CUTE_DEVICE
+void atomic_add_float4(float* dst_ptr, const float4& v) {
+    asm volatile(
+        "red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :
+        : "l"(dst_ptr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+        : "memory"
+    );
+}
+
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -589,7 +599,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; i += 4) {
                         float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_addx4_tilelang(dst + i, v);
+                        // atomic_addx4_tilelang(dst + i, v);
+                        atomic_add_float4(dst + i, v);
                     }
                 }
             }
