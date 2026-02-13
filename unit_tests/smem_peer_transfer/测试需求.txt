@@ -1,0 +1,12 @@
+参考路径：
+mla_bwd.cu：/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cu
+mla_bwd.cuh：/Users/chenql/Desktop/workspace/operator/test_operator/mla_bwd/mla_bwd.cuh
+
+1.py生成两个tensor矩阵，A矩阵shape：[128,32]，B矩阵shape：[256,32]
+2.torch_ref结果：C = A @ B.T
+3.cuda_kernel计算流程
+    3.1 cta0持有A[64,32]，B[256,16]前一半，参考mla_bwd.cu中WG0将ds写入smem的方式写入A到smem，参考mla_bwd.cuh中SmemLayoutKNoPETransposed的布局写入B到smem
+    3.1 cta1持有A[64,32]，B[256,16]后一半，同样按3.1的方式写入smem
+    3.3 cta0读取cta1（peer）的B_smem数据[128, 16]（前一半）加载到自己的cta0_rmem(寄存器内存)
+    3.4 cta1读取cta0（peer）的B_smem数据[128, 16]（后一半）加载到自己的cta1_rmem(寄存器内存)
+    3.5 两个cta都加载好后，cta0_rmem加载到

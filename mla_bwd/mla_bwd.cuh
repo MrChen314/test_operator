@@ -111,6 +111,12 @@ using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
 using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
 using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
+using SmemLayoutKVTilesTransposed_KMajor = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<288>, Int<B_TOPK/2>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
 // 2CTA 模式下 S 矩阵形状为 [B_H/2, B_TOPK]
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_INTER_Atom<bf16>{},
@@ -151,6 +157,14 @@ using TiledMMA_dQ = decltype(make_tiled_mma(
 
 using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
+));
+
+using TiledMMA_dQ_2cta = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H/2, 256, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+using TiledMMA_dQ_RoPE_2cta = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H/2, D_ROPE, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 using TiledMMA_dKV = decltype(make_tiled_mma(
@@ -200,12 +214,14 @@ struct alignas(128) SharedMemoryPlan {
             // KV 缓冲区 (每个 CTA 加载 B_TOPK/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;    // [B_TOPK/2, D_V] = [32, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;    // [B_TOPK/2, D_ROPE] = [32, 64] bf16
-            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;    // [B_TOPK/2, D_K] = [32, 576] bf16
+            array_aligned<float, cosize_v<SmemLayoutsdKV>> sdkv;    // [B_TOPK, D_K/4] = [32, 144] fp32
             // Q 缓冲区 (每个 CTA 处理 B_H/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;      // [B_H/2, D_V] = [64, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
         } q_kv;
-        
+
+        array_aligned<bf16, cosize_v<SmemLayoutKVTilesTransposed_KMajor>> k_calc_dq;    // [B_TOPK, D_K/2] = [64, 288] bf16
+
         // dQ 输出阶段 (与 KV 空间复用；注意不能与Q复用，会影响dKV精度)
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;    // [B_H/2, D_Q] = [64, 576] bf16
     } u;
