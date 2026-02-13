@@ -189,8 +189,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             printf(
                 "[DBG][B%d CTA%d WG0] part0 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col0)=(%.6f,%.6f,%.6f,%.6f)\n",
                 blockIdx.x, cta_idx,
-                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(1, 0),
-                (float)sK_calc_part0(2, 0), (float)sK_calc_part0(3, 0),
+                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(0, 1),
+                (float)sK_calc_part0(0, 2), (float)sK_calc_part0(0, 3),
                 (float)kv[idx0 * D_K + 0], (float)kv[idx1 * D_K + 0],
                 (float)kv[idx2 * D_K + 0], (float)kv[idx3 * D_K + 0]
             );
@@ -209,8 +209,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             printf(
                 "[DBG][B%d CTA%d WG0] part1 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col256)=(%.6f,%.6f,%.6f,%.6f)\n",
                 blockIdx.x, cta_idx,
-                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(1, 0),
-                (float)sK_calc_part1(2, 0), (float)sK_calc_part1(3, 0),
+                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(0, 1),
+                (float)sK_calc_part1(0, 2), (float)sK_calc_part1(0, 3),
                 (float)kv[idx0 * D_K + 256], (float)kv[idx1 * D_K + 256],
                 (float)kv[idx2 * D_K + 256], (float)kv[idx3 * D_K + 256]
             );
@@ -229,8 +229,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             printf(
                 "[DBG][B%d CTA%d WG0] part2 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col512)=(%.6f,%.6f,%.6f,%.6f)\n",
                 blockIdx.x, cta_idx,
-                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(1, 0),
-                (float)sK_calc_part2(2, 0), (float)sK_calc_part2(3, 0),
+                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(0, 1),
+                (float)sK_calc_part2(0, 2), (float)sK_calc_part2(0, 3),
                 (float)kv[idx0 * D_K + 512], (float)kv[idx1 * D_K + 512],
                 (float)kv[idx2 * D_K + 512], (float)kv[idx3 * D_K + 512]
             );
@@ -246,9 +246,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             CUTE_UNROLL
             for (int k = 0; k < B_TOPK; ++k) {
                 const float ds_v = (float)sDS_t(0, k);
-                smem_dot0 += ds_v * (float)sK_calc_part0(k, 0);
-                smem_dot256 += ds_v * (float)sK_calc_part1(k, 0);
-                smem_dot512 += ds_v * (float)sK_calc_part2(k, 0);
+                smem_dot0 += ds_v * (float)sK_calc_part0(0, k);
+                smem_dot256 += ds_v * (float)sK_calc_part1(0, k);
+                smem_dot512 += ds_v * (float)sK_calc_part2(0, k);
 
                 const int kv_idx = indices[k];
                 const float ds_ref = (float)ds[k];
