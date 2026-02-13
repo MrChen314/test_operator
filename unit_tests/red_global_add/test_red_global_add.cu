@@ -2,11 +2,17 @@
 
 #include <c10/cuda/CUDAStream.h>
 #include <cooperative_groups.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cuda_host_adapter.hpp>
 #include <cstring>
 
 namespace test_operator::red_global_add {
 
 namespace cg = cooperative_groups;
+using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
+using cutlass::arch::fence_barrier_init;
+using cutlass::arch::fence_view_async_shared;
 
 __device__ __forceinline__ float4 load_float4(const float* src) {
     return float4{src[0], src[1], src[2], src[3]};
@@ -98,32 +104,70 @@ __global__ void accumulate_wg2_cluster_kernel(
 
     // Minimal WG2-style staging buffer in SMEM: [64, 256].
     extern __shared__ float s_sdkv[];
+    __shared__ transac_bar_t bar_sdkv_peer_load_ready;
+    __shared__ transac_bar_t bar_sdkv_peer_red_done;
 
     const float* src = (cta_idx == 0) ? add1 : add2;
-    constexpr int NUM_SCALAR = ADD_ROWS * GLOBAL_COLS;
     constexpr int HALF_COLS = GLOBAL_COLS / 2;
+    constexpr int COLS_PER_STAGE = 128;
+    constexpr int COLS_PER_HALF_STAGE = COLS_PER_STAGE / 2;
+    constexpr int CHUNK_SIZE = 32;
     constexpr int VEC_PER_ROW_HALF = HALF_COLS / VEC_WIDTH;
     constexpr int NUM_VEC_HALF = ADD_ROWS * VEC_PER_ROW_HALF;
+    static_assert(WG2_THREADS == ADD_ROWS * 2, "WG2 launch expects one row x two-half lane mapping.");
 
-    // Stage 1: emulate TMEM -> SMEM path by staging source values into SMEM.
-    for (int linear = threadIdx.x; linear < NUM_SCALAR; linear += blockDim.x) {
-        const float tmem_val = src[linear];
-        s_sdkv[linear] = tmem_val;
+    const int row = threadIdx.x % ADD_ROWS;
+    const int half = threadIdx.x / ADD_ROWS;
+    const uint32_t peer_cta_idx = static_cast<uint32_t>(cta_idx ^ 1);
+    int peer_load_phase = 0;
+    int peer_red_phase = 0;
+
+    if (threadIdx.x == 0) {
+        bar_sdkv_peer_load_ready.init(WG2_THREADS);
+        bar_sdkv_peer_red_done.init(WG2_THREADS);
+        fence_barrier_init();
     }
 
-    __syncthreads();
-    cluster.sync();
+    auto sync_peer_load_ready = [&]() {
+        bar_sdkv_peer_load_ready.arrive(peer_cta_idx);
+        bar_sdkv_peer_load_ready.wait(peer_load_phase);
+        peer_load_phase ^= 1;
+    };
 
-    // Stage 2: WG2 peer reduce-add in SMEM via red.cluster.shared.
-    for (int linear = threadIdx.x; linear < NUM_SCALAR; linear += blockDim.x) {
-        const float v = s_sdkv[linear];
-        float* peer_ptr = cluster.map_shared_rank(s_sdkv + linear, cta_idx ^ 1);
-        red_add_peer_smem(peer_ptr, v);
+    auto sync_peer_red_done = [&]() {
+        bar_sdkv_peer_red_done.arrive(peer_cta_idx);
+        bar_sdkv_peer_red_done.wait(peer_red_phase);
+        peer_red_phase ^= 1;
+    };
+
+    // Stage 1/2: emulate WG2 TMEM->SMEM staging and peer red without full CTA/cluster barriers.
+    for (int stage = 0; stage < (GLOBAL_COLS / COLS_PER_STAGE); ++stage) {
+        for (int chunk = 0; chunk < (COLS_PER_HALF_STAGE / CHUNK_SIZE); ++chunk) {
+            alignas(16) float src_chunk[CHUNK_SIZE];
+            const int col_base = stage * COLS_PER_STAGE + half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE;
+
+#pragma unroll
+            for (int i = 0; i < CHUNK_SIZE; ++i) {
+                const int col = col_base + i;
+                const float v = src[row * GLOBAL_COLS + col];
+                src_chunk[i] = v;
+                s_sdkv[row * GLOBAL_COLS + col] = v;
+            }
+
+            fence_view_async_shared();
+            sync_peer_load_ready();
+
+#pragma unroll
+            for (int i = 0; i < CHUNK_SIZE; ++i) {
+                const int col = col_base + i;
+                float* peer_ptr = cluster.map_shared_rank(s_sdkv + row * GLOBAL_COLS + col, cta_idx ^ 1);
+                red_add_peer_smem(peer_ptr, src_chunk[i]);
+            }
+        }
+
+        fence_view_async_shared();
+        sync_peer_red_done();
     }
-
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    __syncthreads();
-    cluster.sync();
 
     // Stage 3: each CTA flushes half columns to global with red.global.add.v4.f32.
     const int half_col_start = (cta_idx == 0) ? 0 : HALF_COLS;
