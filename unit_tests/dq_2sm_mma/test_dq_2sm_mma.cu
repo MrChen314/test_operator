@@ -194,6 +194,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 (float)kv[idx0 * D_K + 0], (float)kv[idx1 * D_K + 0],
                 (float)kv[idx2 * D_K + 0], (float)kv[idx3 * D_K + 0]
             );
+            printf(
+                "[DBG][B%d CTA%d WG0] part0 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(0, 1), (float)sK_calc_part0(0, 2), (float)sK_calc_part0(0, 3),
+                (float)sK_calc_part0(1, 0), (float)sK_calc_part0(1, 1), (float)sK_calc_part0(1, 2), (float)sK_calc_part0(1, 3)
+            );
+            printf(
+                "[DBG][B%d CTA%d WG0] part0 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 1], (float)kv[idx0 * D_K + 2], (float)kv[idx0 * D_K + 3],
+                (float)kv[idx1 * D_K + 0], (float)kv[idx1 * D_K + 1], (float)kv[idx1 * D_K + 2], (float)kv[idx1 * D_K + 3]
+            );
         }
         ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part0, tdQ_part0, true);
 
@@ -214,6 +226,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 (float)kv[idx0 * D_K + 256], (float)kv[idx1 * D_K + 256],
                 (float)kv[idx2 * D_K + 256], (float)kv[idx3 * D_K + 256]
             );
+            printf(
+                "[DBG][B%d CTA%d WG0] part1 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(0, 1), (float)sK_calc_part1(0, 2), (float)sK_calc_part1(0, 3),
+                (float)sK_calc_part1(1, 0), (float)sK_calc_part1(1, 1), (float)sK_calc_part1(1, 2), (float)sK_calc_part1(1, 3)
+            );
+            printf(
+                "[DBG][B%d CTA%d WG0] part1 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)kv[idx0 * D_K + 256], (float)kv[idx0 * D_K + 257], (float)kv[idx0 * D_K + 258], (float)kv[idx0 * D_K + 259],
+                (float)kv[idx1 * D_K + 256], (float)kv[idx1 * D_K + 257], (float)kv[idx1 * D_K + 258], (float)kv[idx1 * D_K + 259]
+            );
         }
         ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part1, tdQ_part1, true);
 
@@ -233,6 +257,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 (float)sK_calc_part2(0, 2), (float)sK_calc_part2(0, 3),
                 (float)kv[idx0 * D_K + 512], (float)kv[idx1 * D_K + 512],
                 (float)kv[idx2 * D_K + 512], (float)kv[idx3 * D_K + 512]
+            );
+            printf(
+                "[DBG][B%d CTA%d WG0] part2 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(0, 1), (float)sK_calc_part2(0, 2), (float)sK_calc_part2(0, 3),
+                (float)sK_calc_part2(1, 0), (float)sK_calc_part2(1, 1), (float)sK_calc_part2(1, 2), (float)sK_calc_part2(1, 3)
+            );
+            printf(
+                "[DBG][B%d CTA%d WG0] part2 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)kv[idx0 * D_K + 512], (float)kv[idx0 * D_K + 513], (float)kv[idx0 * D_K + 514], (float)kv[idx0 * D_K + 515],
+                (float)kv[idx1 * D_K + 512], (float)kv[idx1 * D_K + 513], (float)kv[idx1 * D_K + 514], (float)kv[idx1 * D_K + 515]
             );
         }
 
