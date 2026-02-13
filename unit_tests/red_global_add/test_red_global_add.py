@@ -28,6 +28,7 @@ def main() -> int:
     global_tensor1 = global_tensor.clone()
     global_tensor2 = global_tensor.clone()
     global_tensor3 = global_tensor.clone()
+    global_tensor4 = global_tensor.clone()
 
     add1 = torch.randn(*ADD_SHAPE, device="cuda", dtype=torch.float32)
     add2 = torch.randn(*ADD_SHAPE, device="cuda", dtype=torch.float32)
@@ -37,16 +38,23 @@ def main() -> int:
     torch_ref.index_add_(0, indices.to(torch.int64), add1)
     torch_ref.index_add_(0, indices.to(torch.int64), add2)
 
-    out2, out3 = red_global_add_cuda.run_red_global_add(global_tensor2, global_tensor3, add1, add2, indices)
+    out2, out3, out4 = red_global_add_cuda.run_red_global_add(
+        global_tensor2, global_tensor3, global_tensor4, add1, add2, indices
+    )
     torch.cuda.synchronize()
 
     print("\n[compare against torch_ref]")
     max_diff2, rel_diff2 = calc_diff(out2, torch_ref)
     max_diff3, rel_diff3 = calc_diff(out3, torch_ref)
+    max_diff4, rel_diff4 = calc_diff(out4, torch_ref)
     print(f"global_tensor2 (cta0:add1, cta1:add2): max_diff={max_diff2:.6e}, rel_diff={rel_diff2:.6e}")
     print(f"global_tensor3 (cta0:add1+add2): max_diff={max_diff3:.6e}, rel_diff={rel_diff3:.6e}")
+    print(
+        "global_tensor4 (WG2 style: smem red reduce + half flush): "
+        f"max_diff={max_diff4:.6e}, rel_diff={rel_diff4:.6e}"
+    )
 
-    ok = (rel_diff2 < 1e-3) and (rel_diff3 < 1e-3)
+    ok = (rel_diff2 < 1e-3) and (rel_diff3 < 1e-3) and (rel_diff4 < 1e-3)
     print("\nFinal:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
