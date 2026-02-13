@@ -30,6 +30,17 @@ void atomic_add_float4(float* dst_ptr, const float4& v) {
     );
 }
 
+CUTE_DEVICE
+void red_add_peer_sdkv(float* peer_smem_ptr, float v) {
+    uint32_t peer_addr = cute::cast_smem_ptr_to_uint(peer_smem_ptr);
+    asm volatile(
+        "red.relaxed.cluster.shared::cluster.add.f32 [%0], %1;"
+        :
+        : "r"(peer_addr), "f"(v)
+        : "memory"
+    );
+}
+
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -585,7 +596,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     
     // ========================================
     // Warpgroup 2: dKV Transfer (WG2)
-    // Responsibility: TMEM -> sdkv -> red.global.add.v4.f32
+    // Responsibility: TMEM -> sdkv -> peer sdkv reduce(red) -> red.global.add.v4.f32
     // ========================================
     if (is_wg2) {
         cutlass::arch::warpgroup_reg_dealloc<80>();
@@ -600,18 +611,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
 
         Tensor sSDKV = make_tensor(make_smem_ptr(plan.u.q_kv.sdkv.data()), SmemLayoutsdKV{});
 
-        auto flush_sdkv_stage = [&](int global_col_base, int kv_idx, bool row_valid) {
+        auto flush_sdkv_stage = [&](int global_col_base, int stage_cols, int kv_idx, bool row_valid) {
             if (!row_valid) {
                 return;
             }
-            float* dst = dKV + kv_idx * D_K + global_col_base + half * COLS_PER_HALF_STAGE;
+            constexpr int VEC = 4;
+            const int cols_per_cta = stage_cols / 2;
+            // After peer reduction, cta0 writes the front half and cta1 writes the back half.
+            if ((cta_idx == 0 && half != 0) || (cta_idx == 1 && half != 1)) {
+                return;
+            }
+            const int local_col_base = (cta_idx == 0) ? 0 : cols_per_cta;
+            float* dst = dKV + kv_idx * D_K + global_col_base + local_col_base;
             CUTE_UNROLL
-            for (int i = 0; i < COLS_PER_HALF_STAGE; i += 4) {
+            for (int i = 0; i < cols_per_cta; i += VEC) {
                 float4 v = {
-                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 0),
-                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 1),
-                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 2),
-                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 3),
+                    sSDKV(row, local_col_base + i + 0),
+                    sSDKV(row, local_col_base + i + 1),
+                    sSDKV(row, local_col_base + i + 2),
+                    sSDKV(row, local_col_base + i + 3),
                 };
                 atomic_add_float4(dst + i, v);
             }
@@ -642,11 +660,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
-                        sSDKV(row, half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i) = src[i];
+                        const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
+                        sSDKV(row, col) = src[i];
+                        float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
+                        red_add_peer_sdkv(peer_ptr, src[i]);
                     }
                 }
                 fence_view_async_shared();
-                flush_sdkv_stage(stage * COLS_PER_STAGE, kv_idx, row_valid);
+                flush_sdkv_stage(stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
                 plan.bar_dkv_part0_done.arrive(0u);
@@ -668,11 +689,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
                     for (int i = 0; i < CHUNK_SIZE; ++i) {
-                        sSDKV(row, half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i) = src[i];
+                        const int col = half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i;
+                        sSDKV(row, col) = src[i];
+                        float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
+                        red_add_peer_sdkv(peer_ptr, src[i]);
                     }
                 }
                 fence_view_async_shared();
-                flush_sdkv_stage(256 + stage * COLS_PER_STAGE, kv_idx, row_valid);
+                flush_sdkv_stage(256 + stage * COLS_PER_STAGE, COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
                 plan.bar_dkv_part1_done.arrive(0u);
@@ -692,23 +716,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 const float* src = (const float*)dkv_rope_data;
                 CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; ++i) {
-                    sSDKV(row, half * ROPE_COLS_PER_HALF + i) = src[i];
+                    const int col = half * ROPE_COLS_PER_HALF + i;
+                    sSDKV(row, col) = src[i];
+                    float* peer_ptr = kerutils::get_peer_addr(&sSDKV(row, col));
+                    red_add_peer_sdkv(peer_ptr, src[i]);
                 }
             }
             fence_view_async_shared();
-            if (row_valid) {
-                float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
-                CUTE_UNROLL
-                for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    float4 v = {
-                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 0),
-                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 1),
-                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 2),
-                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 3),
-                    };
-                    atomic_add_float4(dst + i, v);
-                }
-            }
+            flush_sdkv_stage(D_V, D_ROPE, kv_idx, row_valid);
             if (cta_idx == 0) {
                 plan.bar_dkv_part2_done.arrive(0u);
             } else {
