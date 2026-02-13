@@ -36,6 +36,7 @@ struct TmaParams {
     Shape_dQ shape_dQ;
     TMA_dQ tma_dQ;
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_rope32;
 };
 
 // ============================================================================
@@ -116,6 +117,23 @@ using SmemLayoutKVTilesTransposed_KMajor = decltype(coalesce(tile_to_shape(
     Shape<Int<288>, Int<B_TOPK/2>>{},
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
+
+using SmemLayoutKCalcDQPartNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<128>, Int<B_TOPK/2>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutKCalcDQPartRoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<D_ROPE/2>, Int<B_TOPK/2>>{},
+    Step<_2, _1>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutsdKV = Layout<
+    Shape<Int<B_TOPK>, Int<D_K/4>>,
+    Stride<Int<D_K/4>, _1>
+>;
 
 // 2CTA 模式下 S 矩阵形状为 [B_H/2, B_TOPK]
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
@@ -214,7 +232,7 @@ struct alignas(128) SharedMemoryPlan {
             // KV 缓冲区 (每个 CTA 加载 B_TOPK/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;    // [B_TOPK/2, D_V] = [32, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;    // [B_TOPK/2, D_ROPE] = [32, 64] bf16
-            array_aligned<float, cosize_v<SmemLayoutsdKV>> sdkv;    // [B_TOPK, D_K/4] = [32, 144] fp32
+            array_aligned<float, cosize_v<SmemLayoutsdKV>> sdkv;    // [B_TOPK, D_K/4] = [64, 144] fp32
             // Q 缓冲区 (每个 CTA 处理 B_H/2 行)
             array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;      // [B_H/2, D_V] = [64, 512] bf16
             array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;      // [B_H/2, D_ROPE] = [64, 64] bf16
@@ -261,9 +279,10 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_dkv_part0_done;           // WG2通知WG3 dKV_part0传输完成
     transac_bar_t bar_dkv_part1_done;           // WG2通知WG3 dKV_part1传输完成
     transac_bar_t bar_dkv_part2_done;           // WG2通知WG3 dKV_part2传输完成
-    // WG1-WG3 同步屏障 (kv_peer cp_async)
-    transac_bar_t bar_kv_peer_cp_async;         // cp_async传输kv_peer的transaction barrier
-    transac_bar_t bar_kv_peer_ready;            // WG1通知WG3 kv_peer加载完成
+    // WG1-WG3 同步屏障 (dQ K tiles)
+    transac_bar_t bar_kv_part0_ready;           // WG1通知WG3 kv_part0 (cols 0-255) 准备完成
+    transac_bar_t bar_kv_part1_ready;           // WG1通知WG3 kv_part1 (cols 256-511) 准备完成
+    transac_bar_t bar_kv_part2_ready;           // WG1通知WG3 kv_part2 (cols 512-575) 准备完成
     // WG3-WG0 同步屏障 (dQ computation)
     transac_bar_t bar_dq_ready;                 // WG3通知WG0 dQ计算完成
 

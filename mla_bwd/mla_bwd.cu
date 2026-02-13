@@ -21,18 +21,6 @@ float2 float2_sub(const float2 &a, const float2 &b) {
 }
 
 CUTE_DEVICE
-void atomic_addx4_tilelang(float* ref, const float4& add_val) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    atomicAdd(reinterpret_cast<float4*>(ref), add_val);
-    return;
-#endif
-    atomicAdd(ref + 0, add_val.x);
-    atomicAdd(ref + 1, add_val.y);
-    atomicAdd(ref + 2, add_val.z);
-    atomicAdd(ref + 3, add_val.w);
-}
-
-CUTE_DEVICE
 void atomic_add_float4(float* dst_ptr, const float4& v) {
     asm volatile(
         "red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
@@ -168,6 +156,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         cute::prefetch_tma_descriptor(tma_params.tma_dO.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_dQ.get_tma_descriptor());
         cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
+        cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv_rope32));
     }
 
     // Initialize barriers (warp 0 in CTA0)
@@ -187,9 +176,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         plan.bar_dkv_part0_done.init(128);
         plan.bar_dkv_part1_done.init(128);
         plan.bar_dkv_part2_done.init(128);
-        // WG1-WG3 barriers for kv_peer cp_async
-        plan.bar_kv_peer_cp_async.init(1);      // cp_async transaction barrier
-        plan.bar_kv_peer_ready.init(1);         // WG1 notifies WG3 kv_peer is ready
+        // WG1-WG3 barriers for dQ K tiles
+        plan.bar_kv_part0_ready.init(1);
+        plan.bar_kv_part1_ready.init(1);
+        plan.bar_kv_part2_ready.init(1);
         // WG3-WG0 barrier for dQ computation
         plan.bar_k_valid_ready.init(8);
         plan.bar_k_valid_free.init(128);
@@ -197,7 +187,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
         fence_barrier_init();
     }
     
-    // Cluster sync before accessing peer SMEM - all CTAs must participate
+    // Cluster sync before cross-CTA cooperative paths - all CTAs must participate
     __syncthreads();
     cluster_sync();
     
@@ -210,8 +200,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     Tensor sKNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKNoPE{});
     Tensor sKRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPE{});
     Tensor sdO = make_tensor(make_smem_ptr(plan.dO.data()), SmemLayoutdO{});
-    // kv_peer: [B_TOPK/2, D_K] = [32, 576] for cross-CTA K loading
-    Tensor sKV_peer = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKV{});
 
     // Launch prologue TMA loads and allocate TMEM (warp 0 in each CTA)
     if (warp_idx == 0) {
@@ -488,18 +476,24 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     
     // ========================================
     // Warpgroup 1: KV Loading (WG1)
-    // Responsibility: Maintain per-block KV tile and kv_peer transfer
+    // Responsibility: Maintain per-block KV tile and stage dQ K parts
     // ========================================
     if (is_wg1) {
         cutlass::arch::warpgroup_reg_dealloc<96>();
         const int local_warp_idx = warp_idx - 4;  // WG1 has global warps [4, 7]
         constexpr int NUM_WARPS = 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
-        constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;  // 32 * 576 = 18432
+        constexpr int COLS_NOPE_PART = 128;
+        constexpr int COLS_ROPE_PART = D_ROPE / 2;  // 32
 
         // Use lane0 of each warp (4 warps in WG1) to issue gather4 TMA loads.
         if (elect_one_sync()) {
             bf16* sKV_base = plan.u.q_kv.k_nope.data() + local_warp_idx * 4 * 64;
+            bf16* sKCalc_part0_base = plan.u.k_calc_dq.data() + local_warp_idx * 4 * 64;
+            bf16* sKCalc_part1_base =
+                plan.u.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> + local_warp_idx * 4 * 64;
+            bf16* sKCalc_part2_base =
+                plan.u.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> * 2 + local_warp_idx * 4 * COLS_ROPE_PART;
 
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -519,6 +513,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                     );
                 }
 
+                // Load local KV tile for P/dP and dKV paths.
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                     CUTE_UNROLL
@@ -533,27 +528,56 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                         );
                     }
                 }
-                // Load kv_peer from peer CTA using cp_async every iteration.
-                if (local_warp_idx == 0) {
-                    // Wait until WG3 has consumed this K block for P, then copy to kv_peer.
-                    plan.bar_p_ready.wait(phase);
 
-                    plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
-                    bf16* peer_kv_peer_ptr = kerutils::get_peer_addr(plan.u.q_kv.kv_peer.data());
-                    transac_bar_t* peer_bar_ptr = kerutils::get_peer_addr(&plan.bar_kv_peer_cp_async);
-                    kerutils::cp_async_bulk_shared_cta_to_shared_cluster(
-                        peer_kv_peer_ptr,
-                        plan.u.q_kv.k_nope.data(),
-                        sizeof(bf16) * KV_PEER_ELEMENTS,
-                        *peer_bar_ptr
-                    );
-                    fence_view_async_shared();
-                    plan.bar_kv_peer_cp_async.wait(phase);
-                    if (cta_idx == 0) {
-                        plan.bar_kv_peer_ready.arrive(0u);
-                    } else {
-                        plan.bar_kv_peer_ready.arrive(1u);
+                // After dP is ready, load K tiles for dQ into k_calc_dq in three parts.
+                plan.bar_dp_ready.wait(phase);
+
+                // part0: cta0 -> cols [0, 128), cta1 -> cols [128, 256)
+                const int part0_gmem_col_base = (cta_idx == 0) ? 0 : 128;
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    CUTE_UNROLL
+                    for (int local_col = 0; local_col < COLS_NOPE_PART / 64; ++local_col) {
+                        ku::tma_gather4_cta_group_2<true>(
+                            &(tma_params.tensor_map_kv),
+                            plan.bar_kv_part0_ready,
+                            sKCalc_part0_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
+                            part0_gmem_col_base + local_col * 64,
+                            indices4[local_row],
+                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                        );
                     }
+                }
+
+                // part1: cta0 -> cols [256, 384), cta1 -> cols [384, 512)
+                const int part1_gmem_col_base = (cta_idx == 0) ? 256 : 384;
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    CUTE_UNROLL
+                    for (int local_col = 0; local_col < COLS_NOPE_PART / 64; ++local_col) {
+                        ku::tma_gather4_cta_group_2<true>(
+                            &(tma_params.tensor_map_kv),
+                            plan.bar_kv_part1_ready,
+                            sKCalc_part1_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
+                            part1_gmem_col_base + local_col * 64,
+                            indices4[local_row],
+                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                        );
+                    }
+                }
+
+                // part2 (RoPE 32 cols): cta0 -> [512, 544), cta1 -> [544, 576)
+                const int part2_gmem_col_base = (cta_idx == 0) ? 512 : 544;
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    ku::tma_gather4_cta_group_2<true>(
+                        &(tma_params.tensor_map_kv_rope32),
+                        plan.bar_kv_part2_ready,
+                        sKCalc_part2_base + local_row * (4 * NUM_WARPS) * COLS_ROPE_PART,
+                        part2_gmem_col_base,
+                        indices4[local_row],
+                        (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                    );
                 }
             }
         }
@@ -561,15 +585,37 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     
     // ========================================
     // Warpgroup 2: dKV Transfer (WG2)
-    // Responsibility: Read dKV from TMEM and atomicAdd to global memory
+    // Responsibility: TMEM -> sdkv -> red.global.add.v4.f32
     // ========================================
     if (is_wg2) {
         cutlass::arch::warpgroup_reg_dealloc<80>();
-        const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
-        const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
+        const int row = idx_in_warpgroup % B_TOPK;    // 0-63
+        const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1
+        constexpr int COLS_PER_STAGE = 128;
+        constexpr int COLS_PER_HALF_STAGE = COLS_PER_STAGE / 2;  // 64
+        constexpr int CHUNK_SIZE = 32;
         static_assert(D_K % 4 == 0, "D_K must be 16B aligned in float units.");
         static_assert(D_V % 4 == 0, "D_V must be 16B aligned in float units.");
         static_assert((D_ROPE / 2) % 4 == 0, "D_ROPE/2 must be 16B aligned in float units.");
+
+        Tensor sSDKV = make_tensor(make_smem_ptr(plan.u.q_kv.sdkv.data()), SmemLayoutsdKV{});
+
+        auto flush_sdkv_stage = [&](int global_col_base, int kv_idx, bool row_valid) {
+            if (!row_valid) {
+                return;
+            }
+            float* dst = dKV + kv_idx * D_K + global_col_base + half * COLS_PER_HALF_STAGE;
+            CUTE_UNROLL
+            for (int i = 0; i < COLS_PER_HALF_STAGE; i += 4) {
+                float4 v = {
+                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 0),
+                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 1),
+                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 2),
+                    sSDKV(row, half * COLS_PER_HALF_STAGE + i + 3),
+                };
+                atomic_add_float4(dst + i, v);
+            }
+        };
 
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -582,27 +628,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             }
             const bool row_valid = kv_idx >= 0 && kv_idx < s_kv;
 
+            // part0: split into two [64, 128] stages.
             plan.bar_dkv_part0_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-
-            constexpr int COLS_PER_HALF = 256 / 2;
-            constexpr int CHUNK_SIZE = COLS_PER_HALF / 4;
             CUTE_UNROLL
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
-                cutlass::arch::fence_view_async_tmem_load();
-                ku::tcgen05_before_thread_sync();
-                if (row_valid) {
-                    float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
+            for (int stage = 0; stage < 2; ++stage) {
+                CUTE_UNROLL
+                for (int chunk = 0; chunk < 2; ++chunk) {
+                    alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
+                    ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + stage * 64 + chunk * CHUNK_SIZE, dkv_data);
+                    cutlass::arch::fence_view_async_tmem_load();
+                    ku::tcgen05_before_thread_sync();
                     const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                        // atomic_addx4_tilelang(dst + i, v);
-                        atomic_add_float4(dst + i, v);
+                    for (int i = 0; i < CHUNK_SIZE; ++i) {
+                        sSDKV(row, half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i) = src[i];
                     }
                 }
+                fence_view_async_shared();
+                flush_sdkv_stage(stage * COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
                 plan.bar_dkv_part0_done.arrive(0u);
@@ -610,23 +654,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part0_done.arrive(1u);
             }
 
+            // part1: split into two [64, 128] stages.
             plan.bar_dkv_part1_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
             CUTE_UNROLL
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
-                ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + chunk * CHUNK_SIZE, dkv_data);
-                cutlass::arch::fence_view_async_tmem_load();
-                ku::tcgen05_before_thread_sync();
-                if (row_valid) {
-                    float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
+            for (int stage = 0; stage < 2; ++stage) {
+                CUTE_UNROLL
+                for (int chunk = 0; chunk < 2; ++chunk) {
+                    alignas(16) float2 dkv_data[CHUNK_SIZE / 2];
+                    ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::dKV + stage * 64 + chunk * CHUNK_SIZE, dkv_data);
+                    cutlass::arch::fence_view_async_tmem_load();
+                    ku::tcgen05_before_thread_sync();
                     const float* src = (const float*)dkv_data;
                     CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_addx4_tilelang(dst + i, v);
+                    for (int i = 0; i < CHUNK_SIZE; ++i) {
+                        sSDKV(row, half * COLS_PER_HALF_STAGE + chunk * CHUNK_SIZE + i) = src[i];
                     }
                 }
+                fence_view_async_shared();
+                flush_sdkv_stage(256 + stage * COLS_PER_STAGE, kv_idx, row_valid);
             }
             if (cta_idx == 0) {
                 plan.bar_dkv_part1_done.arrive(0u);
@@ -634,20 +680,33 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 plan.bar_dkv_part1_done.arrive(1u);
             }
 
+            // part2: one [64, 64] stage.
             plan.bar_dkv_part2_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-            constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;
+            constexpr int ROPE_COLS_PER_HALF = D_ROPE / 2;  // 32
             alignas(16) float2 dkv_rope_data[ROPE_COLS_PER_HALF / 2];
             ku::tmem_ld_32dp32bNx<ROPE_COLS_PER_HALF>(tmem_cols::dKV_RoPE, dkv_rope_data);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
-            if (row_valid) {
-                float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
+            {
                 const float* src = (const float*)dkv_rope_data;
                 CUTE_UNROLL
+                for (int i = 0; i < ROPE_COLS_PER_HALF; ++i) {
+                    sSDKV(row, half * ROPE_COLS_PER_HALF + i) = src[i];
+                }
+            }
+            fence_view_async_shared();
+            if (row_valid) {
+                float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
+                CUTE_UNROLL
                 for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    float4 v = {src[i + 0], src[i + 1], src[i + 2], src[i + 3]};
-                    atomic_addx4_tilelang(dst + i, v);
+                    float4 v = {
+                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 0),
+                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 1),
+                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 2),
+                        sSDKV(row, half * ROPE_COLS_PER_HALF + i + 3),
+                    };
+                    atomic_add_float4(dst + i, v);
                 }
             }
             if (cta_idx == 0) {
@@ -712,32 +771,39 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             // Q RoPE transposed: [D_ROPE, B_H/2] = [64, 64]
             Tensor sQ_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPETransposed{});
 
-            // Allocate TMEM tensors for dQ
-            TiledMMA_dQ tiled_mma_dQ{};
-            TiledMMA_dQ_RoPE tiled_mma_dQ_RoPE{};
-            Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H/2>, Int<256>>{});
+            // Allocate TMEM tensors for dQ (2CTA kernels)
+            TiledMMA_dQ_2cta tiled_mma_dQ_2cta{};
+            TiledMMA_dQ_RoPE_2cta tiled_mma_dQ_RoPE_2cta{};
+            Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H/2>, Int<256>>{});
             tdQ_part0.data().get() = tmem_cols::dQ;
-            Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ, Shape<Int<B_H/2>, Int<256>>{});
+            Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H/2>, Int<256>>{});
             tdQ_part1.data().get() = tmem_cols::dQ + 128;
-            Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE, Shape<Int<B_H/2>, Int<D_ROPE>>{});
+            Tensor tdQ_RoPE = partition_fragment_C(tiled_mma_dQ_RoPE_2cta, Shape<Int<B_H/2>, Int<D_ROPE>>{});
             tdQ_RoPE.data().get() = tmem_cols::dQ_RoPE;
 
             // dS transposed tensor for MMA A operand: [B_H/2, B_TOPK] -> A matrix
             Tensor sDS_t = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutdSTransposed{});
             auto sDS_t_div = flat_divide(sDS_t, Shape<Int<B_H/2>, Int<B_TOPK/2>>{});
 
-            // K NoPE/RoPE transposed
-            Tensor sK_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
-            auto sK_nope_t_div = flat_divide(sK_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
-            Tensor sK_rope_t = make_tensor(make_smem_ptr(plan.u.q_kv.k_rope.data()), SmemLayoutKRoPETransposed{});
-
-            // K_peer transposed
-            Tensor sK_peer_nope_t_full = make_tensor(make_smem_ptr(plan.u.q_kv.kv_peer.data()), SmemLayoutKVTilesTransposed<D_V/64>{});
-            auto sK_peer_nope_t_div = flat_divide(sK_peer_nope_t_full, Shape<Int<256>, Int<B_TOPK/2>>{});
-            Tensor sK_peer_rope_t = make_tensor(
-                make_smem_ptr(plan.u.q_kv.kv_peer.data() + (B_TOPK/2) * D_V),
-                SmemLayoutKRoPETransposed{}
+            // K tiles for dQ are staged by WG1 into k_calc_dq in three parts.
+            Tensor sK_calc_part0 = make_tensor(
+                make_smem_ptr(plan.u.k_calc_dq.data()),
+                SmemLayoutKCalcDQPartNoPE{}
             );
+            Tensor sK_calc_part1 = make_tensor(
+                make_smem_ptr(plan.u.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE>),
+                SmemLayoutKCalcDQPartNoPE{}
+            );
+            Tensor sK_calc_part2 = make_tensor(
+                make_smem_ptr(plan.u.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> * 2),
+                SmemLayoutKCalcDQPartRoPE{}
+            );
+            transac_bar_t* bar_kv_part0_ready =
+                (cta_idx == 0) ? &plan.bar_kv_part0_ready : kerutils::get_peer_addr(&plan.bar_kv_part0_ready);
+            transac_bar_t* bar_kv_part1_ready =
+                (cta_idx == 0) ? &plan.bar_kv_part1_ready : kerutils::get_peer_addr(&plan.bar_kv_part1_ready);
+            transac_bar_t* bar_kv_part2_ready =
+                (cta_idx == 0) ? &plan.bar_kv_part2_ready : kerutils::get_peer_addr(&plan.bar_kv_part2_ready);
 
             CUTE_NO_UNROLL
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
@@ -779,29 +845,38 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::umma_arrive_noelect(plan.bar_dkv_part0_ready);
                 ku::tcgen05_after_thread_sync();
 
-                // dQ: k==0 clear, k>0 accumulate
+                // dQ: consume WG1-staged K parts in order (k==0 clear, k>0 accumulate).
                 if (cta_idx == 0) {
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    plan.bar_kv_peer_ready.wait(phase);
-                    ku::tcgen05_after_thread_sync();
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
-
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
-
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_rope_t, tdQ_RoPE, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
+                    bar_kv_part0_ready->arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
+                }
+                bar_kv_part0_ready->wait(phase);
+                ku::tcgen05_after_thread_sync();
+                if (cta_idx == 0) {
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part0, tdQ_part0, dq_clear);
                 } else {
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
-                    plan.bar_kv_peer_ready.wait(phase);
-                    ku::tcgen05_after_thread_sync();
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part0, tdQ_part0, dq_clear);
+                }
 
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, false);
+                if (cta_idx == 0) {
+                    bar_kv_part1_ready->arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
+                }
+                bar_kv_part1_ready->wait(phase);
+                ku::tcgen05_after_thread_sync();
+                if (cta_idx == 0) {
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part1, tdQ_part1, dq_clear);
+                } else {
+                    ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part1, tdQ_part1, dq_clear);
+                }
 
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_rope_t, tdQ_RoPE, dq_clear);
-                    ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_peer_rope_t, tdQ_RoPE, false);
+                if (cta_idx == 0) {
+                    bar_kv_part2_ready->arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
+                }
+                bar_kv_part2_ready->wait(phase);
+                ku::tcgen05_after_thread_sync();
+                if (cta_idx == 0) {
+                    ku::utcmma_ss(tiled_mma_dQ_RoPE_2cta, sDS_t_div(_, _, _0{}, _0{}), sK_calc_part2, tdQ_RoPE, dq_clear);
+                } else {
+                    ku::utcmma_ss(tiled_mma_dQ_RoPE_2cta, sDS_t_div(_, _, _0{}, _1{}), sK_calc_part2, tdQ_RoPE, dq_clear);
                 }
                 ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();
@@ -963,6 +1038,7 @@ void launch_test_mla_bwd(
     );
 
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_rope32;
     {
         uint64_t size[2] = {(uint64_t)D_K, (unsigned long)s_kv};  // [D_K, s_kv]
         uint64_t stride[1] = {(uint64_t)D_K * sizeof(bf16)};
@@ -987,6 +1063,30 @@ void launch_test_mla_bwd(
             return;
         }
     }
+    {
+        uint64_t size[2] = {(uint64_t)D_K, (unsigned long)s_kv};  // [D_K, s_kv]
+        uint64_t stride[1] = {(uint64_t)D_K * sizeof(bf16)};
+        uint32_t box_size[2] = {32, 1};
+        uint32_t elem_stride[2] = {1, 1};
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_kv_rope32,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            const_cast<bf16*>(kv),
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        if (res != CUresult::CUDA_SUCCESS) {
+            fprintf(stderr, "cuTensorMapEncodeTiled (rope32) failed with error code: %d\n", static_cast<int>(res));
+            return;
+        }
+    }
 
     using KernelTmaParams = TmaParams<
         decltype(shape_Q_nope), decltype(tma_Q_nope),
@@ -1002,7 +1102,8 @@ void launch_test_mla_bwd(
         shape_KV, tma_KV,
         shape_dO, tma_dO,
         shape_dQ, tma_dQ,
-        tensor_map_kv
+        tensor_map_kv,
+        tensor_map_kv_rope32
     };
 
     auto kernel = &test_mla_bwd_kernel<KernelTmaParams>;
