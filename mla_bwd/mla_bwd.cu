@@ -29,6 +29,34 @@ void atomic_add_float4(float* dst_ptr, const float4& v) {
     );
 }
 
+CUTE_DEVICE
+void atomic_add_32floats_unrolled(float* dst, const float* src) {
+    // i = 0:  dst[0..3]   += src[0..3]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 0), "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]) : "memory");
+    // i = 4:  dst[4..7]   += src[4..7]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 4), "f"(src[4]), "f"(src[5]), "f"(src[6]), "f"(src[7]) : "memory");
+    // i = 8:  dst[8..11]  += src[8..11]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 8), "f"(src[8]), "f"(src[9]), "f"(src[10]), "f"(src[11]) : "memory");
+    // i = 12: dst[12..15] += src[12..15]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 12), "f"(src[12]), "f"(src[13]), "f"(src[14]), "f"(src[15]) : "memory");
+    // i = 16: dst[16..19] += src[16..19]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 16), "f"(src[16]), "f"(src[17]), "f"(src[18]), "f"(src[19]) : "memory");
+    // i = 20: dst[20..23] += src[20..23]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 20), "f"(src[20]), "f"(src[21]), "f"(src[22]), "f"(src[23]) : "memory");
+    // i = 24: dst[24..27] += src[24..27]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 24), "f"(src[24]), "f"(src[25]), "f"(src[26]), "f"(src[27]) : "memory");
+    // i = 28: dst[28..31] += src[28..31]
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(dst + 28), "f"(src[28]), "f"(src[29]), "f"(src[30]), "f"(src[31]) : "memory");
+}
+
 // bf16x8 structure for vectorized operations
 struct bf16x8 {
     __nv_bfloat162 a01;
@@ -236,9 +264,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Warpgroup 0: Softmax and dS Computation (WG0)
     // Responsibility: Compute softmax(P), load delta, compute ds
     // ========================================
-    if (is_wg0) {
-        cutlass::arch::warpgroup_reg_alloc<144>();
-        
+    if (is_wg0) {        
         // Load LSE from global memory (needed for softmax computation)
         float row_lse = 0.0f;
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
@@ -478,7 +504,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Responsibility: Maintain per-block KV tile and kv_peer transfer
     // ========================================
     if (is_wg1) {
-        cutlass::arch::warpgroup_reg_dealloc<96>();
         const int local_warp_idx = warp_idx - 4;  // WG1 has global warps [4, 7]
         constexpr int NUM_WARPS = 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
@@ -551,7 +576,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Responsibility: Read dKV from TMEM and atomicAdd to global memory
     // ========================================
     if (is_wg2) {
-        cutlass::arch::warpgroup_reg_dealloc<80>();
         const int row = idx_in_warpgroup % B_TOPK;   // 0-63: which KV row
         const int half = idx_in_warpgroup / B_TOPK;   // 0 or 1: which column half
 
@@ -580,11 +604,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 if (row_valid) {
                     float* dst = dKV + kv_idx * D_K + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
                     float* src = (float*)dkv_data;
-                    CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_add_float4(dst + i, v);
-                    }
+                    atomic_add_32floats_unrolled(dst, src);
                 }
             }
             if (cta_idx == 0) {
@@ -604,11 +624,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 if (row_valid) {
                     float* dst = dKV + kv_idx * D_K + 256 + half * COLS_PER_HALF + chunk * CHUNK_SIZE;
                     float* src = (float*)dkv_data;
-                    CUTE_UNROLL
-                    for (int i = 0; i < CHUNK_SIZE; i += 4) {
-                        float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                        atomic_add_float4(dst + i, v);
-                    }
+                    atomic_add_32floats_unrolled(dst, src);
                 }
             }
             if (cta_idx == 0) {
@@ -627,11 +643,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
             if (row_valid) {
                 float* dst = dKV + kv_idx * D_K + D_V + half * ROPE_COLS_PER_HALF;
                 float* src = (float*)dkv_rope_data;
-                CUTE_UNROLL
-                for (int i = 0; i < ROPE_COLS_PER_HALF; i += 4) {
-                    float4 v = {src[i], src[i + 1], src[i + 2], src[i + 3]};
-                    atomic_add_float4(dst + i, v);
-                }
+                atomic_add_32floats_unrolled(dst, src);
             }
             if (cta_idx == 0) {
                 plan.bar_dkv_part2_done.arrive(0u);
@@ -646,8 +658,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Responsibility: Compute P, dP, and dKV
     // ========================================
     if (is_wg3) {
-        cutlass::arch::warpgroup_reg_alloc<184>();
-
         // Allocate TMEM tensors for P and dP
         TiledMMA_P tiled_mma_P{};
         TiledMMA_dP tiled_mma_dP{};
