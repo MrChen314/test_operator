@@ -264,172 +264,141 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
     // Warpgroup 0: Softmax and dS Computation (WG0)
     // Responsibility: Compute softmax(P), load delta, compute ds
     // ========================================
-    if (is_wg0) {        
-        // Load LSE from global memory (needed for softmax computation)
-        float row_lse = 0.0f;
+    if (is_wg0) {
+        // Load LSE and delta once; both are loop-invariant (fixed head, all k_blocks share them).
         const int global_row_idx = cta_idx * (B_H/2) + idx_in_warpgroup % (B_H/2);
-        row_lse = __ldg(lse_s + global_row_idx);
+        const float row_lse   = __ldg(lse_s   + global_row_idx);
+        const float delta_val = __ldg(delta_s + global_row_idx);
 
-        const float sm_scale = 1.0f / sqrtf(576.0f);  // softmax scale
-        const float scale = sm_scale * 1.44269504f;  // sm_scale * log2(e) for exp2
-        Tensor sS = make_tensor(make_smem_ptr(plan.s_ds.s.data()), SmemLayoutS{});
+        const float sm_scale = 1.0f / sqrtf(576.0f);
+        const float scale    = sm_scale * 1.44269504f;
+
+        // Pre-compute loop-invariant float2 constants to avoid recreating them each iteration.
+        const float2 neg_lse_f2  = make_float2(-row_lse,  -row_lse);
+        const float2 scale_f2    = make_float2(scale,      scale);
+        const float2 delta_f2    = make_float2(delta_val,  delta_val);
+        const float2 sm_scale_f2 = make_float2(sm_scale,   sm_scale);
+
+        Tensor sS  = make_tensor(make_smem_ptr(plan.s_ds.s.data()),  SmemLayoutS{});
         Tensor sDS = make_tensor(make_smem_ptr(plan.s_ds.ds.data()), SmemLayoutS{});
-        
+
+        // Pre-compute loop-invariant TMEM addresses and SMEM row/column indices.
+        const uint32_t tmem_base    = plan.tmem_start_addr.data()[0];
+        const uint32_t tmem_lane    = idx_in_warpgroup % (B_H/2);
+        const uint32_t tmem_p_addr  = tmem_base + (tmem_lane << 16) + tmem_cols::P;
+        const uint32_t tmem_dp_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
+        const int col_offset = (idx_in_warpgroup / 64) * 32;
+        const int s_row      = idx_in_warpgroup % 64;
+
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
 
-            // Step 1: Wait for WG3 to compute P for current block
+            // Step 1: Wait for WG3 to write P into TMEM.
             plan.bar_p_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
-            
-            // Step 2: Load P from TMEM (current tile) for softmax
+
+            // Step 2: Load P from TMEM.  p[] is reused in-place as the softmax result,
+            // eliminating the separate s_fp32[] array and saving (B_TOPK/2)/2 float2 registers.
             float2 p[(B_TOPK/2)/2];
-            uint32_t tmem_base = plan.tmem_start_addr.data()[0];
-            uint32_t tmem_lane = idx_in_warpgroup % (B_H/2);  // 0-63
-            uint32_t tmem_col = tmem_cols::P;
-            uint32_t tmem_addr = tmem_base + (tmem_lane << 16) + tmem_col;
-            
-            ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_addr, p);
+            ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_p_addr, p);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
 
+            // Step 3a: Mask out invalid K positions.
             plan.bar_k_valid_ready.wait(phase);
-            uint32_t is_k_valid_lo = *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+            const uint32_t is_k_valid_lo =
+                *(uint32_t*)(plan.is_k_valid + (idx_in_warpgroup >= 64 ? B_TOPK/8/2 : 0));
             float* p_float = (float*)p;
             CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; i += 1) {
+            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
                 if (!(is_k_valid_lo >> i & 1))
                     p_float[i] = -CUDART_INF_F;
             }
             plan.bar_k_valid_free.arrive();
 
-            // Step 3: Compute softmax(P) = exp2(P*scale - LSE)
-            // Compute softmax values: s = exp2(P*scale - LSE)
-            float2 s_fp32[(B_TOPK/2)/2];
-            float2 neg_lse = make_float2(-row_lse, -row_lse);
+            // Step 3b: Compute softmax(P) = exp2(P*scale - LSE) in-place in p[].
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                float2 scaled_p = ku::float2_fma(p[i], make_float2(scale, scale), neg_lse);
-                scaled_p.x = exp2f(scaled_p.x);
-                scaled_p.y = exp2f(scaled_p.y);
-                // s_fp32[i] = __float22bfloat162_rn(scaled_p);
-                s_fp32[i] = scaled_p;
+                float2 sp = ku::float2_fma(p[i], scale_f2, neg_lse_f2);
+                p[i].x = exp2f(sp.x);
+                p[i].y = exp2f(sp.y);
             }
-            
-            // Step 4: Store s to SMEM (convert fp32 to bf16)
-            // uint128_t* sS_base = (uint128_t*)plan.s_ds.s.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-            // CUTE_UNROLL
-            // for (int i = 0; i < B_TOPK/2/8; ++i) {
-            //     sS_base[64*i] = *(uint128_t*)(s_fp32 + i*4);
-            // }
-            // fence_view_async_shared();
 
-            int s_col_offset = (idx_in_warpgroup / 64) * 32;
+            // Step 4: Store softmax values (p[]) to SMEM as bf16.
             CUTE_UNROLL
             for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                sS(i*2+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].x);
-                sS(i*2+1+s_col_offset, idx_in_warpgroup%64) = bf16(s_fp32[i].y);
+                sS(i*2   + col_offset, s_row) = bf16(p[i].x);
+                sS(i*2+1 + col_offset, s_row) = bf16(p[i].y);
             }
             fence_view_async_shared();
+            __threadfence_block();
 
-            if (is_wg0) {
-                __threadfence_block();
-            }
-            
-            // Step 5: Notify WG3 that s is ready.
+            // Step 5: Notify WG3 that S is ready.
             if (cta_idx == 0) {
                 plan.bar_s_ready.arrive(0u);
             } else {
                 plan.bar_s_ready.arrive(1u);
             }
 
-            // Step 6: Load delta from global memory
-            float delta_val = 0.0f;
-            delta_val = __ldg(delta_s + global_row_idx);
-            
-            // Step 7: Wait for WG3 to compute dP for current block
+            // Step 7: Wait for WG3 to write dP into TMEM.
             plan.bar_dp_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
 
-            // Debug output dP is removed; consume dP directly from TMEM below.
-            // Step 8: Load dp from TMEM
-            float2 dp[(B_TOPK/2)/2];
-            uint32_t dp_tmem_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
-            ku::tmem_ld_32dp32bNx<B_TOPK/2>(dp_tmem_addr, dp);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-            
-            // Step 9: Compute ds = s * (dp - delta) * sm_scale
-            // Note: Use fp32 format of s (s_fp32), not bf16 format stored in SMEM
-            // Note: Use sm_scale (not scale which includes log2(e)) for ds computation
-            __nv_bfloat162 ds_fp32[(B_TOPK/2)/2];
-            float2 delta_float2 = make_float2(delta_val, delta_val);
-            float2 sm_scale_float2 = make_float2(sm_scale, sm_scale);
+            // Steps 8-10: Load dP in 4-float2 chunks and compute ds = s*(dp-delta)*sm_scale
+            // directly into SMEM, eliminating both the full dp[] and ds_fp32[] register arrays.
+            constexpr int DP_CHUNK_F2   = 4;
+            constexpr int NUM_DP_CHUNKS = (B_TOPK/2)/2 / DP_CHUNK_F2;
             CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                // Convert s_fp32 back to float2 for computation
-                // float2 s_val = __bfloat1622float2(s_fp32[i]);
-                float2 s_val = s_fp32[i];
-                float2 dp_val = dp[i];
-                float2 dp_minus_delta = float2_sub(dp_val, delta_float2);
-                float2 ds_val = ku::float2_mul(ku::float2_mul(s_val, dp_minus_delta), sm_scale_float2);
-                ds_fp32[i] = __float22bfloat162_rn(ds_val);
-            }
-            
-            // Step 10: Store ds to SMEM (convert fp32 to bf16)
-            // uint128_t* sDS_base = (uint128_t*)plan.s_ds.ds.data() + idx_in_warpgroup%64 + 64*((idx_in_warpgroup/64)*8);
-            // CUTE_UNROLL
-            // for (int i = 0; i < B_TOPK/2/8; ++i) {
-            //     sDS_base[64*i] = *(uint128_t*)(ds_fp32 + i*4);
-            // }
-            // fence_view_async_shared();
-            int ds_col_offset = (idx_in_warpgroup / 64) * 32;
-            CUTE_UNROLL
-            for (int i = 0; i < (B_TOPK/2)/2; ++i) {
-                sDS(i*2+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].x);
-                sDS(i*2+1+ds_col_offset, idx_in_warpgroup%64) = bf16(ds_fp32[i].y);
+            for (int ch = 0; ch < NUM_DP_CHUNKS; ++ch) {
+                float2 dp[DP_CHUNK_F2];
+                ku::tmem_ld_32dp32bNx<DP_CHUNK_F2 * 2>(tmem_dp_addr + ch * DP_CHUNK_F2 * 2, dp);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                CUTE_UNROLL
+                for (int i = 0; i < DP_CHUNK_F2; ++i) {
+                    const int idx = ch * DP_CHUNK_F2 + i;
+                    float2 dp_minus_delta = float2_sub(dp[i], delta_f2);
+                    float2 ds_val = ku::float2_mul(ku::float2_mul(p[idx], dp_minus_delta), sm_scale_f2);
+                    sDS(idx*2   + col_offset, s_row) = bf16(ds_val.x);
+                    sDS(idx*2+1 + col_offset, s_row) = bf16(ds_val.y);
+                }
             }
             fence_view_async_shared();
-        
-            if (is_wg0) {
-                __threadfence_block();
-            }
-            
-            // Step 11: Notify WG3 that ds is ready.
+            __threadfence_block();
+
+            // Step 11: Notify WG3 that dS is ready.
             if (cta_idx == 0) {
                 plan.bar_ds_ready.arrive(0u);
             } else {
                 plan.bar_ds_ready.arrive(1u);
             }
         }
-        
+
         // ========================================
-        // WG0 Step 12-13: Wait for dQ and transfer to global memory
+        // WG0 Steps 12-13: Wait for dQ and transfer to global memory
         // ========================================
-        // Step 12: Wait for WG3 to complete all dQ accumulations
         const int final_phase = (num_k_blocks - 1) & 1;
         plan.bar_dq_ready.wait(final_phase);
         ku::tcgen05_after_thread_sync();
-        
-        // Step 13: Read dQ (fp32) from TMEM, convert to bf16 in SMEM, then TMA-store to global memory
-        // dQ shape: [B_H, D_Q] = [128, 576], each CTA handles [B_H/2, D_Q] = [64, 576]
+
+        // Read dQ (fp32) from TMEM, convert to bf16 in SMEM, then TMA-store to global memory.
+        // dQ shape: [B_H, D_Q] = [128, 576], each CTA handles [B_H/2, D_Q] = [64, 576].
         {
-            constexpr int dQ_ROWS = B_H / 2;  // 64
-            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;            // 128 floats/thread per NoPE tile-half
-            constexpr int NOPE_CHUNKS = 8;
-            constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16 floats/chunk
-            constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;                 // 8 float2/chunk
-            constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;                      // 16 float2/row
+            constexpr int dQ_ROWS            = B_H / 2;
+            constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;
+            constexpr int NOPE_CHUNKS          = 8;
+            constexpr int NOPE_CHUNK_FLOATS    = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;
+            constexpr int NOPE_CHUNK_FLOAT2    = NOPE_CHUNK_FLOATS / 2;
+            constexpr int ROPE_FLOAT2_PER_ROW  = D_ROPE / 2 / 2;
 
             Tensor sdQ = make_tensor(make_smem_ptr(plan.u.dq.data()), SmemLayoutQ{});
 
-            int row_in_cta = idx_in_warpgroup % dQ_ROWS;   // 0-63
-            int col_half = idx_in_warpgroup / dQ_ROWS;     // 0 or 1
+            const int row_in_cta = idx_in_warpgroup % dQ_ROWS;
+            const int col_half   = idx_in_warpgroup / dQ_ROWS;
 
-            uint32_t tmem_base_dq = plan.tmem_start_addr.data()[0];
-            uint32_t tmem_addr_dq0 = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ;
-            uint32_t tmem_addr_dq1 = tmem_base_dq + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+            const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
+            const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
             // dQ_NoPE part0: cols [0, 255]
             CUTE_UNROLL
@@ -439,11 +408,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-
                 CUTE_UNROLL
                 for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
                     int col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
-                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
+                    sdQ(row_in_cta, col)     = bf16(dq_chunk[i].x);
                     sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
                 }
             }
@@ -456,27 +424,33 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void test_mla_bwd_kernel(
                 ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
-
                 CUTE_UNROLL
                 for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
                     int col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
-                    sdQ(row_in_cta, col) = bf16(dq_chunk[i].x);
+                    sdQ(row_in_cta, col)     = bf16(dq_chunk[i].x);
                     sdQ(row_in_cta, col + 1) = bf16(dq_chunk[i].y);
                 }
             }
 
-            // dQ_RoPE: cols [512, 575]
-            float2 dq_rope[ROPE_FLOAT2_PER_ROW];
-            uint32_t tmem_addr_dq_rope = tmem_base_dq + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
-            ku::tmem_ld_32dp32bNx<D_ROPE/2>(tmem_addr_dq_rope, dq_rope);
-            cutlass::arch::fence_view_async_tmem_load();
-            ku::tcgen05_before_thread_sync();
-
+            // dQ_RoPE: cols [512, 575] — load in 8-float2 chunks to halve peak register pressure
+            // vs. loading the full dq_rope[ROPE_FLOAT2_PER_ROW=16] array at once.
+            constexpr int ROPE_F2_CHUNK   = 8;
+            constexpr int ROPE_NUM_CHUNKS = ROPE_FLOAT2_PER_ROW / ROPE_F2_CHUNK;
+            const uint32_t tmem_addr_dq_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
             CUTE_UNROLL
-            for (int i = 0; i < ROPE_FLOAT2_PER_ROW; ++i) {
-                int col = D_V + col_half * (D_ROPE / 2) + i * 2;
-                sdQ(row_in_cta, col) = bf16(dq_rope[i].x);
-                sdQ(row_in_cta, col + 1) = bf16(dq_rope[i].y);
+            for (int rch = 0; rch < ROPE_NUM_CHUNKS; ++rch) {
+                float2 dq_rope_chunk[ROPE_F2_CHUNK];
+                ku::tmem_ld_32dp32bNx<ROPE_F2_CHUNK * 2>(
+                    tmem_addr_dq_rope + rch * ROPE_F2_CHUNK * 2, dq_rope_chunk);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                CUTE_UNROLL
+                for (int i = 0; i < ROPE_F2_CHUNK; ++i) {
+                    const int fi  = rch * ROPE_F2_CHUNK + i;
+                    const int col = D_V + col_half * (D_ROPE / 2) + fi * 2;
+                    sdQ(row_in_cta, col)     = bf16(dq_rope_chunk[i].x);
+                    sdQ(row_in_cta, col + 1) = bf16(dq_rope_chunk[i].y);
+                }
             }
 
             fence_view_async_shared();
