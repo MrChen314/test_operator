@@ -150,6 +150,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 256 * sizeof(bf16));
         smem.bar_kv_nope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+        if (dbg_print) {
+            const int idx0 = indices[0];
+            printf(
+                "[DBG][B%d CTA%d WG0] nope k_smem(col0,col256) k0=(%.6f,%.6f) kv_ref=(%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                (float)sK_calc_nope(0, 0), (float)sK_calc_nope(128, 0),
+                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 256]
+            );
+        }
 
         ku::utcmma_ss(
             tiled_mma_dQ_2cta,
@@ -205,6 +214,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
+        if (dbg_print && row_in_cta == 0 && col_half == 0 && chunk == 0) {
+            printf(
+                "[DBG][B%d CTA%d WG0] dq0 tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                dq_chunk[0].x, dq_chunk[0].y, dq_chunk[1].x, dq_chunk[1].y
+            );
+        }
 
         CUTE_UNROLL
         for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
@@ -221,6 +237,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
+        if (dbg_print && row_in_cta == 0 && col_half == 0 && chunk == 0) {
+            printf(
+                "[DBG][B%d CTA%d WG0] dq1 tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
+                blockIdx.x, cta_idx,
+                dq_chunk[0].x, dq_chunk[0].y, dq_chunk[1].x, dq_chunk[1].y
+            );
+        }
 
         CUTE_UNROLL
         for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
