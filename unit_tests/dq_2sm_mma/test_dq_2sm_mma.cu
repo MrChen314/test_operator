@@ -153,10 +153,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         if (dbg_print) {
             const int idx0 = indices[0];
             printf(
-                "[DBG][B%d CTA%d WG0] nope k_smem(col0,col256) k0=(%.6f,%.6f) kv_ref=(%.6f,%.6f)\n",
+                "[DBG][B%d CTA%d WG0] nope k_smem(col0,col128) k0=(%.6f,%.6f) kv_ref=(%.6f,%.6f)\n",
                 blockIdx.x, cta_idx,
                 (float)sK_calc_nope(0, 0), (float)sK_calc_nope(128, 0),
-                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 256]
+                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 128]
             );
         }
 
@@ -193,8 +193,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     cluster_sync();
 
     constexpr int dQ_ROWS_PER_CTA = B_H / 2;
-    constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;
-    constexpr int NOPE_CHUNKS = 8;
+    constexpr int NOPE_FLOATS_PER_HALF = 512 / 2;
+    constexpr int NOPE_CHUNKS = 16;
     constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;
     constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;
     constexpr int ROPE_FLOAT2_PER_HALF = (D_ROPE / 2) / 2;
@@ -204,19 +204,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int out_row = cta_idx * dQ_ROWS_PER_CTA + row_in_cta;
 
     const uint32_t tmem_base = smem.tmem_start_addr.data()[0];
-    const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
-    const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+    const uint32_t tmem_addr_dq_nope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
 
     CUTE_UNROLL
     for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
         const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
         float2 dq_chunk[NOPE_CHUNK_FLOAT2];
-        ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
+        ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq_nope + chunk_col_base, dq_chunk);
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
         if (dbg_print && row_in_cta == 0 && col_half == 0 && chunk == 0) {
             printf(
-                "[DBG][B%d CTA%d WG0] dq0 tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
+                "[DBG][B%d CTA%d WG0] dq_nope tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
                 blockIdx.x, cta_idx,
                 dq_chunk[0].x, dq_chunk[0].y, dq_chunk[1].x, dq_chunk[1].y
             );
@@ -225,29 +224,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         CUTE_UNROLL
         for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
             const int out_col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
-            dQ_out[out_row * D_Q + out_col] = dq_chunk[i].x;
-            dQ_out[out_row * D_Q + out_col + 1] = dq_chunk[i].y;
-        }
-    }
-
-    CUTE_UNROLL
-    for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
-        const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
-        float2 dq_chunk[NOPE_CHUNK_FLOAT2];
-        ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
-        cutlass::arch::fence_view_async_tmem_load();
-        ku::tcgen05_before_thread_sync();
-        if (dbg_print && row_in_cta == 0 && col_half == 0 && chunk == 0) {
-            printf(
-                "[DBG][B%d CTA%d WG0] dq1 tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                dq_chunk[0].x, dq_chunk[0].y, dq_chunk[1].x, dq_chunk[1].y
-            );
-        }
-
-        CUTE_UNROLL
-        for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
-            const int out_col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
             dQ_out[out_row * D_Q + out_col] = dq_chunk[i].x;
             dQ_out[out_row * D_Q + out_col + 1] = dq_chunk[i].y;
         }
