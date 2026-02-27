@@ -17,6 +17,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const bf16* __restrict__ kv,
     const int32_t* __restrict__ indices,
     float* __restrict__ dQ_out,
+    bf16* __restrict__ cuda_smem_k_nope,
+    bf16* __restrict__ cuda_smem_k_rope,
     __grid_constant__ const Params params
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
@@ -28,16 +30,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int cta_idx = blockIdx.x % 2;
     const int tid = threadIdx.x;
     const int warp_idx = tid / 32;
-    const int idx_in_warpgroup = tid % 128;
-    const bool dbg_print = (blockIdx.x < 2) && (idx_in_warpgroup == 0);
-
-    if (dbg_print) {
-        printf(
-            "[DBG][B%d CTA%d WG0] enter idx0..3=(%d,%d,%d,%d)\n",
-            blockIdx.x, cta_idx,
-            indices[0], indices[1], indices[2], indices[3]
-        );
-    }
 
     if (warp_idx == 0 && elect_one_sync()) {
         smem.bar_kv_nope_ready.init(1);
@@ -120,6 +112,39 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         }
     }
 
+    Tensor sK_calc_nope = make_tensor(
+        make_smem_ptr(smem.k_calc_dq_nope.data()),
+        SmemLayoutKCalcDQNoPE{}
+    );
+    Tensor sK_calc_rope = make_tensor(
+        make_smem_ptr(smem.k_calc_dq_rope.data()),
+        SmemLayoutKCalcDQRoPE{}
+    );
+
+    // Validate TMA gather: dump staged K tiles from CTA0 shared memory to global tensors.
+    if (cta_idx == 0) {
+        if (warp_idx == 0 && elect_one_sync()) {
+            smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 256 * sizeof(bf16));
+            smem.bar_kv_nope_ready.wait(0);
+            smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
+            smem.bar_kv_rope_ready.wait(0);
+            ku::tcgen05_after_thread_sync();
+        }
+        __syncthreads();
+
+        for (int linear = tid; linear < B_TOPK * COLS_NOPE; linear += blockDim.x) {
+            const int k_row = linear / COLS_NOPE;
+            const int d_col = linear % COLS_NOPE;
+            cuda_smem_k_nope[linear] = sK_calc_nope(d_col, k_row);
+        }
+        for (int linear = tid; linear < B_TOPK * COLS_ROPE; linear += blockDim.x) {
+            const int k_row = linear / COLS_ROPE;
+            const int d_col = linear % COLS_ROPE;
+            cuda_smem_k_rope[linear] = sK_calc_rope(d_col, k_row);
+        }
+        __syncthreads();
+    }
+
     if (cta_idx == 0 && warp_idx == 0 && elect_one_sync()) {
         TiledMMA_dQ_2cta tiled_mma_dQ_2cta{};
         TiledMMA_dQ_RoPE_2cta tiled_mma_dQ_rope_2cta{};
@@ -129,34 +154,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ_rope_2cta, Shape<Int<B_H>, Int<D_ROPE>>{});
         tdQ_rope.data().get() = tmem_cols::dQ_RoPE;
 
-        Tensor sK_calc_nope = make_tensor(
-            make_smem_ptr(smem.k_calc_dq_nope.data()),
-            SmemLayoutKCalcDQNoPE{}
-        );
-        Tensor sK_calc_rope = make_tensor(
-            make_smem_ptr(smem.k_calc_dq_rope.data()),
-            SmemLayoutKCalcDQRoPE{}
-        );
-
-        smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 256 * sizeof(bf16));
-        smem.bar_kv_nope_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
-        if (dbg_print) {
-            const int idx0 = indices[0];
-            printf(
-                "[DBG][B%d CTA%d WG0] nope k_smem(col0,col128) k0=(%.6f,%.6f) kv_ref=(%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_nope(0, 0), (float)sK_calc_nope(128, 0),
-                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 128]
-            );
-        }
-
         ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_nope, tdQ_nope, true);
         ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_nope_ready, 1 | 2);
 
-        smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
-        smem.bar_kv_rope_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
         ku::utcmma_ss(tiled_mma_dQ_rope_2cta, sDS_t, sK_calc_rope, tdQ_rope, true);
         ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_rope_ready, 1 | 2);
     }
@@ -191,13 +191,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq_nope + chunk_col_base, dq_chunk);
         cutlass::arch::fence_view_async_tmem_load();
         ku::tcgen05_before_thread_sync();
-        if (dbg_print && row_in_cta == 0 && col_half == 0 && chunk == 0) {
-            printf(
-                "[DBG][B%d CTA%d WG0] dq_nope tmem ld first4=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                dq_chunk[0].x, dq_chunk[0].y, dq_chunk[1].x, dq_chunk[1].y
-            );
-        }
 
         CUTE_UNROLL
         for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
@@ -219,27 +212,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         dQ_out[out_row * D_Q + out_col + 1] = dq_rope[i].y;
     }
 
-    __syncthreads();
-    if (dbg_print) {
-        const int row_g = cta_idx * dQ_ROWS_PER_CTA;
-        float ref0 = 0.0f;
-        float ref256 = 0.0f;
-        float ref512 = 0.0f;
-        CUTE_UNROLL
-        for (int k = 0; k < B_TOPK; ++k) {
-            const int kv_idx = indices[k];
-            const float ds_v = (float)ds[row_g * B_TOPK + k];
-            ref0 += ds_v * (float)kv[kv_idx * D_K + 0];
-            ref256 += ds_v * (float)kv[kv_idx * D_K + 256];
-            ref512 += ds_v * (float)kv[kv_idx * D_K + 512];
-        }
-        printf(
-            "[DBG][B%d CTA%d WG0] dQ row%d col0/256/512 out=(%.6f,%.6f,%.6f) ref=(%.6f,%.6f,%.6f)\n",
-            blockIdx.x, cta_idx, row_g,
-            dQ_out[row_g * D_Q + 0], dQ_out[row_g * D_Q + 256], dQ_out[row_g * D_Q + 512],
-            ref0, ref256, ref512
-        );
-    }
     cluster_sync();
 
     if (warp_idx == 0 && elect_one_sync()) {
@@ -250,11 +222,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     (void)kv;
     (void)indices;
     (void)dQ_out;
+    (void)cuda_smem_k_nope;
+    (void)cuda_smem_k_rope;
     (void)params;
 #endif
 }
 
-torch::Tensor run_dq_2sm_mma(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     torch::Tensor ds,
     torch::Tensor kv,
     torch::Tensor indices
@@ -283,7 +257,10 @@ torch::Tensor run_dq_2sm_mma(
     TORCH_CHECK(s_kv > 0, "s_kv must be > 0");
 
     auto options_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(ds.device());
+    auto options_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(ds.device());
     torch::Tensor dQ_out = torch::zeros({B_H, D_Q}, options_f32);
+    torch::Tensor cuda_smem_k_nope = torch::zeros({B_TOPK, 256}, options_bf16);
+    torch::Tensor cuda_smem_k_rope = torch::zeros({B_TOPK, D_ROPE / 2}, options_bf16);
 
     torch::Tensor indices_i32 = (indices.dtype() == torch::kInt32) ? indices : indices.to(torch::kInt32);
 
@@ -291,6 +268,8 @@ torch::Tensor run_dq_2sm_mma(
     const bf16* kv_ptr = reinterpret_cast<const bf16*>(kv.data_ptr<at::BFloat16>());
     const int32_t* indices_ptr = indices_i32.data_ptr<int32_t>();
     float* dq_ptr = dQ_out.data_ptr<float>();
+    bf16* smem_k_nope_ptr = reinterpret_cast<bf16*>(cuda_smem_k_nope.data_ptr<at::BFloat16>());
+    bf16* smem_k_rope_ptr = reinterpret_cast<bf16*>(cuda_smem_k_rope.data_ptr<at::BFloat16>());
 
     CUtensorMap tensor_map_kv;
     CUtensorMap tensor_map_kv_rope32;
@@ -372,11 +351,13 @@ torch::Tensor run_dq_2sm_mma(
         kv_ptr,
         indices_ptr,
         dq_ptr,
+        smem_k_nope_ptr,
+        smem_k_rope_ptr,
         params
     );
     TORCH_CHECK(err == cudaSuccess, "dq_2sm_mma_kernel launch failed: ", cudaGetErrorString(err));
 
-    return dQ_out;
+    return std::make_tuple(dQ_out, cuda_smem_k_nope, cuda_smem_k_rope);
 }
 
 }  // namespace test_operator::dq_2sm_mma

@@ -17,38 +17,45 @@ def calc_diff(a: torch.Tensor, b: torch.Tensor):
 
 
 def run_case(case_name: str, ds: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor):
-    k_sel = kv.index_select(0, indices.to(torch.int64)).float()
-    dq_ref = torch.matmul(ds.float(), k_sel)
-    dq_cuda = dq_2sm_mma_cuda.run_dq_2sm_mma(ds, kv, indices)
+    _, cuda_smem_k_nope, cuda_smem_k_rope = dq_2sm_mma_cuda.run_dq_2sm_mma(ds, kv, indices)
     torch.cuda.synchronize()
 
-    max_diff, rel_diff = calc_diff(dq_cuda, dq_ref)
-    print(f"[{case_name}] max_diff={max_diff:.6e}, rel_diff={rel_diff:.6e}")
+    k_sel = kv.index_select(0, indices.to(torch.int64))
+    smem_k_nope_ref = k_sel[:, :256].contiguous()
+    smem_k_rope_ref = k_sel[:, 512:544].contiguous()
 
-    seg0_max, seg0_rel = calc_diff(dq_cuda[:, :256], dq_ref[:, :256])
-    seg1_max, seg1_rel = calc_diff(dq_cuda[:, 256:512], dq_ref[:, 256:512])
-    seg2_max, seg2_rel = calc_diff(dq_cuda[:, 512:], dq_ref[:, 512:])
+    nope_max, nope_rel = calc_diff(cuda_smem_k_nope.float(), smem_k_nope_ref.float())
+    rope_max, rope_rel = calc_diff(cuda_smem_k_rope.float(), smem_k_rope_ref.float())
+    print(f"[{case_name}] smem_k_nope max_diff={nope_max:.6e}, rel_diff={nope_rel:.6e}")
+    print(f"[{case_name}] smem_k_rope max_diff={rope_max:.6e}, rel_diff={rope_rel:.6e}")
+
+    sample_nope_cols = [0, 1, 2, 3, 127, 128, 254, 255]
+    sample_rope_cols = [0, 1, 2, 3, 28, 29, 30, 31]
+    row0_nope_cuda = cuda_smem_k_nope[0, sample_nope_cols].detach().cpu()
+    row0_nope_ref = smem_k_nope_ref[0, sample_nope_cols].detach().cpu()
+    row0_rope_cuda = cuda_smem_k_rope[0, sample_rope_cols].detach().cpu()
+    row0_rope_ref = smem_k_rope_ref[0, sample_rope_cols].detach().cpu()
+
+    print(f"[{case_name}] indices[0:8]={indices[:8].detach().cpu().tolist()}")
+    print(f"[{case_name}] row0 smem_k_nope cuda={row0_nope_cuda.tolist()}")
+    print(f"[{case_name}] row0 smem_k_nope ref ={row0_nope_ref.tolist()}")
+    print(f"[{case_name}] row0 smem_k_rope cuda={row0_rope_cuda.tolist()}")
+    print(f"[{case_name}] row0 smem_k_rope ref ={row0_rope_ref.tolist()}")
+
+    nope_row_diff = torch.max(torch.abs(cuda_smem_k_nope.float() - smem_k_nope_ref.float()), dim=1).values
+    rope_row_diff = torch.max(torch.abs(cuda_smem_k_rope.float() - smem_k_rope_ref.float()), dim=1).values
+    worst_nope_rows = torch.topk(nope_row_diff, k=4).indices.detach().cpu().tolist()
+    worst_rope_rows = torch.topk(rope_row_diff, k=4).indices.detach().cpu().tolist()
     print(
-        f"[{case_name}] seg0(0:256) max={seg0_max:.6e} rel={seg0_rel:.6e} | "
-        f"seg1(256:512) max={seg1_max:.6e} rel={seg1_rel:.6e} | "
-        f"seg2(512:576) max={seg2_max:.6e} rel={seg2_rel:.6e}"
+        f"[{case_name}] worst_nope_rows={worst_nope_rows} "
+        f"row_max_diff={[nope_row_diff[i].item() for i in worst_nope_rows]}"
+    )
+    print(
+        f"[{case_name}] worst_rope_rows={worst_rope_rows} "
+        f"row_max_diff={[rope_row_diff[i].item() for i in worst_rope_rows]}"
     )
 
-    sample_cols = [0, 1, 2, 3, 256, 257, 512, 513]
-    row0_cuda = dq_cuda[0, sample_cols].detach().cpu()
-    row0_ref = dq_ref[0, sample_cols].detach().cpu()
-    row64_cuda = dq_cuda[64, sample_cols].detach().cpu()
-    row64_ref = dq_ref[64, sample_cols].detach().cpu()
-    print(f"[{case_name}] indices[0:8]={indices[:8].detach().cpu().tolist()}")
-    print(f"[{case_name}] row0 cuda={row0_cuda.tolist()}")
-    print(f"[{case_name}] row0 ref ={row0_ref.tolist()}")
-    print(f"[{case_name}] row64 cuda={row64_cuda.tolist()}")
-    print(f"[{case_name}] row64 ref ={row64_ref.tolist()}")
-
-    row_diff = torch.max(torch.abs(dq_cuda - dq_ref), dim=1).values
-    worst_rows = torch.topk(row_diff, k=4).indices.detach().cpu().tolist()
-    print(f"[{case_name}] worst_rows={worst_rows} row_max_diff={[row_diff[i].item() for i in worst_rows]}")
-    return rel_diff < 1e-3
+    return nope_rel < 1e-3 and rope_rel < 1e-3
 
 
 def main() -> int:
