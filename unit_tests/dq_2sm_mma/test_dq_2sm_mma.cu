@@ -138,15 +138,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             SmemLayoutKCalcDQRoPE{}
         );
 
-        Tensor sDS_t_divided = flat_divide(
-            sDS_t,
-            Tile<Int<B_H / 2>, Int<B_TOPK / 2>>{}
-        )(_, _, _0{}, _);
-        Tensor sK_calc_nope_divided = flat_divide(
-            sK_calc_nope,
-            Tile<Int<256>, Int<B_TOPK / 2>>{}
-        )(_, _, _0{}, _);
-
         smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 256 * sizeof(bf16));
         smem.bar_kv_nope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
@@ -160,20 +151,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             );
         }
 
-        ku::utcmma_ss(
-            tiled_mma_dQ_2cta,
-            sDS_t_divided(_, _, _0{}),
-            sK_calc_nope_divided(_, _, _0{}),
-            tdQ_nope,
-            true
-        );
-        ku::utcmma_ss(
-            tiled_mma_dQ_2cta,
-            sDS_t_divided(_, _, _1{}),
-            sK_calc_nope_divided(_, _, _1{}),
-            tdQ_nope,
-            false
-        );
+        ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_nope, tdQ_nope, true);
         ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_nope_ready, 1 | 2);
 
         smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
