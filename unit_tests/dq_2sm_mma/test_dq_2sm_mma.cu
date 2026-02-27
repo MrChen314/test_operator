@@ -40,10 +40,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     }
 
     if (warp_idx == 0 && elect_one_sync()) {
-        smem.bar_kv_part0_ready.init(1);
-        smem.bar_kv_part1_ready.init(1);
-        smem.bar_kv_part2_ready.init(1);
-        smem.bar_dq_ready.init(1);
+        smem.bar_kv_nope_ready.init(1);
+        smem.bar_kv_rope_ready.init(1);
+        smem.bar_dq_nope_ready.init(1);
+        smem.bar_dq_rope_ready.init(1);
         fence_barrier_init();
     }
     __syncthreads();
@@ -59,24 +59,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         const int row = linear_idx / DS_COLS;
         const int col = linear_idx % DS_COLS;
         const int global_row = cta_idx * DS_ROWS_PER_CTA + row;
-        // Match mla_bwd flow: producer writes dS with SmemLayoutdS, consumer reads with dSTransposed view.
         sDS(col, row) = ds[global_row * DS_COLS + col];
     }
     fence_view_async_shared();
     __syncthreads();
     cluster_sync();
-
-    if (dbg_print) {
-        const int row0 = cta_idx * DS_ROWS_PER_CTA;
-        printf(
-            "[DBG][B%d CTA%d WG0] ds smem(0,0..3)=(%.6f,%.6f,%.6f,%.6f) gmem(row=%d,0..3)=(%.6f,%.6f,%.6f,%.6f)\n",
-            blockIdx.x, cta_idx,
-            (float)sDS(0, 0), (float)sDS(1, 0), (float)sDS(2, 0), (float)sDS(3, 0),
-            row0,
-            (float)ds[row0 * DS_COLS + 0], (float)ds[row0 * DS_COLS + 1],
-            (float)ds[row0 * DS_COLS + 2], (float)ds[row0 * DS_COLS + 3]
-        );
-    }
 
     if (warp_idx == 0) {
         TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
@@ -87,16 +74,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     constexpr int NUM_WARPS = 4;
     constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
-    constexpr int COLS_NOPE_PART = 128;
-    constexpr int COLS_ROPE_PART = D_ROPE / 2;
+    constexpr int COLS_NOPE = 256;
+    constexpr int COLS_ROPE = D_ROPE / 2;
 
     if (warp_idx < NUM_WARPS && elect_one_sync()) {
         const int local_warp_idx = warp_idx;
-        bf16* sKCalc_part0_base = smem.k_calc_dq.data() + local_warp_idx * 4 * 64;
-        bf16* sKCalc_part1_base =
-            smem.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> + local_warp_idx * 4 * 64;
-        bf16* sKCalc_part2_base =
-            smem.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> * 2 + local_warp_idx * 4 * COLS_ROPE_PART;
+        bf16* sKCalc_nope_base = smem.k_calc_dq_nope.data() + local_warp_idx * 4 * 64;
+        bf16* sKCalc_rope_base = smem.k_calc_dq_rope.data() + local_warp_idx * 4 * COLS_ROPE;
 
         int4 indices4[NUM_LOCAL_ROWS_PER_WARP];
         CUTE_UNROLL
@@ -106,46 +90,30 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             );
         }
 
-        const int part0_gmem_col_base = (cta_idx == 0) ? 0 : 128;
+        const int nope_gmem_col_base = (cta_idx == 0) ? 0 : 256;
         CUTE_UNROLL
         for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
             CUTE_UNROLL
-            for (int local_col = 0; local_col < COLS_NOPE_PART / 64; ++local_col) {
+            for (int local_col = 0; local_col < COLS_NOPE / 64; ++local_col) {
                 ku::tma_gather4_cta_group_2<true>(
                     &(params.tensor_map_kv),
-                    smem.bar_kv_part0_ready,
-                    sKCalc_part0_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
-                    part0_gmem_col_base + local_col * 64,
+                    smem.bar_kv_nope_ready,
+                    sKCalc_nope_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
+                    nope_gmem_col_base + local_col * 64,
                     indices4[local_row],
                     (int64_t)TMA::CacheHintSm90::EVICT_LAST
                 );
             }
         }
 
-        const int part1_gmem_col_base = (cta_idx == 0) ? 256 : 384;
-        CUTE_UNROLL
-        for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-            CUTE_UNROLL
-            for (int local_col = 0; local_col < COLS_NOPE_PART / 64; ++local_col) {
-                ku::tma_gather4_cta_group_2<true>(
-                    &(params.tensor_map_kv),
-                    smem.bar_kv_part1_ready,
-                    sKCalc_part1_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
-                    part1_gmem_col_base + local_col * 64,
-                    indices4[local_row],
-                    (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                );
-            }
-        }
-
-        const int part2_gmem_col_base = (cta_idx == 0) ? 512 : 544;
+        const int rope_gmem_col_base = (cta_idx == 0) ? 512 : 544;
         CUTE_UNROLL
         for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
             ku::tma_gather4_cta_group_2<true>(
                 &(params.tensor_map_kv_rope32),
-                smem.bar_kv_part2_ready,
-                sKCalc_part2_base + local_row * (4 * NUM_WARPS) * COLS_ROPE_PART,
-                part2_gmem_col_base,
+                smem.bar_kv_rope_ready,
+                sKCalc_rope_base + local_row * (4 * NUM_WARPS) * COLS_ROPE,
+                rope_gmem_col_base,
                 indices4[local_row],
                 (int64_t)TMA::CacheHintSm90::EVICT_LAST
             );
@@ -156,185 +124,60 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         TiledMMA_dQ_2cta tiled_mma_dQ_2cta{};
         TiledMMA_dQ_RoPE_2cta tiled_mma_dQ_rope_2cta{};
 
-        Tensor tdQ_part0 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H>, Int<256>>{});
-        tdQ_part0.data().get() = tmem_cols::dQ;
-
-        Tensor tdQ_part1 = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H>, Int<256>>{});
-        tdQ_part1.data().get() = tmem_cols::dQ + 128;
-
+        Tensor tdQ_nope = partition_fragment_C(tiled_mma_dQ_2cta, Shape<Int<B_H>, Int<512>>{});
+        tdQ_nope.data().get() = tmem_cols::dQ;
         Tensor tdQ_rope = partition_fragment_C(tiled_mma_dQ_rope_2cta, Shape<Int<B_H>, Int<D_ROPE>>{});
         tdQ_rope.data().get() = tmem_cols::dQ_RoPE;
 
-        Tensor sK_calc_part0 = make_tensor(
-            make_smem_ptr(smem.k_calc_dq.data()),
-            SmemLayoutKCalcDQPartNoPE{}
+        Tensor sK_calc_nope = make_tensor(
+            make_smem_ptr(smem.k_calc_dq_nope.data()),
+            SmemLayoutKCalcDQNoPE{}
         );
-        Tensor sK_calc_part1 = make_tensor(
-            make_smem_ptr(smem.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE>),
-            SmemLayoutKCalcDQPartNoPE{}
-        );
-        Tensor sK_calc_part2 = make_tensor(
-            make_smem_ptr(smem.k_calc_dq.data() + cosize_v<SmemLayoutKCalcDQPartNoPE> * 2),
-            SmemLayoutKCalcDQPartRoPE{}
+        Tensor sK_calc_rope = make_tensor(
+            make_smem_ptr(smem.k_calc_dq_rope.data()),
+            SmemLayoutKCalcDQRoPE{}
         );
 
-        // kv_part0 expects bytes from both CTAs combined via cta_group::2 + USE_CTA0_MBAR:
-        // 2 * (B_TOPK/2 rows) * 128 cols * sizeof(bf16) = B_TOPK * 128 * sizeof(bf16).
-        smem.bar_kv_part0_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
-        smem.bar_kv_part0_ready.wait(0);
+        Tensor sDS_t_divided = flat_divide(
+            sDS_t,
+            Tile<Int<B_H / 2>, Int<B_TOPK / 2>>{}
+        )(_, _, _0{}, _);
+        Tensor sK_calc_nope_divided = flat_divide(
+            sK_calc_nope,
+            Tile<Int<256>, Int<B_TOPK / 2>>{}
+        )(_, _, _0{}, _);
+
+        smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 256 * sizeof(bf16));
+        smem.bar_kv_nope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
-        if (dbg_print) {
-            const int idx0 = indices[0];
-            const int idx1 = indices[1];
-            const int idx2 = indices[2];
-            const int idx3 = indices[3];
-            printf(
-                "[DBG][B%d CTA%d WG0] part0 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col0)=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(0, 1),
-                (float)sK_calc_part0(0, 2), (float)sK_calc_part0(0, 3),
-                (float)kv[idx0 * D_K + 0], (float)kv[idx1 * D_K + 0],
-                (float)kv[idx2 * D_K + 0], (float)kv[idx3 * D_K + 0]
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part0 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part0(0, 0), (float)sK_calc_part0(0, 1), (float)sK_calc_part0(0, 2), (float)sK_calc_part0(0, 3),
-                (float)sK_calc_part0(1, 0), (float)sK_calc_part0(1, 1), (float)sK_calc_part0(1, 2), (float)sK_calc_part0(1, 3)
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part0 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)kv[idx0 * D_K + 0], (float)kv[idx0 * D_K + 1], (float)kv[idx0 * D_K + 2], (float)kv[idx0 * D_K + 3],
-                (float)kv[idx1 * D_K + 0], (float)kv[idx1 * D_K + 1], (float)kv[idx1 * D_K + 2], (float)kv[idx1 * D_K + 3]
-            );
-        }
-        ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part0, tdQ_part0, true);
 
-        // kv_part1 has the same footprint as part0 (another 128-column slice).
-        smem.bar_kv_part1_ready.arrive_and_expect_tx(B_TOPK * 128 * sizeof(bf16));
-        smem.bar_kv_part1_ready.wait(0);
+        ku::utcmma_ss(
+            tiled_mma_dQ_2cta,
+            sDS_t_divided(_, _, _0{}),
+            sK_calc_nope_divided(_, _, _0{}),
+            tdQ_nope,
+            true
+        );
+        ku::utcmma_ss(
+            tiled_mma_dQ_2cta,
+            sDS_t_divided(_, _, _1{}),
+            sK_calc_nope_divided(_, _, _1{}),
+            tdQ_nope,
+            false
+        );
+        ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_nope_ready, 1 | 2);
+
+        smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
+        smem.bar_kv_rope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
-        if (dbg_print) {
-            const int idx0 = indices[0];
-            const int idx1 = indices[1];
-            const int idx2 = indices[2];
-            const int idx3 = indices[3];
-            printf(
-                "[DBG][B%d CTA%d WG0] part1 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col256)=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(0, 1),
-                (float)sK_calc_part1(0, 2), (float)sK_calc_part1(0, 3),
-                (float)kv[idx0 * D_K + 256], (float)kv[idx1 * D_K + 256],
-                (float)kv[idx2 * D_K + 256], (float)kv[idx3 * D_K + 256]
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part1 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part1(0, 0), (float)sK_calc_part1(0, 1), (float)sK_calc_part1(0, 2), (float)sK_calc_part1(0, 3),
-                (float)sK_calc_part1(1, 0), (float)sK_calc_part1(1, 1), (float)sK_calc_part1(1, 2), (float)sK_calc_part1(1, 3)
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part1 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)kv[idx0 * D_K + 256], (float)kv[idx0 * D_K + 257], (float)kv[idx0 * D_K + 258], (float)kv[idx0 * D_K + 259],
-                (float)kv[idx1 * D_K + 256], (float)kv[idx1 * D_K + 257], (float)kv[idx1 * D_K + 258], (float)kv[idx1 * D_K + 259]
-            );
-        }
-        ku::utcmma_ss(tiled_mma_dQ_2cta, sDS_t, sK_calc_part1, tdQ_part1, true);
-
-        // kv_part2 is the 32-column RoPE slice, again aggregated across both CTAs.
-        smem.bar_kv_part2_ready.arrive_and_expect_tx(B_TOPK * (D_ROPE / 2) * sizeof(bf16));
-        smem.bar_kv_part2_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
-        if (dbg_print) {
-            const int idx0 = indices[0];
-            const int idx1 = indices[1];
-            const int idx2 = indices[2];
-            const int idx3 = indices[3];
-            printf(
-                "[DBG][B%d CTA%d WG0] part2 k_smem(k0..3,col0)=(%.6f,%.6f,%.6f,%.6f) kv_ref(idx0..3,col512)=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(0, 1),
-                (float)sK_calc_part2(0, 2), (float)sK_calc_part2(0, 3),
-                (float)kv[idx0 * D_K + 512], (float)kv[idx1 * D_K + 512],
-                (float)kv[idx2 * D_K + 512], (float)kv[idx3 * D_K + 512]
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part2 smem4x4 r0=(%.6f,%.6f,%.6f,%.6f) r1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part2(0, 0), (float)sK_calc_part2(0, 1), (float)sK_calc_part2(0, 2), (float)sK_calc_part2(0, 3),
-                (float)sK_calc_part2(1, 0), (float)sK_calc_part2(1, 1), (float)sK_calc_part2(1, 2), (float)sK_calc_part2(1, 3)
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] part2 kv4x4 i0=(%.6f,%.6f,%.6f,%.6f) i1=(%.6f,%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)kv[idx0 * D_K + 512], (float)kv[idx0 * D_K + 513], (float)kv[idx0 * D_K + 514], (float)kv[idx0 * D_K + 515],
-                (float)kv[idx1 * D_K + 512], (float)kv[idx1 * D_K + 513], (float)kv[idx1 * D_K + 514], (float)kv[idx1 * D_K + 515]
-            );
-        }
-
-        if (dbg_print) {
-            float smem_dot0 = 0.0f;
-            float smem_dot256 = 0.0f;
-            float smem_dot512 = 0.0f;
-            float smem_dot0_alt = 0.0f;
-            float smem_dot256_alt = 0.0f;
-            float smem_dot512_fd32 = 0.0f;
-            float gmem_dot0 = 0.0f;
-            float gmem_dot256 = 0.0f;
-            float gmem_dot512 = 0.0f;
-            CUTE_UNROLL
-            for (int k = 0; k < B_TOPK; ++k) {
-                const float ds_v = (float)sDS_t(0, k);
-                smem_dot0_alt += ds_v * (float)sK_calc_part0(k, 0);
-                smem_dot256_alt += ds_v * (float)sK_calc_part1(k, 0);
-                smem_dot0 += ds_v * (float)sK_calc_part0(0, k);
-                smem_dot256 += ds_v * (float)sK_calc_part1(0, k);
-                smem_dot512 += ds_v * (float)sK_calc_part2(0, k);
-                if (k < 32) {
-                    smem_dot512_fd32 += ds_v * (float)sK_calc_part2(k, 0);
-                }
-
-                const int kv_idx = indices[k];
-                const float ds_ref = (float)ds[k];
-                gmem_dot0 += ds_ref * (float)kv[kv_idx * D_K + 0];
-                gmem_dot256 += ds_ref * (float)kv[kv_idx * D_K + 256];
-                gmem_dot512 += ds_ref * (float)kv[kv_idx * D_K + 512];
-            }
-            printf(
-                "[DBG][B%d CTA%d WG0] dot_pre row0 col0/256/512 smem_sd=(%.6f,%.6f,%.6f) "
-                "smem_fd=(%.6f,%.6f,%.6f[32]) gmem=(%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                smem_dot0, smem_dot256, smem_dot512,
-                smem_dot0_alt, smem_dot256_alt, smem_dot512_fd32,
-                gmem_dot0, gmem_dot256, gmem_dot512
-            );
-
-            const int idx31 = indices[31];
-            const int idx32 = indices[32];
-            const int idx63 = indices[63];
-            printf(
-                "[DBG][B%d CTA%d WG0] k_boundary part0 smem(31,0)=%.6f smem(32,0)=%.6f smem(63,0)=%.6f "
-                "kv(idx31/32/63,col0)=(%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sK_calc_part0(31, 0), (float)sK_calc_part0(32, 0), (float)sK_calc_part0(63, 0),
-                (float)kv[idx31 * D_K + 0], (float)kv[idx32 * D_K + 0], (float)kv[idx63 * D_K + 0]
-            );
-            printf(
-                "[DBG][B%d CTA%d WG0] ds_t boundary row0 k31/32/63=(%.6f,%.6f,%.6f) gmem ds row0 k31/32/63=(%.6f,%.6f,%.6f)\n",
-                blockIdx.x, cta_idx,
-                (float)sDS_t(0, 31), (float)sDS_t(0, 32), (float)sDS_t(0, 63),
-                (float)ds[31], (float)ds[32], (float)ds[63]
-            );
-        }
-        ku::utcmma_ss(tiled_mma_dQ_rope_2cta, sDS_t, sK_calc_part2, tdQ_rope, true);
-
-        ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_ready, 1 | 2);
+        ku::utcmma_ss(tiled_mma_dQ_rope_2cta, sDS_t, sK_calc_rope, tdQ_rope, true);
+        ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_dq_rope_ready, 1 | 2);
     }
 
     if (warp_idx == 0 && elect_one_sync()) {
-        smem.bar_dq_ready.wait(0);
+        smem.bar_dq_nope_ready.wait(0);
+        ku::tcgen05_after_thread_sync();
+        smem.bar_dq_rope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
     }
     __syncthreads();
@@ -565,6 +408,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "run_dq_2sm_mma",
         &test_operator::dq_2sm_mma::run_dq_2sm_mma,
-        "Unit test kernel for dQ path with TMA kv_part staging and 2SM MMA"
+        "Unit test kernel for dQ path with TMA kv_nope/kv_rope staging and 2SM MMA"
     );
 }
