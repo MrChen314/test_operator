@@ -35,6 +35,12 @@ def run_case(case_name: str, ds: torch.Tensor, kv: torch.Tensor, indices: torch.
     print(f"[{case_name}] smem_k_nope_ref[:32, :32]:")
     print(smem_k_nope_ref[:32, :32])
 
+    # 全部打印
+    print(f"[{case_name}] cuda_smem_k_nope")
+    print(cuda_smem_k_nope)
+    print(f"[{case_name}] smem_k_nope_ref")
+    print(smem_k_nope_ref)
+
     sample_nope_cols = [0, 1, 2, 3, 127, 128, 254, 255]
     sample_rope_cols = [0, 1, 2, 3, 28, 29, 30, 31]
     row0_nope_cuda = cuda_smem_k_nope[0, sample_nope_cols].detach().cpu()
