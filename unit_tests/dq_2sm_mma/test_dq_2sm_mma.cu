@@ -65,7 +65,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     cluster_sync();
 
     constexpr int NUM_WARPS = 4;
-    constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK / 2) / 4 / NUM_WARPS;
+    // Each CTA loads the full B_TOPK rows; CTAs split only on column ranges.
+    constexpr int NUM_LOCAL_ROWS_PER_WARP = B_TOPK / 4 / NUM_WARPS;
     constexpr int COLS_NOPE = 256;
     constexpr int COLS_ROPE = D_ROPE / 2;
 
@@ -78,7 +79,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         CUTE_UNROLL
         for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
             indices4[local_row] = __ldg(
-                (const int4*)(indices + cta_idx * (B_TOPK / 2)) + local_row * NUM_WARPS + local_warp_idx
+                (const int4*)(indices) + local_row * NUM_WARPS + local_warp_idx
             );
         }
 
@@ -90,7 +91,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 ku::tma_gather4_cta_group_2<true>(
                     &(params.tensor_map_kv),
                     smem.bar_kv_nope_ready,
-                    sKCalc_nope_base + local_row * (4 * NUM_WARPS) * 64 + local_col * ((B_TOPK / 2) * 64),
+                    sKCalc_nope_base + local_row * (4 * NUM_WARPS) * 64 + local_col * (B_TOPK * 64),
                     nope_gmem_col_base + local_col * 64,
                     indices4[local_row],
                     (int64_t)TMA::CacheHintSm90::EVICT_LAST
