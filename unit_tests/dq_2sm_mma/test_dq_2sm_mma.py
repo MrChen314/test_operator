@@ -29,6 +29,12 @@ def run_case(case_name: str, ds: torch.Tensor, kv: torch.Tensor, indices: torch.
     print(f"[{case_name}] smem_k_nope max_diff={nope_max:.6e}, rel_diff={nope_rel:.6e}")
     print(f"[{case_name}] smem_k_rope max_diff={rope_max:.6e}, rel_diff={rope_rel:.6e}")
 
+    # 打印前32行和前32列
+    print(f"[{case_name}] cuda_smem_k_nope[:32, :32]:")
+    print(cuda_smem_k_nope[:32, :32])
+    print(f"[{case_name}] smem_k_nope_ref[:32, :32]:")
+    print(smem_k_nope_ref[:32, :32])
+
     sample_nope_cols = [0, 1, 2, 3, 127, 128, 254, 255]
     sample_rope_cols = [0, 1, 2, 3, 28, 29, 30, 31]
     row0_nope_cuda = cuda_smem_k_nope[0, sample_nope_cols].detach().cpu()
