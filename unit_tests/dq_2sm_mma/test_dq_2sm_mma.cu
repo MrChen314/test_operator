@@ -108,7 +108,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 kerutils::tma_gather4_cta_group_2<true>(
                     &(params.tensor_map_kv),
                     smem.bar_kv_nope_ready,
-                    smem.k_nope.data() + row * 512 + col_tile * 64,
+                    // SmemLayoutKNoPE is tile-major on the 64-col axis:
+                    // row-group stride = 64, col-tile stride = (B_TOPK/2)*64.
+                    smem.k_nope.data() + row * 64 + col_tile * ((B_TOPK / 2) * 64),
+                    // smem.k_nope.data() + row * 512 + col_tile * 64,
                     col_tile * 64,
                     indices4,
                     (int64_t)TMA::CacheHintSm90::EVICT_LAST
@@ -171,9 +174,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         constexpr int ELEMENTS_PER_THREAD_NOPE = EXCHANGE_ELEMENTS_NOPE / NUM_THREADS;
 
         bf16 exchange_buffer_nope[ELEMENTS_PER_THREAD_NOPE];
+        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
 
         // Read from peer CTA's smem
         bf16* peer_k_nope = kerutils::get_peer_addr(smem.k_nope.data());
+        Tensor peer_sK_nope = make_tensor(make_smem_ptr(peer_k_nope), SmemLayoutKNoPE{});
 
         if (cta_idx == 0) {
             // CTA0: read peer's [32, 0:256]
@@ -181,7 +186,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
                 const int row = flat_idx / 256;
                 const int col = flat_idx % 256;
-                exchange_buffer_nope[i] = peer_k_nope[row * 512 + col];
+                exchange_buffer_nope[i] = peer_sK_nope(row, col);
             }
         } else {
             // CTA1: read peer's [32, 256:512]
@@ -189,7 +194,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
                 const int row = flat_idx / 256;
                 const int col = flat_idx % 256;
-                exchange_buffer_nope[i] = peer_k_nope[row * 512 + 256 + col];
+                exchange_buffer_nope[i] = peer_sK_nope(row, 256 + col);
             }
         }
 
@@ -202,7 +207,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
                 const int row = flat_idx / 256;
                 const int col = flat_idx % 256;
-                smem.k_nope.data()[row * 512 + 256 + col] = exchange_buffer_nope[i];
+                sK_nope(row, 256 + col) = exchange_buffer_nope[i];
             }
         } else {
             // CTA1: write to [32, 0:256]
@@ -210,7 +215,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
                 const int row = flat_idx / 256;
                 const int col = flat_idx % 256;
-                smem.k_nope.data()[row * 512 + col] = exchange_buffer_nope[i];
+                sK_nope(row, col) = exchange_buffer_nope[i];
             }
         }
     }
@@ -231,9 +236,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         constexpr int ELEMENTS_PER_THREAD_ROPE = EXCHANGE_ELEMENTS_ROPE / NUM_THREADS;
 
         bf16 exchange_buffer_rope[ELEMENTS_PER_THREAD_ROPE];
+        Tensor sK_rope = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
 
         // Read from peer CTA's smem
         bf16* peer_k_rope = kerutils::get_peer_addr(smem.k_rope.data());
+        Tensor peer_sK_rope = make_tensor(make_smem_ptr(peer_k_rope), SmemLayoutKRoPE{});
 
         if (cta_idx == 0) {
             // CTA0: read peer's [32, 0:32]
@@ -241,7 +248,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
                 const int row = flat_idx / 32;
                 const int col = flat_idx % 32;
-                exchange_buffer_rope[i] = peer_k_rope[row * D_ROPE + col];
+                exchange_buffer_rope[i] = peer_sK_rope(row, col);
             }
         } else {
             // CTA1: read peer's [32, 32:64]
@@ -249,7 +256,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
                 const int row = flat_idx / 32;
                 const int col = flat_idx % 32;
-                exchange_buffer_rope[i] = peer_k_rope[row * D_ROPE + 32 + col];
+                exchange_buffer_rope[i] = peer_sK_rope(row, 32 + col);
             }
         }
 
@@ -262,7 +269,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
                 const int row = flat_idx / 32;
                 const int col = flat_idx % 32;
-                smem.k_rope.data()[row * D_ROPE + 32 + col] = exchange_buffer_rope[i];
+                sK_rope(row, 32 + col) = exchange_buffer_rope[i];
             }
         } else {
             // CTA1: write to [32, 0:32]
@@ -270,7 +277,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
                 const int row = flat_idx / 32;
                 const int col = flat_idx % 32;
-                smem.k_rope.data()[row * D_ROPE + col] = exchange_buffer_rope[i];
+                sK_rope(row, col) = exchange_buffer_rope[i];
             }
         }
     }
