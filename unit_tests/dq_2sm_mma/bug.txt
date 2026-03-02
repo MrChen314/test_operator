@@ -62,37 +62,18 @@ CTA0: TMEM read done
 CTA0: TMEM freed
 CTA0: kernel finished
 Testing KV exchange accuracy...
-KV max diff: 5.828125
-KV mean diff: 0.909963
+KV max diff: 0.000000
+KV mean diff: 0.000000
 
 Testing dQ accuracy...
-dQ max diff: 38.301838
-dQ mean diff: 6.510710
-dQ relative diff: 1.633769
+dQ max diff: 41.223343
+dQ mean diff: 6.681736
+dQ relative diff: 1.782985
 Host: kernel finished
 Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 94, in <module>
+  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 75, in <module>
     test_dq_2sm_mma()
-  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 86, in test_dq_2sm_mma
-    assert kv_max_diff < 1e-2, f"KV max diff too large: {kv_max_diff}"
-           ^^^^^^^^^^^^^^^^^^
-AssertionError: KV max diff too large: 5.828125
-
-
-cuda_kv_nope[0] - ref_kv[0,:512]
-tensor([ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
-         0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,  7.5000e-01,
-         9.4922e-01, -1.6719e+00, -8.4375e-01, -1.3184e-01,  3.5156e-02,
-        -1.3594e+00,  4.9414e-01, -7.5000e-01, -9.4922e-01,  1.6719e+00,
-         8.4375e-01,  1.3184e-01, -3.5156e-02,  1.3594e+00, -4.9414e-01,...
+  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 68, in test_dq_2sm_mma
+    assert dq_max_diff < 1.0, f"dQ max diff too large: {dq_max_diff}"
+           ^^^^^^^^^^^^^^^^^
+AssertionError: dQ max diff too large: 41.22334289550781
