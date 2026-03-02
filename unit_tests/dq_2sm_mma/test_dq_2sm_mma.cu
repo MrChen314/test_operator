@@ -368,7 +368,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     // Step 2.3: Compute dQ using MMA
     // Allocate TMEM (warp 0 only)
-    if (warp_idx == 0) {
+    if (warp_idx == 0 && elect_one_sync()) {
         TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
         TMEM::Allocator2Sm().release_allocation_lock();
         if (cta_idx == 0) {
