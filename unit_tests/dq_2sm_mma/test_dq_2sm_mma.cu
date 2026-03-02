@@ -390,16 +390,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf("CTA%d: output cuda_kv done\n", cta_idx);
     }
 
-    // Step 2.5: In-place relayout k_nope for dQ MMA using cycle permutation.
-    // Logical transform:
-    //   k_nope [32,512] -> split A:[32,0:256], B:[32,256:512]
-    //   stack to [64,256], then transpose to [256,64].
+    // Step 2.5: In-place relayout k_nope / k_rope for dQ MMA using cycle permutation.
+    // k_nope logical transform:
+    //   [32,512] -> split A:[32,0:256], B:[32,256:512] -> stack [64,256] -> transpose [256,64]
+    // k_rope logical transform:
+    //   [32, 64] -> split A:[32,0:32],  B:[32,32:64]  -> stack [64, 32] -> transpose [32,64]
     {
         Tensor sK_nope_src = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
         Tensor sK_nope_dst = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
+        Tensor sK_rope_src = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
+        Tensor sK_rope_dst = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKCalcDQRoPE{});
 
         constexpr int K_NOPE_STORAGE = cosize_v<SmemLayoutKNoPE>;
         static_assert(K_NOPE_STORAGE <= 65535, "k_nope storage exceeds uint16 permutation range");
+        constexpr int K_ROPE_STORAGE = cosize_v<SmemLayoutKRoPE>;
+        static_assert(K_ROPE_STORAGE <= 65535, "k_rope storage exceeds uint16 permutation range");
 
         if (tid == 0) {
             uint16_t perm[K_NOPE_STORAGE];
@@ -455,6 +460,61 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                     }
                 }
             }
+
+            uint16_t perm_rope[K_ROPE_STORAGE];
+            uint8_t visited_rope[K_ROPE_STORAGE];
+            uint8_t used_rope[K_ROPE_STORAGE];
+
+            for (int i = 0; i < K_ROPE_STORAGE; ++i) {
+                perm_rope[i] = static_cast<uint16_t>(i);
+                visited_rope[i] = 0;
+                used_rope[i] = 0;
+            }
+
+            constexpr int N_COLS_ROPE = D_ROPE / 2;  // 32
+            constexpr int K_ROWS_ROPE = B_TOPK;       // 64
+            constexpr int HALF_ROWS_ROPE = B_TOPK / 2;  // 32
+
+            // Build physical-address permutation for k_rope:
+            // dst(n,k) <- src(k%32, n + (k/32)*32)
+            for (int n = 0; n < N_COLS_ROPE; ++n) {
+                for (int k = 0; k < K_ROWS_ROPE; ++k) {
+                    const int src_row = k % HALF_ROWS_ROPE;
+                    const int src_col = n + (k / HALF_ROWS_ROPE) * N_COLS_ROPE;
+                    bf16* src_ptr = &sK_rope_src(src_row, src_col);
+                    bf16* dst_ptr = &sK_rope_dst(n, k);
+                    const int src_off = static_cast<int>(src_ptr - smem.k_rope.data());
+                    const int dst_off = static_cast<int>(dst_ptr - smem.k_rope.data());
+                    perm_rope[src_off] = static_cast<uint16_t>(dst_off);
+                    used_rope[src_off] = 1;
+                    used_rope[dst_off] = 1;
+                }
+            }
+
+            bf16* base_rope = smem.k_rope.data();
+            for (int i = 0; i < K_ROPE_STORAGE; ++i) {
+                if (!used_rope[i] || visited_rope[i]) {
+                    continue;
+                }
+                if (perm_rope[i] == i) {
+                    visited_rope[i] = 1;
+                    continue;
+                }
+
+                int cur = i;
+                bf16 carry = base_rope[cur];
+                while (true) {
+                    const int next = static_cast<int>(perm_rope[cur]);
+                    visited_rope[cur] = 1;
+                    bf16 next_val = base_rope[next];
+                    base_rope[next] = carry;
+                    carry = next_val;
+                    cur = next;
+                    if (cur == i) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -462,7 +522,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     __syncthreads();
 
     if (tid == 0) {
-        printf("CTA%d: k_nope relayout for dQ done\n", cta_idx);
+        printf("CTA%d: k_nope/k_rope relayout for dQ done\n", cta_idx);
     }
 
     // Step 2.3: Compute dQ using MMA
