@@ -5,75 +5,18 @@ Host: kernel launched
 CTA0: kernel started
 CTA1: kernel started
 CTA0: barriers initialized
-CTA1: after cluster_sync 1
 CTA0: after cluster_sync 1
-CTA1: ds loaded
+CTA1: after cluster_sync 1
 CTA0: ds loaded
+CTA1: ds loaded
 CTA0: starting TMA load
 CTA0: k_nope loaded
 CTA0: k_rope loaded
-CTA1: after TMA load cluster_sync
 CTA0: after TMA load cluster_sync
+CTA1: after TMA load cluster_sync
 CTA1: k_nope exchange done
 CTA0: k_nope exchange done
 CTA0: k_rope exchange done
 CTA1: k_rope exchange done
 CTA0: output cuda_kv done
 CTA1: output cuda_kv done
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA0: TMEM allocated
-CTA1: before reading TMEM
-CTA0: starting MMA computation
-CTA1: TMEM read done
-CTA0: MMA computation done
-CTA1: kernel finished
-CTA0: before reading TMEM
-CTA0: TMEM read done
-CTA0: TMEM freed
-CTA0: kernel finished
-Testing KV exchange accuracy...
-KV max diff: 0.000000
-KV mean diff: 0.000000
-
-Testing dQ accuracy...
-dQ max diff: 41.223343
-dQ mean diff: 6.681736
-dQ relative diff: 1.782985
-Host: kernel finished
-Traceback (most recent call last):
-  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 75, in <module>
-    test_dq_2sm_mma()
-  File "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.py", line 68, in test_dq_2sm_mma
-    assert dq_max_diff < 1.0, f"dQ max diff too large: {dq_max_diff}"
-           ^^^^^^^^^^^^^^^^^
-AssertionError: dQ max diff too large: 41.22334289550781
