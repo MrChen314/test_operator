@@ -71,14 +71,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int ds_cols = B_TOPK;   // 64
     const int ds_elements = ds_rows * ds_cols;  // 4096
     const int ds_elements_per_thread = ds_elements / NUM_THREADS;  // 32
+    Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
 
     for (int i = 0; i < ds_elements_per_thread; ++i) {
         const int flat_idx = tid * ds_elements_per_thread + i;
         const int row = flat_idx / ds_cols;
         const int col = flat_idx % ds_cols;
         const int global_row = cta_idx * ds_rows + row;
-        // Store transposed: smem[col][row]
-        smem.ds_t.data()[col * ds_rows + row] = ds[global_row * ds_cols + col];
+        // Use layout-aware tensor accessor so swizzle/interleave mapping is respected.
+        sDS_t(row, col) = ds[global_row * ds_cols + col];
     }
 
     fence_view_async_shared();
@@ -91,8 +92,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     // Step 1.1: Output ds_t from smem to global for verification.
     // Global layout: cuda_smem_ds_t[col, global_row] with shape [B_TOPK, B_H].
     if (cuda_smem_ds_t != nullptr) {
-        Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
-
         const int elements_per_cta = ds_rows * ds_cols;  // 64 * 64
         const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
         for (int i = 0; i < elements_per_thread; ++i) {
