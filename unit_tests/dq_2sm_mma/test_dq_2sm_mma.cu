@@ -390,35 +390,70 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf("CTA%d: output cuda_kv done\n", cta_idx);
     }
 
-    // Step 2.5: Relayout k_nope for dQ MMA.
-    // Desired logical transform:
-    //   k_nope [32,512] -> split columns:
-    //     A = [32,0:256], B = [32,256:512]
-    //   stack A/B to [64,256], then transpose to [256,64].
+    // Step 2.5: In-place relayout k_nope for dQ MMA using cycle permutation.
+    // Logical transform:
+    //   k_nope [32,512] -> split A:[32,0:256], B:[32,256:512]
+    //   stack to [64,256], then transpose to [256,64].
     {
-        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
-        Tensor sK_nope_t_relayout = make_tensor(
-            make_smem_ptr(smem.k_nope_dq.data()),
-            SmemLayoutKCalcDQNoPE{}
-        );  // [256, 64]
+        Tensor sK_nope_src = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
+        Tensor sK_nope_dst = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
 
-        constexpr int N_COLS = 256;
-        constexpr int K_ROWS = B_TOPK;  // 64
-        constexpr int HALF_ROWS = B_TOPK / 2;  // 32
-        const int elements_per_cta = N_COLS * K_ROWS;
-        const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
+        constexpr int K_NOPE_STORAGE = cosize_v<SmemLayoutKNoPE>;
+        static_assert(K_NOPE_STORAGE <= 65535, "k_nope storage exceeds uint16 permutation range");
 
-        for (int i = 0; i < elements_per_thread; ++i) {
-            const int flat_idx = tid * elements_per_thread + i;
-            if (flat_idx < elements_per_cta) {
-                const int n = flat_idx / K_ROWS;  // 0..255
-                const int k = flat_idx % K_ROWS;  // 0..63
+        if (tid == 0) {
+            uint16_t perm[K_NOPE_STORAGE];
+            uint8_t visited[K_NOPE_STORAGE];
+            uint8_t used[K_NOPE_STORAGE];
 
-                // k in [0,31] comes from A[row=k, col=n]
-                // k in [32,63] comes from B[row=k-32, col=n+256]
-                const int src_row = k % HALF_ROWS;
-                const int src_col = n + (k / HALF_ROWS) * 256;
-                sK_nope_t_relayout(n, k) = sK_nope(src_row, src_col);
+            for (int i = 0; i < K_NOPE_STORAGE; ++i) {
+                perm[i] = static_cast<uint16_t>(i);
+                visited[i] = 0;
+                used[i] = 0;
+            }
+
+            constexpr int N_COLS = 256;
+            constexpr int K_ROWS = B_TOPK;        // 64
+            constexpr int HALF_ROWS = B_TOPK / 2; // 32
+
+            // Build physical-address permutation: source(slot in K layout) -> destination(slot in MN layout).
+            for (int n = 0; n < N_COLS; ++n) {
+                for (int k = 0; k < K_ROWS; ++k) {
+                    const int src_row = k % HALF_ROWS;
+                    const int src_col = n + (k / HALF_ROWS) * 256;
+                    bf16* src_ptr = &sK_nope_src(src_row, src_col);
+                    bf16* dst_ptr = &sK_nope_dst(n, k);
+                    const int src_off = static_cast<int>(src_ptr - smem.k_nope.data());
+                    const int dst_off = static_cast<int>(dst_ptr - smem.k_nope.data());
+                    perm[src_off] = static_cast<uint16_t>(dst_off);
+                    used[src_off] = 1;
+                    used[dst_off] = 1;
+                }
+            }
+
+            bf16* base = smem.k_nope.data();
+            for (int i = 0; i < K_NOPE_STORAGE; ++i) {
+                if (!used[i] || visited[i]) {
+                    continue;
+                }
+                if (perm[i] == i) {
+                    visited[i] = 1;
+                    continue;
+                }
+
+                int cur = i;
+                bf16 carry = base[cur];
+                while (true) {
+                    const int next = static_cast<int>(perm[cur]);
+                    visited[cur] = 1;
+                    bf16 next_val = base[next];
+                    base[next] = carry;
+                    carry = next_val;
+                    cur = next;
+                    if (cur == i) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -449,7 +484,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
         // Prepare tensors
         Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
-        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope_dq.data()), SmemLayoutKCalcDQNoPE{});
+        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
         Tensor sK_rope_t = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKCalcDQRoPE{});
 
         // Allocate TMEM for dQ
