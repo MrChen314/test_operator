@@ -377,8 +377,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     }
     __syncthreads();
 
-    // Compute dQ (elected warp only)
-    if (warp_idx == 0 && elect_one_sync()) {
+    // Compute dQ (2x1SM launch discipline: only CTA0 launches)
+    if (cta_idx == 0 && warp_idx == 0 && elect_one_sync()) {
         if (cta_idx == 0) {
             printf("CTA0: starting MMA computation\n");
         }
@@ -402,14 +402,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         ku::utcmma_ss(tiled_mma_dQ, sDS_t, sK_nope_t, tdQ, true);
         ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t, sK_rope_t, tdQ_RoPE, true);
 
-        ku::tcgen05_after_thread_sync();
-
         if (cta_idx == 0) {
             printf("CTA0: MMA computation done\n");
         }
     }
 
+    ku::tcgen05_after_thread_sync();
     __syncthreads();
+    cluster_sync();
 
     if (tid == 0) {
         printf("CTA%d: before reading TMEM\n", cta_idx);
@@ -417,32 +417,62 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     // Read dQ from TMEM and write to global memory (all threads participate)
     {
+        constexpr int DQ_ROWS_PER_CTA = B_H / 2;          // 64
+        constexpr int NOPE_FLOATS_PER_HALF = 256 / 2;     // 128
+        constexpr int NOPE_CHUNKS = 8;
+        constexpr int NOPE_CHUNK_FLOATS = NOPE_FLOATS_PER_HALF / NOPE_CHUNKS;  // 16
+        constexpr int NOPE_CHUNK_FLOAT2 = NOPE_CHUNK_FLOATS / 2;                // 8
+        constexpr int ROPE_FLOAT2_PER_ROW = D_ROPE / 2 / 2;                     // 16
+
         const uint32_t tmem_base = smem.tmem_start_addr.data()[0];
-        const int row_in_cta = tid % (B_H / 2);
-        const int global_row = cta_idx * (B_H / 2) + row_in_cta;
+        const int row_in_cta = tid % DQ_ROWS_PER_CTA;
+        const int col_half = tid / DQ_ROWS_PER_CTA;  // 0 or 1
+        const int global_row = cta_idx * DQ_ROWS_PER_CTA + row_in_cta;
 
-        // Read dQ NoPE part (512 elements)
-        for (int col_chunk = 0; col_chunk < 2; ++col_chunk) {
-            const uint32_t tmem_addr = tmem_base + (row_in_cta << 16) + tmem_cols::dQ + col_chunk * 128;
-            float2 dq_data[16];
-            ku::tmem_ld_32dp32bNx<32>(tmem_addr, dq_data);
+        const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
+        const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+
+        // dQ NoPE part0: cols [0, 255]
+        for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
+            const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
+            float2 dq_chunk[NOPE_CHUNK_FLOAT2];
+            ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq0 + chunk_col_base, dq_chunk);
             cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
 
-            for (int i = 0; i < 16; ++i) {
-                dQ_out[global_row * D_Q + col_chunk * 256 + i * 2] = dq_data[i].x;
-                dQ_out[global_row * D_Q + col_chunk * 256 + i * 2 + 1] = dq_data[i].y;
+            for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
+                const int col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                dQ_out[global_row * D_Q + col] = dq_chunk[i].x;
+                dQ_out[global_row * D_Q + col + 1] = dq_chunk[i].y;
             }
         }
 
-        // Read dQ RoPE part (64 elements)
-        const uint32_t tmem_addr_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
-        float2 dq_rope_data[16];
-        ku::tmem_ld_32dp32bNx<32>(tmem_addr_rope, dq_rope_data);
-        cutlass::arch::fence_view_async_tmem_load();
+        // dQ NoPE part1: cols [256, 511]
+        for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
+            const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
+            float2 dq_chunk[NOPE_CHUNK_FLOAT2];
+            ku::tmem_ld_32dp32bNx<NOPE_CHUNK_FLOATS>(tmem_addr_dq1 + chunk_col_base, dq_chunk);
+            cutlass::arch::fence_view_async_tmem_load();
+            ku::tcgen05_before_thread_sync();
 
-        for (int i = 0; i < 16; ++i) {
-            dQ_out[global_row * D_Q + 512 + i * 2] = dq_rope_data[i].x;
-            dQ_out[global_row * D_Q + 512 + i * 2 + 1] = dq_rope_data[i].y;
+            for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
+                const int col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                dQ_out[global_row * D_Q + col] = dq_chunk[i].x;
+                dQ_out[global_row * D_Q + col + 1] = dq_chunk[i].y;
+            }
+        }
+
+        // dQ RoPE: cols [512, 575]
+        const uint32_t tmem_addr_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+        float2 dq_rope[ROPE_FLOAT2_PER_ROW];
+        ku::tmem_ld_32dp32bNx<D_ROPE / 2>(tmem_addr_rope, dq_rope);
+        cutlass::arch::fence_view_async_tmem_load();
+        ku::tcgen05_before_thread_sync();
+
+        for (int i = 0; i < ROPE_FLOAT2_PER_ROW; ++i) {
+            const int col = 512 + col_half * (D_ROPE / 2) + i * 2;
+            dQ_out[global_row * D_Q + col] = dq_rope[i].x;
+            dQ_out[global_row * D_Q + col + 1] = dq_rope[i].y;
         }
     }
 
