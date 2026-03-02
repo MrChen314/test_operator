@@ -47,7 +47,7 @@ include_dirs = [
 
 ext_modules = [
     CUDAExtension(
-        name="dq_2sm_mma_cuda",
+        name="test_dq_2sm_mma",
         sources=["test_dq_2sm_mma.cu"],
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
         include_dirs=include_dirs,
@@ -55,7 +55,7 @@ ext_modules = [
 ]
 
 setup(
-    name="dq_2sm_mma_cuda",
+    name="test_dq_2sm_mma",
     version="1.0.0",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
