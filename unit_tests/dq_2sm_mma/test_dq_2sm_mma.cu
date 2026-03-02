@@ -125,6 +125,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         }
 
         // Load KV RoPE part: [32, 64]
+        // Each CTA loads full 64 columns of RoPE data in one TMA call
         for (int row = 0; row < B_TOPK / 2; row += 4) {
             int4 indices4;
             indices4.x = __ldg(cta_indices + row + 0);
@@ -133,10 +134,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             indices4.w = __ldg(cta_indices + row + 3);
 
             kerutils::tma_gather4_cta_group_2<true>(
-                &(params.tensor_map_kv_rope32),
+                &(params.tensor_map_kv_rope),
                 smem.bar_kv_rope_ready,
-                smem.k_rope.data() + row * 64,
-                512,  // offset to RoPE part in global memory
+                smem.k_rope.data() + row * D_ROPE,
+                512,  // Start from column 512 (RoPE part)
                 indices4,
                 (int64_t)TMA::CacheHintSm90::EVICT_LAST
             );
@@ -473,7 +474,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     auto indices_i32 = indices.to(torch::kInt32);
 
     // Create tensor maps for TMA
-    CUtensorMap tensor_map_kv, tensor_map_kv_rope32;
+    CUtensorMap tensor_map_kv, tensor_map_kv_rope;
 
     // Tensor map for k_nope (box_size = 64)
     {
@@ -499,15 +500,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
         KU_ASSERT(res == CUresult::CUDA_SUCCESS);
     }
 
-    // Tensor map for k_rope (box_size = 32)
+    // Tensor map for k_rope (box_size = 64, same as k_nope)
     {
         uint64_t size[2] = {(uint64_t)D_K, (uint64_t)kv.size(0)};
         uint64_t stride[1] = {(uint64_t)kv.stride(0) * sizeof(bf16)};
-        uint32_t box_size[2] = {32, 1};
+        uint32_t box_size[2] = {64, 1};  // Changed from 32 to 64
         uint32_t elem_stride[2] = {1, 1};
 
         CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-            &tensor_map_kv_rope32,
+            &tensor_map_kv_rope,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             2,
             (bf16*)kv.data_ptr(),
@@ -525,7 +526,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
 
     printf("Host: tensor maps created\n");
 
-    KernelParams params{tensor_map_kv, tensor_map_kv_rope32};
+    KernelParams params{tensor_map_kv, tensor_map_kv_rope};
 
     auto kernel = &dq_2sm_mma_kernel<KernelParams>;
     dim3 grid(2, 1, 1);
