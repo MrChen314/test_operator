@@ -95,11 +95,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         }
         const int32_t* cta_indices = indices + cta_idx * (B_TOPK / 2);
 
-        // Only CTA0 calls arrive_and_expect_tx because tma_gather4_cta_group_2<true> uses CTA0's barrier
-        if (cta_idx == 0) {
-            smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK* 512 * sizeof(bf16));  // Both CTAs' data
-        }
-
         // Load KV NoPE part: [32, 512]
         for (int row = 0; row < B_TOPK / 2; row += 4) {
             int4 indices4;
@@ -121,16 +116,12 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             }
         }
 
-        smem.bar_kv_nope_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
-
+        // Only CTA0 waits for TMA completion
         if (cta_idx == 0) {
+            smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK * 512 * sizeof(bf16));
+            smem.bar_kv_nope_ready.wait(0);
+            ku::tcgen05_after_thread_sync();
             printf("CTA0: k_nope loaded\n");
-        }
-
-        // Only CTA0 calls arrive_and_expect_tx for RoPE
-        if (cta_idx == 0) {
-            smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));  // Both CTAs' data
         }
 
         // Load KV RoPE part: [32, 64]
@@ -151,10 +142,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             );
         }
 
-        smem.bar_kv_rope_ready.wait(0);
-        ku::tcgen05_after_thread_sync();
-
+        // Only CTA0 waits for TMA completion
         if (cta_idx == 0) {
+            smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));
+            smem.bar_kv_rope_ready.wait(0);
+            ku::tcgen05_after_thread_sync();
             printf("CTA0: k_rope loaded\n");
         }
     }
