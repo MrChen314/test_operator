@@ -82,7 +82,7 @@ struct tmem_cols {
 
 struct KernelParams {
     CUtensorMap tensor_map_kv;
-    CUtensorMap tensor_map_kv_rope32;
+    CUtensorMap tensor_map_kv_rope;
 };
 
 struct alignas(128) SharedMemory {

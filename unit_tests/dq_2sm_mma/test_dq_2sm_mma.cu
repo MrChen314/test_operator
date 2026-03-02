@@ -290,6 +290,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     // k_rope: CTA0: smem[32, 0:32] -> global[0:32, 0:32], smem[32, 32:64] -> global[32:64, 0:32]
     //         CTA1: smem[32, 0:32] -> global[0:32, 32:64], smem[32, 32:64] -> global[32:64, 32:64]
     if (cuda_smem_k_nope != nullptr) {
+        // Create tensor view for smem
+        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
+
         // Each CTA outputs 32*512 = 16384 elements
         const int elements_per_cta = (B_TOPK / 2) * 512;
         const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
@@ -312,12 +315,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                     global_col = cta_idx * 256 + (local_col - 256);
                 }
 
-                cuda_smem_k_nope[global_row * 512 + global_col] = smem.k_nope.data()[flat_idx];
+                // Use tensor accessor to handle swizzled layout
+                cuda_smem_k_nope[global_row * 512 + global_col] = sK_nope(local_row, local_col);
             }
         }
     }
 
     if (cuda_smem_k_rope != nullptr) {
+        // Create tensor view for smem
+        Tensor sK_rope = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
+
         // Each CTA outputs 32*64 = 2048 elements
         const int elements_per_cta = (B_TOPK / 2) * D_ROPE;
         const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
@@ -340,7 +347,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                     global_col = cta_idx * 32 + (local_col - 32);
                 }
 
-                cuda_smem_k_rope[global_row * D_ROPE + global_col] = smem.k_rope.data()[flat_idx];
+                // Use tensor accessor to handle swizzled layout
+                cuda_smem_k_rope[global_row * D_ROPE + global_col] = sK_rope(local_row, local_col);
             }
         }
     }
