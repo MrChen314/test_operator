@@ -591,7 +591,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
         const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
-        // dQ NoPE part0: cols [0, 255]
+        // dQ NoPE part0:
+        //   col_half==0 -> cols [0,127]
+        //   col_half==1 -> cols [256,383]
         for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
             const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
             float2 dq_chunk[NOPE_CHUNK_FLOAT2];
@@ -600,13 +602,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             ku::tcgen05_before_thread_sync();
 
             for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
-                const int col = col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                const int part0_base = (col_half == 0) ? 0 : 256;
+                const int col = part0_base + chunk_col_base + i * 2;
                 dQ_out[global_row * D_Q + col] = dq_chunk[i].x;
                 dQ_out[global_row * D_Q + col + 1] = dq_chunk[i].y;
             }
         }
 
-        // dQ NoPE part1: cols [256, 511]
+        // dQ NoPE part1:
+        //   col_half==0 -> cols [128,255]
+        //   col_half==1 -> cols [384,511]
         for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
             const int chunk_col_base = chunk * NOPE_CHUNK_FLOATS;
             float2 dq_chunk[NOPE_CHUNK_FLOAT2];
@@ -615,7 +620,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             ku::tcgen05_before_thread_sync();
 
             for (int i = 0; i < NOPE_CHUNK_FLOAT2; ++i) {
-                const int col = 256 + col_half * NOPE_FLOATS_PER_HALF + chunk_col_base + i * 2;
+                const int part1_base = (col_half == 0) ? 128 : 384;
+                const int col = part1_base + chunk_col_base + i * 2;
                 dQ_out[global_row * D_Q + col] = dq_chunk[i].x;
                 dQ_out[global_row * D_Q + col + 1] = dq_chunk[i].y;
             }
