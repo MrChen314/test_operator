@@ -14,8 +14,10 @@
    - 2.1 读取 ds 到 smem.ds_t (转置存储)
    - 2.2 使用 TMA gather4 加载 kv
      - CTA0 和 CTA1 各加载 [32, 576] 的 kv 数据
-     - 交换 CTA0 的 k_nope[32, 256:512] 与 CTA1 的 k_nope[32, 0:256]
-     - 每个线程处理 64 个 bf16 元素 (32 * 256 / 128 = 64)
+     - 交换 k_nope: CTA0 的 [32, 256:512] ↔ CTA1 的 [32, 0:256]
+       - 每个线程处理 64 个 bf16 元素 (32 * 256 / 128 = 64)
+     - 交换 k_rope: CTA0 的 [32, 32:64] ↔ CTA1 的 [32, 0:32]
+       - 每个线程处理 8 个 bf16 元素 (32 * 32 / 128 = 8)
      - 交换完成后写入各自的 smem
    - 2.3 将交换完成的 k_smem 输出到全局内存 cuda_kv，用于精度验证
    - 2.4 计算 dQ = dS^T @ K
@@ -43,18 +45,21 @@
 ### 交换操作
 
 **交换的数据**:
-- CTA0 的 k_nope[32, 256:512] ↔ CTA1 的 k_nope[32, 0:256]
-- 交换数据量: 32 * 256 = 8192 个 bf16 元素
-- 每个线程处理: 8192 / 128 = 64 个 bf16 元素
+- k_nope: CTA0 的 [32, 256:512] ↔ CTA1 的 [32, 0:256]
+  - 交换数据量: 32 * 256 = 8192 个 bf16 元素
+  - 每个线程处理: 8192 / 128 = 64 个 bf16 元素
+- k_rope: CTA0 的 [32, 32:64] ↔ CTA1 的 [32, 0:32]
+  - 交换数据量: 32 * 32 = 1024 个 bf16 元素
+  - 每个线程处理: 1024 / 128 = 8 个 bf16 元素
 
 **交换步骤**:
-1. 每个线程从 peer CTA 的 smem 读取 64 个元素到 exchange_buffer
-   - CTA0 读取 peer 的 [32, 0:256]
-   - CTA1 读取 peer 的 [32, 256:512]
+1. 每个线程从 peer CTA 的 smem 读取数据到 exchange_buffer
+   - k_nope: CTA0 读取 peer 的 [32, 0:256]，CTA1 读取 peer 的 [32, 256:512]
+   - k_rope: CTA0 读取 peer 的 [32, 0:32]，CTA1 读取 peer 的 [32, 32:64]
 2. cluster_sync() 确保所有线程读取完成
 3. 每个线程将 exchange_buffer 写入本地 smem
-   - CTA0 写入 [32, 256:512]
-   - CTA1 写入 [32, 0:256]
+   - k_nope: CTA0 写入 [32, 256:512]，CTA1 写入 [32, 0:256]
+   - k_rope: CTA0 写入 [32, 32:64]，CTA1 写入 [32, 0:32]
 
 ### 交换后的数据分布
 
@@ -66,9 +71,13 @@
 - [32, 0:256]: 从 CTA0 交换来的数据 (indices[0:32] 的 kv[:, 256:512])
 - [32, 256:512]: 原始加载的数据 (indices[32:64] 的 kv[:, 256:512])
 
-**k_rope 不交换**:
-- CTA0: [32, 64] (indices[0:32] 的 kv[:, 512:576])
-- CTA1: [32, 64] (indices[32:64] 的 kv[:, 512:576])
+**CTA0 的 smem.k_rope [32, 64]**:
+- [32, 0:32]: 原始加载的数据 (indices[0:32] 的 kv[:, 512:544])
+- [32, 32:64]: 从 CTA1 交换来的数据 (indices[32:64] 的 kv[:, 512:544])
+
+**CTA1 的 smem.k_rope [32, 64]**:
+- [32, 0:32]: 从 CTA0 交换来的数据 (indices[0:32] 的 kv[:, 544:576])
+- [32, 32:64]: 原始加载的数据 (indices[32:64] 的 kv[:, 544:576])
 
 ### 输出到 Global Memory 的映射关系
 
@@ -90,15 +99,22 @@ smem[0:32, 256:512] → global[32:64, 256:512] (原始数据)
 
 **k_rope 部分 [64, 64]**:
 
+CTA0 输出映射:
 ```
-CTA0: smem[0:32, 0:64] → global[0:32,  0:64]
-CTA1: smem[0:32, 0:64] → global[32:64, 0:64]
+smem[0:32, 0:32]  → global[0:32,  0:32]  (原始数据)
+smem[0:32, 32:64] → global[32:64, 0:32]  (交换来的数据)
+```
+
+CTA1 输出映射:
+```
+smem[0:32, 0:32]  → global[0:32,  32:64] (交换来的数据)
+smem[0:32, 32:64] → global[32:64, 32:64] (原始数据)
 ```
 
 ### 输出逻辑伪代码
 
 ```cpp
-// CTA0 和 CTA1 各自处理
+// k_nope 输出
 for each element in local smem[32, 512]:
     local_row = element_idx / 512  // 0-31
     local_col = element_idx % 512  // 0-511
@@ -112,14 +128,36 @@ for each element in local smem[32, 512]:
         global_row = 32 + local_row
         global_col = cta_idx * 256 + (local_col - 256)
 
-    cuda_kv[global_row, global_col] = smem[local_row, local_col]
+    cuda_kv_nope[global_row, global_col] = smem[local_row, local_col]
+
+// k_rope 输出
+for each element in local smem[32, 64]:
+    local_row = element_idx / 64   // 0-31
+    local_col = element_idx % 64   // 0-63
+
+    if (local_col < 32):
+        // 前半列 → 输出到前 32 行
+        global_row = local_row
+        global_col = cta_idx * 32 + local_col
+    else:
+        // 后半列 → 输出到后 32 行
+        global_row = 32 + local_row
+        global_col = cta_idx * 32 + (local_col - 32)
+
+    cuda_kv_rope[global_row, global_col] = smem[local_row, local_col]
 ```
 
 ### 为什么需要这样交换？
 
 这种交换模式是为了让每个 CTA 在计算 dQ 时能够访问到完整的列范围:
+
+**k_nope 交换**:
 - CTA0 负责计算 dQ[:, 0:256]，需要 K 的所有行的 [0:256] 列
 - CTA1 负责计算 dQ[:, 256:512]，需要 K 的所有行的 [256:512] 列
+
+**k_rope 交换**:
+- CTA0 负责计算 dQ[:, 512:544]，需要 K 的所有行的 [512:544] 列
+- CTA1 负责计算 dQ[:, 544:576]，需要 K 的所有行的 [544:576] 列
 
 交换后，每个 CTA 的 smem 包含了它计算所需的完整数据，无需在计算过程中再访问 peer smem。
 

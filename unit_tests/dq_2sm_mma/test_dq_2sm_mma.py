@@ -33,16 +33,26 @@ def test_dq_2sm_mma():
     # Step 2: Exchange data between first and second half
     # CTA0 handles indices[0:32], CTA1 handles indices[32:64]
     # After exchange:
+    # k_nope:
     # - CTA0's k_nope[:, 256:512] comes from CTA1's k_nope[:, 0:256]
     # - CTA1's k_nope[:, 0:256] comes from CTA0's k_nope[:, 256:512]
+    # k_rope:
+    # - CTA0's k_rope[:, 32:64] comes from CTA1's k_rope[:, 0:32]
+    # - CTA1's k_rope[:, 0:32] comes from CTA0's k_rope[:, 32:64]
 
     ref_kv = kv_gathered.clone()
+
+    # Exchange k_nope
     kv_nope_cta0 = ref_kv[0:32, 0:512].clone()
     kv_nope_cta1 = ref_kv[32:64, 0:512].clone()
-
-    # Exchange
     ref_kv[0:32, 256:512] = kv_nope_cta1[:, 0:256]
     ref_kv[32:64, 0:256] = kv_nope_cta0[:, 256:512]
+
+    # Exchange k_rope
+    kv_rope_cta0 = ref_kv[0:32, 512:576].clone()
+    kv_rope_cta1 = ref_kv[32:64, 512:576].clone()
+    ref_kv[0:32, 544:576] = kv_rope_cta1[:, 0:32]
+    ref_kv[32:64, 512:544] = kv_rope_cta0[:, 32:64]
 
     # Verify cuda_kv matches ref_kv
     cuda_kv_full = torch.cat([cuda_kv_nope, cuda_kv_rope], dim=1)  # [B_TOPK, 576]

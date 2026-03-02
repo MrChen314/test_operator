@@ -60,7 +60,7 @@ using SmemLayoutKCalcDQNoPE = decltype(coalesce(tile_to_shape(
 ), Shape<_1, _1>{}));
 
 using SmemLayoutKCalcDQRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    UMMA::Layout_MN_SW64_Atom<bf16>{},
     Shape<Int<D_ROPE / 2>, Int<B_TOPK>>{},
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
