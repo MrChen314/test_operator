@@ -24,7 +24,21 @@ def test_dq_2sm_mma():
     indices = torch.randint(0, s_kv, (B_TOPK,), dtype=torch.int32, device=device)
 
     # Run CUDA kernel
-    dQ_cuda, cuda_kv_nope, cuda_kv_rope = run_dq_2sm_mma(ds, kv, indices)
+    dQ_cuda, cuda_kv_nope, cuda_kv_rope, cuda_ds_t = run_dq_2sm_mma(ds, kv, indices)
+
+    # Step 0: Verify ds_t accuracy
+    # Kernel exports smem.ds_t as [B_TOPK, B_H], which should match ds^T.
+    ds_ref = ds.transpose(0, 1).contiguous()
+
+    print("Testing ds_t load accuracy...")
+    ds_t_diff = (cuda_ds_t.float() - ds_ref.float()).abs()
+    ds_t_max_diff = ds_t_diff.max().item()
+    ds_t_mean_diff = ds_t_diff.mean().item()
+    ds_t_rel_diff = (ds_t_diff / (ds_ref.float().abs() + 1e-6)).mean().item()
+
+    print(f"ds_t max diff: {ds_t_max_diff:.6f}")
+    print(f"ds_t mean diff: {ds_t_mean_diff:.6f}")
+    print(f"ds_t relative diff: {ds_t_rel_diff:.6f}")
 
     # Compute reference
     # Step 1: Gather KV according to indices
@@ -64,6 +78,8 @@ def test_dq_2sm_mma():
     print(f"dQ relative diff: {dq_rel_diff:.6f}")
 
     # Check thresholds
+    assert ds_t_max_diff < 1e-2, f"ds_t max diff too large: {ds_t_max_diff}"
+    assert ds_t_rel_diff < 1e-3, f"ds_t relative diff too large: {ds_t_rel_diff}"
     assert kv_max_diff < 1e-2, f"KV max diff too large: {kv_max_diff}"
     assert dq_max_diff < 1.0, f"dQ max diff too large: {dq_max_diff}"
     assert dq_rel_diff < 0.01, f"dQ relative diff too large: {dq_rel_diff}"

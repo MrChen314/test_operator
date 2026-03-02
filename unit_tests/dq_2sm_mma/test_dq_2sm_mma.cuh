@@ -106,12 +106,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const bf16* __restrict__ kv,      // [s_kv, D_K]
     const int32_t* __restrict__ indices,  // [B_TOPK] = [64]
     float* __restrict__ dQ_out,       // [B_H, D_Q] = [128, 576]
-    bf16* __restrict__ cuda_smem_k_nope,  // [B_TOPK, 256]
-    bf16* __restrict__ cuda_smem_k_rope,  // [B_TOPK, D_ROPE/2]
+    bf16* __restrict__ cuda_smem_k_nope,  // [B_TOPK, 512]
+    bf16* __restrict__ cuda_smem_k_rope,  // [B_TOPK, D_ROPE]
+    bf16* __restrict__ cuda_smem_ds_t,    // [B_TOPK, B_H]
     __grid_constant__ const Params params
 );
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     torch::Tensor ds,      // [128, 64], bf16
     torch::Tensor kv,      // [s_kv, 576], bf16
     torch::Tensor indices  // [64], int32/int64

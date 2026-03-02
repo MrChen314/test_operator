@@ -27,6 +27,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     float* __restrict__ dQ_out,       // [B_H, D_Q] = [128, 576]
     bf16* __restrict__ cuda_smem_k_nope,  // [B_TOPK, 512] for verification
     bf16* __restrict__ cuda_smem_k_rope,  // [B_TOPK, D_ROPE] for verification
+    bf16* __restrict__ cuda_smem_ds_t,    // [B_TOPK, B_H] for verification
     __grid_constant__ const Params params
 ) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200))
@@ -85,6 +86,30 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     if (tid == 0) {
         printf("CTA%d: ds loaded\n", cta_idx);
+    }
+
+    // Step 1.1: Output ds_t from smem to global for verification.
+    // Global layout: cuda_smem_ds_t[col, global_row] with shape [B_TOPK, B_H].
+    if (cuda_smem_ds_t != nullptr) {
+        Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
+
+        const int elements_per_cta = ds_rows * ds_cols;  // 64 * 64
+        const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
+        for (int i = 0; i < elements_per_thread; ++i) {
+            const int flat_idx = tid * elements_per_thread + i;
+            if (flat_idx < elements_per_cta) {
+                const int local_row = flat_idx / ds_cols;  // 0-63
+                const int local_col = flat_idx % ds_cols;  // 0-63
+                const int global_row = cta_idx * ds_rows + local_row;  // 0-127
+                cuda_smem_ds_t[local_col * B_H + global_row] = sDS_t(local_row, local_col);
+            }
+        }
+    }
+
+    __syncthreads();
+
+    if (tid == 0) {
+        printf("CTA%d: output ds_t done\n", cta_idx);
     }
 
     // Step 2: Load KV using TMA gather4
@@ -368,7 +393,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     // Step 2.3: Compute dQ using MMA
     // Allocate TMEM (warp 0 only)
-    if (warp_idx == 0 && elect_one_sync()) {
+    if (warp_idx == 0) {
         TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
         TMEM::Allocator2Sm().release_allocation_lock();
         if (cta_idx == 0) {
@@ -496,7 +521,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 #endif
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     torch::Tensor ds,      // [128, 64], bf16
     torch::Tensor kv,      // [s_kv, 576], bf16
     torch::Tensor indices  // [64], int32/int64
@@ -514,6 +539,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     auto dQ = torch::zeros({B_H, D_Q}, torch::dtype(torch::kFloat32).device(ds.device()));
     auto cuda_kv_nope = torch::zeros({B_TOPK, 512}, torch::dtype(torch::kBFloat16).device(ds.device()));
     auto cuda_kv_rope = torch::zeros({B_TOPK, D_ROPE}, torch::dtype(torch::kBFloat16).device(ds.device()));
+    auto cuda_ds_t = torch::zeros({B_TOPK, B_H}, torch::dtype(torch::kBFloat16).device(ds.device()));
 
     // Convert indices to int32 if needed
     auto indices_i32 = indices.to(torch::kInt32);
@@ -586,6 +612,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     float* dQ_ptr = (float*)dQ.data_ptr();
     bf16* cuda_kv_nope_ptr = (bf16*)cuda_kv_nope.data_ptr();
     bf16* cuda_kv_rope_ptr = (bf16*)cuda_kv_rope.data_ptr();
+    bf16* cuda_ds_t_ptr = (bf16*)cuda_ds_t.data_ptr();
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
@@ -605,7 +632,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     config.numAttrs = 1;
 
     cudaError_t err = cudaLaunchKernelEx(&config, kernel,
-        ds_ptr, kv_ptr, indices_ptr, dQ_ptr, cuda_kv_nope_ptr, cuda_kv_rope_ptr, params);
+        ds_ptr, kv_ptr, indices_ptr, dQ_ptr, cuda_kv_nope_ptr, cuda_kv_rope_ptr, cuda_ds_t_ptr, params);
 
     printf("Host: kernel launched\n");
 
@@ -616,7 +643,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     cudaDeviceSynchronize();
     printf("Host: kernel finished\n");
 
-    return std::make_tuple(dQ, cuda_kv_nope, cuda_kv_rope);
+    return std::make_tuple(dQ, cuda_kv_nope, cuda_kv_rope, cuda_ds_t);
 }
 
 }  // namespace test_operator::dq_2sm_mma
