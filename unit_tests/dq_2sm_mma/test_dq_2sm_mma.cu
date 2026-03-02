@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
@@ -15,6 +16,8 @@ namespace test_operator::dq_2sm_mma {
 
 using namespace cute;
 using bf16 = cutlass::bfloat16_t;
+using cutlass::arch::fence_barrier_init;
+using cutlass::arch::fence_view_async_shared;
 
 template <typename Params>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
@@ -37,7 +40,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int warp_idx = cutlass::canonical_warp_idx_sync();
 
     // Initialize barriers (only CTA0 thread 0)
-    if (tid == 0 && cta_idx == 0) {
+    if (warp_idx == 0 && elect_one_sync()) {
         smem.bar_kv_nope_ready.init(1);
         smem.bar_kv_rope_ready.init(1);
         smem.bar_dq_nope_ready.init(1);
@@ -315,8 +318,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     // Compute dQ (elected warp only)
     if (warp_idx == 0 && elect_one_sync()) {
-        cutlass::arch::warpgroup_reg_alloc<168>();
-
         // Prepare tensors
         Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
         Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
