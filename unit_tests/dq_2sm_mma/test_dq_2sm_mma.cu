@@ -95,8 +95,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         }
         const int32_t* cta_indices = indices + cta_idx * (B_TOPK / 2);
 
-        // Arrive and expect tx BEFORE issuing TMA loads
-        smem.bar_kv_nope_ready.arrive_and_expect_tx((B_TOPK / 2) * 512 * sizeof(bf16));
+        // Only CTA0 calls arrive_and_expect_tx because tma_gather4_cta_group_2<true> uses CTA0's barrier
+        if (cta_idx == 0) {
+            smem.bar_kv_nope_ready.arrive_and_expect_tx((B_TOPK / 2) * 512 * sizeof(bf16) * 2);  // Both CTAs' data
+        }
 
         // Load KV NoPE part: [32, 512]
         for (int row = 0; row < B_TOPK / 2; row += 4) {
@@ -126,8 +128,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
             printf("CTA0: k_nope loaded\n");
         }
 
-        // Arrive and expect tx BEFORE issuing TMA loads for RoPE
-        smem.bar_kv_rope_ready.arrive_and_expect_tx((B_TOPK / 2) * D_ROPE * sizeof(bf16));
+        // Only CTA0 calls arrive_and_expect_tx for RoPE
+        if (cta_idx == 0) {
+            smem.bar_kv_rope_ready.arrive_and_expect_tx((B_TOPK / 2) * D_ROPE * sizeof(bf16) * 2);  // Both CTAs' data
+        }
 
         // Load KV RoPE part: [32, 64]
         for (int row = 0; row < B_TOPK / 2; row += 4) {
