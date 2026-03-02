@@ -390,6 +390,46 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf("CTA%d: output cuda_kv done\n", cta_idx);
     }
 
+    // Step 2.5: Relayout k_nope for dQ MMA.
+    // Desired logical transform:
+    //   k_nope [32,512] -> split columns:
+    //     A = [32,0:256], B = [32,256:512]
+    //   stack A/B to [64,256], then transpose to [256,64].
+    {
+        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
+        Tensor sK_nope_t_relayout = make_tensor(
+            make_smem_ptr(smem.k_nope_dq.data()),
+            SmemLayoutKCalcDQNoPE{}
+        );  // [256, 64]
+
+        constexpr int N_COLS = 256;
+        constexpr int K_ROWS = B_TOPK;  // 64
+        constexpr int HALF_ROWS = B_TOPK / 2;  // 32
+        const int elements_per_cta = N_COLS * K_ROWS;
+        const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
+
+        for (int i = 0; i < elements_per_thread; ++i) {
+            const int flat_idx = tid * elements_per_thread + i;
+            if (flat_idx < elements_per_cta) {
+                const int n = flat_idx / K_ROWS;  // 0..255
+                const int k = flat_idx % K_ROWS;  // 0..63
+
+                // k in [0,31] comes from A[row=k, col=n]
+                // k in [32,63] comes from B[row=k-32, col=n+256]
+                const int src_row = k % HALF_ROWS;
+                const int src_col = n + (k / HALF_ROWS) * 256;
+                sK_nope_t_relayout(n, k) = sK_nope(src_row, src_col);
+            }
+        }
+    }
+
+    fence_view_async_shared();
+    __syncthreads();
+
+    if (tid == 0) {
+        printf("CTA%d: k_nope relayout for dQ done\n", cta_idx);
+    }
+
     // Step 2.3: Compute dQ using MMA
     // Allocate TMEM (warp 0 only)
     if (warp_idx == 0) {
@@ -409,7 +449,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
         // Prepare tensors
         Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
-        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
+        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope_dq.data()), SmemLayoutKCalcDQNoPE{});
         Tensor sK_rope_t = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKCalcDQRoPE{});
 
         // Allocate TMEM for dQ
