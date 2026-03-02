@@ -39,6 +39,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     const int tid = threadIdx.x;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
 
+    if (tid == 0) {
+        printf("CTA%d: kernel started\n", cta_idx);
+    }
+
     // Initialize barriers (only CTA0 thread 0)
     if (warp_idx == 0 && elect_one_sync()) {
         smem.bar_kv_nope_ready.init(1);
@@ -46,10 +50,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         smem.bar_dq_nope_ready.init(1);
         smem.bar_dq_rope_ready.init(1);
         fence_barrier_init();
+        if (cta_idx == 0) {
+            printf("CTA0: barriers initialized\n");
+        }
     }
 
     __syncthreads();
     cluster_sync();
+
+    if (tid == 0) {
+        printf("CTA%d: after cluster_sync 1\n", cta_idx);
+    }
 
     // Step 1: Load ds to smem.ds_t
     // ds shape: [B_H, B_TOPK] = [128, 64]
@@ -72,9 +83,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     fence_view_async_shared();
     __syncthreads();
 
+    if (tid == 0) {
+        printf("CTA%d: ds loaded\n", cta_idx);
+    }
+
     // Step 2: Load KV using TMA gather4
     // Each CTA loads [B_TOPK/2, D_K] = [32, 576]
     if (warp_idx == 0 && elect_one_sync()) {
+        if (cta_idx == 0) {
+            printf("CTA0: starting TMA load\n");
+        }
         const int32_t* cta_indices = indices + cta_idx * (B_TOPK / 2);
 
         // Load KV NoPE part: [32, 512]
@@ -102,6 +120,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         smem.bar_kv_nope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
 
+        if (cta_idx == 0) {
+            printf("CTA0: k_nope loaded\n");
+        }
+
         // Load KV RoPE part: [32, 64]
         for (int row = 0; row < B_TOPK / 2; row += 4) {
             int4 indices4;
@@ -123,10 +145,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         smem.bar_kv_rope_ready.arrive_and_expect_tx((B_TOPK / 2) * D_ROPE * sizeof(bf16));
         smem.bar_kv_rope_ready.wait(0);
         ku::tcgen05_after_thread_sync();
+
+        if (cta_idx == 0) {
+            printf("CTA0: k_rope loaded\n");
+        }
     }
 
     __syncthreads();
     cluster_sync();
+
+    if (tid == 0) {
+        printf("CTA%d: after TMA load cluster_sync\n", cta_idx);
+    }
 
     // Step 2.2: Exchange KV data between CTA0 and CTA1
     // Exchange k_nope: CTA0's [32, 256:512] ↔ CTA1's [32, 0:256]
@@ -188,6 +218,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     __syncthreads();
     cluster_sync();
 
+    if (tid == 0) {
+        printf("CTA%d: k_nope exchange done\n", cta_idx);
+    }
+
     // Exchange k_rope
     // Total: 32 * 32 = 1024 bf16 elements
     // Each thread handles: 1024 / 128 = 8 bf16 elements
@@ -243,6 +277,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
     fence_view_async_shared();
     __syncthreads();
     cluster_sync();
+
+    if (tid == 0) {
+        printf("CTA%d: k_rope exchange done\n", cta_idx);
+    }
 
     // Step 2.4: Output cuda_kv for verification
     // After exchange, each CTA's smem contains the data it needs to output:
@@ -308,16 +346,27 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     __syncthreads();
 
+    if (tid == 0) {
+        printf("CTA%d: output cuda_kv done\n", cta_idx);
+    }
+
     // Step 2.3: Compute dQ using MMA
     // Allocate TMEM (warp 0 only)
     if (warp_idx == 0) {
         TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
         TMEM::Allocator2Sm().release_allocation_lock();
+        if (cta_idx == 0) {
+            printf("CTA0: TMEM allocated\n");
+        }
     }
     __syncthreads();
 
     // Compute dQ (elected warp only)
     if (warp_idx == 0 && elect_one_sync()) {
+        if (cta_idx == 0) {
+            printf("CTA0: starting MMA computation\n");
+        }
+
         // Prepare tensors
         Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
         Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
@@ -338,9 +387,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t, sK_rope_t, tdQ_RoPE, true);
 
         ku::tcgen05_after_thread_sync();
+
+        if (cta_idx == 0) {
+            printf("CTA0: MMA computation done\n");
+        }
     }
 
     __syncthreads();
+
+    if (tid == 0) {
+        printf("CTA%d: before reading TMEM\n", cta_idx);
+    }
 
     // Read dQ from TMEM and write to global memory (all threads participate)
     {
@@ -375,9 +432,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
     __syncthreads();
 
+    if (tid == 0) {
+        printf("CTA%d: TMEM read done\n", cta_idx);
+    }
+
     // Free TMEM
     if (warp_idx == 0 && elect_one_sync()) {
         TMEM::Allocator2Sm().free(smem.tmem_start_addr.data()[0], 512);
+        if (cta_idx == 0) {
+            printf("CTA0: TMEM freed\n");
+        }
+    }
+
+    if (tid == 0) {
+        printf("CTA%d: kernel finished\n", cta_idx);
     }
 #endif
 }
@@ -387,11 +455,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     torch::Tensor kv,      // [s_kv, 576], bf16
     torch::Tensor indices  // [64], int32/int64
 ) {
+    printf("Host: run_dq_2sm_mma started\n");
+
     TORCH_CHECK(ds.dtype() == torch::kBFloat16);
     TORCH_CHECK(kv.dtype() == torch::kBFloat16);
     TORCH_CHECK(ds.size(0) == B_H && ds.size(1) == B_TOPK);
     TORCH_CHECK(kv.size(1) == D_K);
     TORCH_CHECK(indices.size(0) == B_TOPK);
+
+    printf("Host: input checks passed\n");
 
     auto dQ = torch::zeros({B_H, D_Q}, torch::dtype(torch::kFloat32).device(ds.device()));
     auto cuda_kv_nope = torch::zeros({B_TOPK, 512}, torch::dtype(torch::kBFloat16).device(ds.device()));
@@ -429,6 +501,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     // Tensor map for RoPE part (same as above, just different column offset)
     tensor_map_kv_rope32 = tensor_map_kv;
 
+    printf("Host: tensor maps created\n");
+
     KernelParams params{tensor_map_kv, tensor_map_kv_rope32};
 
     auto kernel = &dq_2sm_mma_kernel<KernelParams>;
@@ -465,9 +539,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     cudaError_t err = cudaLaunchKernelEx(&config, kernel,
         ds_ptr, kv_ptr, indices_ptr, dQ_ptr, cuda_kv_nope_ptr, cuda_kv_rope_ptr, params);
 
+    printf("Host: kernel launched\n");
+
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
     }
+
+    cudaDeviceSynchronize();
+    printf("Host: kernel finished\n");
 
     return std::make_tuple(dQ, cuda_kv_nope, cuda_kv_rope);
 }
