@@ -13,3 +13,4 @@
         2.2.3 cta0和cta1都读取完成后(cluster_sync)，写入自己的smem对应位置中
         2.2.4 将交换完成的k_smem输出到全局内存cuda_kv，在test_dq_2sm_mma.py中对比cuda_kv与ref_kv的精度
     2.3计算dq
+3.test_dq_2sm_mma.py：测试cuda_kv、dq的精度
