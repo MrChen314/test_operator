@@ -1,22 +1,18 @@
-Host: run_dq_2sm_mma started
-Host: input checks passed
-Host: tensor maps created
-Host: kernel launched
-CTA0: kernel started
-CTA1: kernel started
-CTA0: barriers initialized
-CTA0: after cluster_sync 1
-CTA1: after cluster_sync 1
-CTA0: ds loaded
-CTA1: ds loaded
-CTA0: starting TMA load
-CTA0: k_nope loaded
-CTA0: k_rope loaded
-CTA0: after TMA load cluster_sync
-CTA1: after TMA load cluster_sync
-CTA1: k_nope exchange done
-CTA0: k_nope exchange done
-CTA0: k_rope exchange done
-CTA1: k_rope exchange done
-CTA0: output cuda_kv done
-CTA1: output cuda_kv done
+(dQ_cuda - ref_dQ)[:,:64].abs().sum()
+tensor(0.0007, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,:128].abs().sum()
+tensor(0.0013, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,:256].abs().sum()
+tensor(144496.7656, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,128:256].abs().sum()
+tensor(144496.7656, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,256:384].abs().sum()
+tensor(144496.7656, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,384:512].abs().sum()
+tensor(0.0012, device='cuda:0')
+(dQ_cuda - ref_dQ)[:,512:].abs().sum()
+tensor(0.0006, device='cuda:0')
+(dQ_cuda[:,128:256] - ref_dQ[:,256:384]).abs().sum()
+tensor(0.0013, device='cuda:0')
+(dQ_cuda[:,256:384] - ref_dQ[:,128:256]).abs().sum()
+tensor(0.0012, device='cuda:0')
