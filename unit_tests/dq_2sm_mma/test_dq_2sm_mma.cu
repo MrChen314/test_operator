@@ -97,7 +97,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
         // Only CTA0 calls arrive_and_expect_tx because tma_gather4_cta_group_2<true> uses CTA0's barrier
         if (cta_idx == 0) {
-            smem.bar_kv_nope_ready.arrive_and_expect_tx((B_TOPK / 2) * 512 * sizeof(bf16) * 2);  // Both CTAs' data
+            smem.bar_kv_nope_ready.arrive_and_expect_tx(B_TOPK* 512 * sizeof(bf16));  // Both CTAs' data
         }
 
         // Load KV NoPE part: [32, 512]
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
         // Only CTA0 calls arrive_and_expect_tx for RoPE
         if (cta_idx == 0) {
-            smem.bar_kv_rope_ready.arrive_and_expect_tx((B_TOPK / 2) * D_ROPE * sizeof(bf16) * 2);  // Both CTAs' data
+            smem.bar_kv_rope_ready.arrive_and_expect_tx(B_TOPK * D_ROPE * sizeof(bf16));  // Both CTAs' data
         }
 
         // Load KV RoPE part: [32, 64]
@@ -483,6 +483,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     // Create tensor maps for TMA
     CUtensorMap tensor_map_kv, tensor_map_kv_rope32;
 
+    // Tensor map for k_nope (box_size = 64)
     {
         uint64_t size[2] = {(uint64_t)D_K, (uint64_t)kv.size(0)};
         uint64_t stride[1] = {(uint64_t)kv.stride(0) * sizeof(bf16)};
@@ -506,8 +507,29 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
         KU_ASSERT(res == CUresult::CUDA_SUCCESS);
     }
 
-    // Tensor map for RoPE part (same as above, just different column offset)
-    tensor_map_kv_rope32 = tensor_map_kv;
+    // Tensor map for k_rope (box_size = 32)
+    {
+        uint64_t size[2] = {(uint64_t)D_K, (uint64_t)kv.size(0)};
+        uint64_t stride[1] = {(uint64_t)kv.stride(0) * sizeof(bf16)};
+        uint32_t box_size[2] = {32, 1};
+        uint32_t elem_stride[2] = {1, 1};
+
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_kv_rope32,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            (bf16*)kv.data_ptr(),
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
 
     printf("Host: tensor maps created\n");
 
