@@ -43,26 +43,36 @@ using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKCalcDQNoPE = decltype(coalesce(tile_to_shape(
+template<int NUM_TILES>
+using SmemLayoutKVTiles = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
-    Shape<Int<256>, Int<B_TOPK>>{},
+    Shape<Int<B_TOPK / 2>, Int<64 * NUM_TILES>>{},
     Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutKNoPE = SmemLayoutKVTiles<8>;
+using SmemLayoutKRoPE = SmemLayoutKVTiles<1>;
+
+using SmemLayoutKCalcDQNoPE = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_MN_SW128_Atom<bf16>{},
+    Shape<Int<256>, Int<B_TOPK>>{},
+    Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
 using SmemLayoutKCalcDQRoPE = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
+    UMMA::Layout_MN_SW128_Atom<bf16>{},
     Shape<Int<D_ROPE / 2>, Int<B_TOPK>>{},
-    Step<_1, _2>{}
+    Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
 using TiledMMA_dQ_2cta = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::MN, UMMA::Major::K>{},
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::MN, UMMA::Major::MN>{},
     Layout<Shape<_1, _1, _1>>{},
     Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}
 ));
 
 using TiledMMA_dQ_RoPE_2cta = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, D_ROPE, UMMA::Major::MN, UMMA::Major::MN>{}
 ));
 
 struct tmem_cols {
@@ -77,8 +87,8 @@ struct KernelParams {
 
 struct alignas(128) SharedMemory {
     array_aligned<bf16, cosize_v<SmemLayoutdSTransposed>> ds_t;
-    array_aligned<bf16, cosize_v<SmemLayoutKCalcDQNoPE>> k_calc_dq_nope;
-    array_aligned<bf16, cosize_v<SmemLayoutKCalcDQRoPE>> k_calc_dq_rope;
+    array_aligned<bf16, cosize_v<SmemLayoutK>> k_nope;
+    array_aligned<bf16, cosize_v<SmemLayoutK>> k_rope;
 
     transac_bar_t bar_kv_nope_ready;
     transac_bar_t bar_kv_rope_ready;

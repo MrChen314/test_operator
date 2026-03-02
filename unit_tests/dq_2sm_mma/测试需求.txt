@@ -1,1 +1,15 @@
-对mla_bwd.cu中计算dQ进行单测
+/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128/phase1.cuh
+对phase1.cuh中WG1传输数据到peer的smem以及WG3通过mma计算dq进行单测
+
+要求：
+1.输入输出参数
+    输入：ds、kv
+    输出：cuda_kv、dq
+2.测试kernel流程：
+    2.1读取ds到smem.ds_t
+    2.2按照phase1.cuh使用tma_ghther4加载kv，然后交换cta0和cta1的smem kv指定数据
+        2.2.1 cta0和cta1的kv_nope数据shape是[32,512]，交换cta0的[32,256-512]与cta1的[32,0-256]
+        2.2.2 一共128个线程，需要交换的数据是32 * 256(bf16)，每个线程需要处理32 * 256 / 128 = 64(bf16)，这个数据从peer对端读取
+        2.2.3 cta0和cta1都读取完成后(cluster_sync)，写入自己的smem对应位置中
+        2.2.4 将交换完成的k_smem输出到全局内存cuda_kv，在test_dq_2sm_mma.py中对比cuda_kv与ref_kv的精度
+    2.3计算dq
