@@ -12,3 +12,5 @@ CTA0: ds loaded
 CTA0: starting TMA load
 CTA0: k_nope loaded
 CTA0: k_rope loaded
+rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+
