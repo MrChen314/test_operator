@@ -436,12 +436,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
 
+    // Get pointers first
+    bf16* ds_ptr = (bf16*)ds.data_ptr();
+    bf16* kv_ptr = (bf16*)kv.data_ptr();
+    int32_t* indices_ptr = (int32_t*)indices_i32.data_ptr();
+    float* dQ_ptr = (float*)dQ.data_ptr();
+    bf16* cuda_kv_nope_ptr = (bf16*)cuda_kv_nope.data_ptr();
+    bf16* cuda_kv_rope_ptr = (bf16*)cuda_kv_rope.data_ptr();
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
     cudaLaunchConfig_t config;
     memset(&config, 0, sizeof(config));
     config.gridDim = grid;
     config.blockDim = block;
     config.dynamicSmemBytes = SMEM_SIZE;
-    config.stream = c10::cuda::getCurrentCUDAStream();
+    config.stream = stream;
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeClusterDimension;
@@ -451,17 +461,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_dq_2sm_mma(
     config.attrs = attrs;
     config.numAttrs = 1;
 
-    void* kernel_args[] = {
-        (void*)&ds.data_ptr(),
-        (void*)&kv.data_ptr(),
-        (void*)&indices_i32.data_ptr(),
-        (void*)&dQ.data_ptr(),
-        (void*)&cuda_kv_nope.data_ptr(),
-        (void*)&cuda_kv_rope.data_ptr(),
-        (void*)&params
-    };
+    cudaError_t err = cudaLaunchKernelEx(&config, kernel,
+        ds_ptr, kv_ptr, indices_ptr, dQ_ptr, cuda_kv_nope_ptr, cuda_kv_rope_ptr, params);
 
-    cudaLaunchKernelExC(&config, (void*)kernel, kernel_args);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaLaunchKernelEx failed with error: %s\n", cudaGetErrorString(err));
+    }
 
     return std::make_tuple(dQ, cuda_kv_nope, cuda_kv_rope);
 }
