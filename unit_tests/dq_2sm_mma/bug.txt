@@ -1,10 +1,4 @@
 root@tjzj-inf-sci-k8s-bzz2-0205:/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
-Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
-
-/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(92): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
-    module.attr(name) = wrapper_class;
-    ^
-
 /usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include/torch/python.h(154): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
                 module.to(
                 ^
@@ -25,29 +19,35 @@ Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
                   module.to(
                   ^
 
-/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout.hpp(1792): error: static assertion failed with "tile_to_shape: block shape does not divide the target shape."
-      static_assert(decltype(evenly_divides(target_shape, block_shape))::value, "tile_to_shape: block shape does not divide the target shape.")
-      ^
-          detected during:
-            instantiation of "auto cute::tile_to_shape(const cute::Layout<Shape, Stride> &, const TrgShape &, const ModeOrder &) [with Shape=cute::tuple<cute::C<64>, cute::C<8>>, Stride=cute::tuple<cute::_1, cute::C<64>>, TrgShape=cute::tuple<cute::C<32>, cute::C<64>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 552 of /home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include/cute/layout_composed.hpp
-            instantiation of "auto cute::tile_to_shape(const cute::ComposedLayout<A, O, B> &, const Shape &, const ModeOrder &) [with A=cute::Swizzle<3, 4, 3>, O=cute::smem_ptr_flag_bits<16>, B=cute::Layout<cute::tuple<cute::C<64>, cute::C<8>>, cute::tuple<cute::_1, cute::C<64>>>, Shape=cute::tuple<cute::C<32>, cute::C<64>>, ModeOrder=cute::tuple<cute::_2, cute::_1>]" at line 66 of /home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cuh
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(444): error: namespace "c10::cuda" has no member "getCurrentCUDAStream"
+      config.stream = c10::cuda::getCurrentCUDAStream();
+                                 ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(373): error: namespace "at::cuda" has no member "getCurrentCUDAStream"
-      config.stream = at::cuda::getCurrentCUDAStream();
-                                ^
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(455): error: expression must be an lvalue or a function designator
+          (void*)&ds.data_ptr(),
+                  ^
 
-/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(383): error: no instance of overloaded function "cudaLaunchKernelEx" matches the argument list
-            argument types are: (cudaLaunchConfig_t *, void *, test_operator::dq_2sm_mma::bf16 *, test_operator::dq_2sm_mma::bf16 *, int32_t *, float *, test_operator::dq_2sm_mma::bf16 *, test_operator::dq_2sm_mma::bf16 *, test_operator::dq_2sm_mma::KernelParams)
-      cudaLaunchKernelEx(
-      ^
-/usr/local/cuda/include/cuda_runtime.h(349): note #3326-D: function template "cudaLaunchKernelEx(const cudaLaunchConfig_t *, cudaKernel_t, ActTypes &&...)" does not match because argument #2 does not match parameter
-  static __inline__ __attribute__((host)) cudaError_t cudaLaunchKernelEx(
-                                                      ^
-/usr/local/cuda/include/cuda_runtime.h(280): note #3327-D: candidate function template "cudaLaunchKernelEx(const cudaLaunchConfig_t *, void (*)(ExpTypes...), ActTypes &&...)" failed deduction
-  static __inline__ __attribute__((host)) cudaError_t cudaLaunchKernelEx(
-                                                      ^
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(456): error: expression must be an lvalue or a function designator
+          (void*)&kv.data_ptr(),
+                  ^
 
-3 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu".
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(457): error: expression must be an lvalue or a function designator
+          (void*)&indices_i32.data_ptr(),
+                  ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(458): error: expression must be an lvalue or a function designator
+          (void*)&dQ.data_ptr(),
+                  ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(459): error: expression must be an lvalue or a function designator
+          (void*)&cuda_kv_nope.data_ptr(),
+                  ^
+
+/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu(460): error: expression must be an lvalue or a function designator
+          (void*)&cuda_kv_rope.data_ptr(),
+                  ^
+
+7 errors detected in the compilation of "/home/users/chenquanlin/workspace/operator/test_operator/unit_tests/dq_2sm_mma/test_dq_2sm_mma.cu".
 ninja: build stopped: subcommand failed.
 Traceback (most recent call last):
   File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
