@@ -87,8 +87,8 @@ struct KernelParams {
 
 struct alignas(128) SharedMemory {
     array_aligned<bf16, cosize_v<SmemLayoutdSTransposed>> ds_t;
-    array_aligned<bf16, cosize_v<SmemLayoutK>> k_nope;
-    array_aligned<bf16, cosize_v<SmemLayoutK>> k_rope;
+    array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;
+    array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;
 
     transac_bar_t bar_kv_nope_ready;
     transac_bar_t bar_kv_rope_ready;
