@@ -10,3 +10,5 @@ CTA0: after cluster_sync 1
 CTA1: ds loaded
 CTA0: ds loaded
 CTA0: starting TMA load
+CTA0: k_nope loaded
+CTA0: k_rope loaded
