@@ -186,220 +186,23 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf("CTA%d: after TMA load cluster_sync\n", cta_idx);
     }
 
-    // Step 2.2: Exchange KV data between CTA0 and CTA1
-    // Exchange k_nope: CTA0's [32, 256:512] ↔ CTA1's [32, 0:256]
-    // Exchange k_rope: CTA0's [32, 32:64] ↔ CTA1's [32, 0:32]
-
-    // Exchange k_nope
-    // Total: 32 * 256 = 8192 bf16 elements
-    // Each thread handles: 8192 / 128 = 64 bf16 elements
-    {
-        constexpr int EXCHANGE_ELEMENTS_NOPE = 32 * 256;
-        constexpr int ELEMENTS_PER_THREAD_NOPE = EXCHANGE_ELEMENTS_NOPE / NUM_THREADS;
-
-        bf16 exchange_buffer_nope[ELEMENTS_PER_THREAD_NOPE];
-        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
-
-        // Read from peer CTA's smem
-        bf16* peer_k_nope = kerutils::get_peer_addr(smem.k_nope.data());
-        Tensor peer_sK_nope = make_tensor(make_smem_ptr(peer_k_nope), SmemLayoutKNoPE{});
-
-        if (cta_idx == 0) {
-            // CTA0: read peer's [32, 0:256]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_NOPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
-                const int row = flat_idx / 256;
-                const int col = flat_idx % 256;
-                exchange_buffer_nope[i] = peer_sK_nope(row, col);
-            }
-        } else {
-            // CTA1: read peer's [32, 256:512]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_NOPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
-                const int row = flat_idx / 256;
-                const int col = flat_idx % 256;
-                exchange_buffer_nope[i] = peer_sK_nope(row, 256 + col);
-            }
-        }
-
-        cluster_sync();
-
-        // Write to local smem
-        if (cta_idx == 0) {
-            // CTA0: write to [32, 256:512]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_NOPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
-                const int row = flat_idx / 256;
-                const int col = flat_idx % 256;
-                sK_nope(row, 256 + col) = exchange_buffer_nope[i];
-            }
-        } else {
-            // CTA1: write to [32, 0:256]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_NOPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_NOPE + i;
-                const int row = flat_idx / 256;
-                const int col = flat_idx % 256;
-                sK_nope(row, col) = exchange_buffer_nope[i];
-            }
-        }
-    }
-
-    fence_view_async_shared();
-    __syncthreads();
-    cluster_sync();
-
-    if (tid == 0) {
-        printf("CTA%d: k_nope exchange done\n", cta_idx);
-    }
-
-    // Exchange k_rope
-    // Total: 32 * 32 = 1024 bf16 elements
-    // Each thread handles: 1024 / 128 = 8 bf16 elements
-    {
-        constexpr int EXCHANGE_ELEMENTS_ROPE = 32 * 32;
-        constexpr int ELEMENTS_PER_THREAD_ROPE = EXCHANGE_ELEMENTS_ROPE / NUM_THREADS;
-
-        bf16 exchange_buffer_rope[ELEMENTS_PER_THREAD_ROPE];
-        Tensor sK_rope = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
-
-        // Read from peer CTA's smem
-        bf16* peer_k_rope = kerutils::get_peer_addr(smem.k_rope.data());
-        Tensor peer_sK_rope = make_tensor(make_smem_ptr(peer_k_rope), SmemLayoutKRoPE{});
-
-        if (cta_idx == 0) {
-            // CTA0: read peer's [32, 0:32]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_ROPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
-                const int row = flat_idx / 32;
-                const int col = flat_idx % 32;
-                exchange_buffer_rope[i] = peer_sK_rope(row, col);
-            }
-        } else {
-            // CTA1: read peer's [32, 32:64]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_ROPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
-                const int row = flat_idx / 32;
-                const int col = flat_idx % 32;
-                exchange_buffer_rope[i] = peer_sK_rope(row, 32 + col);
-            }
-        }
-
-        cluster_sync();
-
-        // Write to local smem
-        if (cta_idx == 0) {
-            // CTA0: write to [32, 32:64]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_ROPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
-                const int row = flat_idx / 32;
-                const int col = flat_idx % 32;
-                sK_rope(row, 32 + col) = exchange_buffer_rope[i];
-            }
-        } else {
-            // CTA1: write to [32, 0:32]
-            for (int i = 0; i < ELEMENTS_PER_THREAD_ROPE; ++i) {
-                const int flat_idx = tid * ELEMENTS_PER_THREAD_ROPE + i;
-                const int row = flat_idx / 32;
-                const int col = flat_idx % 32;
-                sK_rope(row, col) = exchange_buffer_rope[i];
-            }
-        }
-    }
-
-    fence_view_async_shared();
-    __syncthreads();
-    cluster_sync();
-
-    if (tid == 0) {
-        printf("CTA%d: k_rope exchange done\n", cta_idx);
-    }
-
-    // Step 2.4: Output cuda_kv for verification
-    // After exchange, each CTA's smem contains the data it needs to output:
-    // k_nope: CTA0: smem[32, 0:256] -> global[0:32, 0:256], smem[32, 256:512] -> global[32:64, 0:256]
-    //         CTA1: smem[32, 0:256] -> global[0:32, 256:512], smem[32, 256:512] -> global[32:64, 256:512]
-    // k_rope: CTA0: smem[32, 0:32] -> global[0:32, 0:32], smem[32, 32:64] -> global[32:64, 0:32]
-    //         CTA1: smem[32, 0:32] -> global[0:32, 32:64], smem[32, 32:64] -> global[32:64, 32:64]
-    if (cuda_smem_k_nope != nullptr) {
-        // Create tensor view for smem
-        Tensor sK_nope = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
-
-        // Each CTA outputs 32*512 = 16384 elements
-        const int elements_per_cta = (B_TOPK / 2) * 512;
-        const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
-
-        for (int i = 0; i < elements_per_thread; ++i) {
-            const int flat_idx = tid * elements_per_thread + i;
-            if (flat_idx < elements_per_cta) {
-                const int local_row = flat_idx / 512;  // 0-31
-                const int local_col = flat_idx % 512;  // 0-511
-
-                // Determine global position
-                int global_row, global_col;
-                if (local_col < 256) {
-                    // First half columns: output to rows [0:32]
-                    global_row = local_row;
-                    global_col = cta_idx * 256 + local_col;
-                } else {
-                    // Second half columns: output to rows [32:64]
-                    global_row = (B_TOPK / 2) + local_row;
-                    global_col = cta_idx * 256 + (local_col - 256);
-                }
-
-                // Use tensor accessor to handle swizzled layout
-                cuda_smem_k_nope[global_row * 512 + global_col] = sK_nope(local_row, local_col);
-            }
-        }
-    }
-
-    if (cuda_smem_k_rope != nullptr) {
-        // Create tensor view for smem
-        Tensor sK_rope = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
-
-        // Each CTA outputs 32*64 = 2048 elements
-        const int elements_per_cta = (B_TOPK / 2) * D_ROPE;
-        const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
-
-        for (int i = 0; i < elements_per_thread; ++i) {
-            const int flat_idx = tid * elements_per_thread + i;
-            if (flat_idx < elements_per_cta) {
-                const int local_row = flat_idx / D_ROPE;  // 0-31
-                const int local_col = flat_idx % D_ROPE;  // 0-63
-
-                // Determine global position
-                int global_row, global_col;
-                if (local_col < 32) {
-                    // First half columns: output to rows [0:32]
-                    global_row = local_row;
-                    global_col = cta_idx * 32 + local_col;
-                } else {
-                    // Second half columns: output to rows [32:64]
-                    global_row = (B_TOPK / 2) + local_row;
-                    global_col = cta_idx * 32 + (local_col - 32);
-                }
-
-                // Use tensor accessor to handle swizzled layout
-                cuda_smem_k_rope[global_row * D_ROPE + global_col] = sK_rope(local_row, local_col);
-            }
-        }
-    }
-
-    __syncthreads();
-
-    if (tid == 0) {
-        printf("CTA%d: output cuda_kv done\n", cta_idx);
-    }
-
-    // Step 2.5: Relayout k_nope / k_rope for dQ MMA into dedicated SMEM buffers.
+    // Step 2.2 + 2.5: Direct relayout for dQ MMA (no explicit exchange writeback to k_nope/k_rope).
+    // Data is read from local/peer SMEM with the same logical mapping as previous exchange step,
+    // then written directly to k_nope_dq/k_rope_dq.
     // k_nope logical transform:
     //   [32,512] -> split A:[32,0:256], B:[32,256:512] -> stack [64,256] -> transpose [256,64]
     // k_rope logical transform:
     //   [32, 64] -> split A:[32,0:32],  B:[32,32:64]  -> stack [64, 32] -> transpose [32,64]
     {
-        Tensor sK_nope_src = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
+        Tensor sK_nope_local = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
         Tensor sK_nope_dst = make_tensor(make_smem_ptr(smem.k_nope_dq.data()), SmemLayoutKCalcDQNoPE{});
-        Tensor sK_rope_src = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
+        bf16* peer_k_nope = kerutils::get_peer_addr(smem.k_nope.data());
+        Tensor sK_nope_peer = make_tensor(make_smem_ptr(peer_k_nope), SmemLayoutKNoPE{});
+
+        Tensor sK_rope_local = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
         Tensor sK_rope_dst = make_tensor(make_smem_ptr(smem.k_rope_dq.data()), SmemLayoutKCalcDQRoPE{});
+        bf16* peer_k_rope = kerutils::get_peer_addr(smem.k_rope.data());
+        Tensor sK_rope_peer = make_tensor(make_smem_ptr(peer_k_rope), SmemLayoutKRoPE{});
 
         constexpr int N_COLS = 256;
         constexpr int K_ROWS = B_TOPK;  // 64
@@ -414,7 +217,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int k = flat_idx % K_ROWS;  // 0..63
                 const int src_row = k % HALF_ROWS;
                 const int src_col = n + (k / HALF_ROWS) * N_COLS;
-                sK_nope_dst(n, k) = sK_nope_src(src_row, src_col);
+                bf16 v;
+                if (cta_idx == 0) {
+                    v = (src_col < 256)
+                        ? sK_nope_local(src_row, src_col)
+                        : sK_nope_peer(src_row, src_col - 256);
+                } else {
+                    v = (src_col < 256)
+                        ? sK_nope_peer(src_row, src_col + 256)
+                        : sK_nope_local(src_row, src_col);
+                }
+                sK_nope_dst(n, k) = v;
             }
         }
 
@@ -431,7 +244,86 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
                 const int k = flat_idx % K_ROWS_ROPE;  // 0..63
                 const int src_row = k % HALF_ROWS_ROPE;
                 const int src_col = n + (k / HALF_ROWS_ROPE) * N_COLS_ROPE;
-                sK_rope_dst(n, k) = sK_rope_src(src_row, src_col);
+                bf16 v;
+                if (cta_idx == 0) {
+                    v = (src_col < 32)
+                        ? sK_rope_local(src_row, src_col)
+                        : sK_rope_peer(src_row, src_col - 32);
+                } else {
+                    v = (src_col < 32)
+                        ? sK_rope_peer(src_row, src_col + 32)
+                        : sK_rope_local(src_row, src_col);
+                }
+                sK_rope_dst(n, k) = v;
+            }
+        }
+
+        // Step 2.4: Output cuda_kv for verification with the same logical exchange mapping.
+        if (cuda_smem_k_nope != nullptr) {
+            const int elements_per_cta = (B_TOPK / 2) * 512;
+            const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
+
+            for (int i = 0; i < elements_per_thread; ++i) {
+                const int flat_idx = tid * elements_per_thread + i;
+                if (flat_idx < elements_per_cta) {
+                    const int local_row = flat_idx / 512;  // 0-31
+                    const int local_col = flat_idx % 512;  // 0-511
+
+                    int global_row, global_col;
+                    if (local_col < 256) {
+                        global_row = local_row;
+                        global_col = cta_idx * 256 + local_col;
+                    } else {
+                        global_row = (B_TOPK / 2) + local_row;
+                        global_col = cta_idx * 256 + (local_col - 256);
+                    }
+
+                    bf16 v;
+                    if (cta_idx == 0) {
+                        v = (local_col < 256)
+                            ? sK_nope_local(local_row, local_col)
+                            : sK_nope_peer(local_row, local_col - 256);
+                    } else {
+                        v = (local_col < 256)
+                            ? sK_nope_peer(local_row, local_col + 256)
+                            : sK_nope_local(local_row, local_col);
+                    }
+                    cuda_smem_k_nope[global_row * 512 + global_col] = v;
+                }
+            }
+        }
+
+        if (cuda_smem_k_rope != nullptr) {
+            const int elements_per_cta = (B_TOPK / 2) * D_ROPE;
+            const int elements_per_thread = (elements_per_cta + NUM_THREADS - 1) / NUM_THREADS;
+
+            for (int i = 0; i < elements_per_thread; ++i) {
+                const int flat_idx = tid * elements_per_thread + i;
+                if (flat_idx < elements_per_cta) {
+                    const int local_row = flat_idx / D_ROPE;  // 0-31
+                    const int local_col = flat_idx % D_ROPE;  // 0-63
+
+                    int global_row, global_col;
+                    if (local_col < 32) {
+                        global_row = local_row;
+                        global_col = cta_idx * 32 + local_col;
+                    } else {
+                        global_row = (B_TOPK / 2) + local_row;
+                        global_col = cta_idx * 32 + (local_col - 32);
+                    }
+
+                    bf16 v;
+                    if (cta_idx == 0) {
+                        v = (local_col < 32)
+                            ? sK_rope_local(local_row, local_col)
+                            : sK_rope_peer(local_row, local_col - 32);
+                    } else {
+                        v = (local_col < 32)
+                            ? sK_rope_peer(local_row, local_col + 32)
+                            : sK_rope_local(local_row, local_col);
+                    }
+                    cuda_smem_k_rope[global_row * D_ROPE + global_col] = v;
+                }
             }
         }
     }
