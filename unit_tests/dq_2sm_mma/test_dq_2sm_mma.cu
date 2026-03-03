@@ -390,130 +390,48 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
         printf("CTA%d: output cuda_kv done\n", cta_idx);
     }
 
-    // Step 2.5: In-place relayout k_nope / k_rope for dQ MMA using cycle permutation.
+    // Step 2.5: Relayout k_nope / k_rope for dQ MMA into dedicated SMEM buffers.
     // k_nope logical transform:
     //   [32,512] -> split A:[32,0:256], B:[32,256:512] -> stack [64,256] -> transpose [256,64]
     // k_rope logical transform:
     //   [32, 64] -> split A:[32,0:32],  B:[32,32:64]  -> stack [64, 32] -> transpose [32,64]
     {
         Tensor sK_nope_src = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKNoPE{});
-        Tensor sK_nope_dst = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
+        Tensor sK_nope_dst = make_tensor(make_smem_ptr(smem.k_nope_dq.data()), SmemLayoutKCalcDQNoPE{});
         Tensor sK_rope_src = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKRoPE{});
-        Tensor sK_rope_dst = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKCalcDQRoPE{});
+        Tensor sK_rope_dst = make_tensor(make_smem_ptr(smem.k_rope_dq.data()), SmemLayoutKCalcDQRoPE{});
 
-        constexpr int K_NOPE_STORAGE = cosize_v<SmemLayoutKNoPE>;
-        static_assert(K_NOPE_STORAGE <= 65535, "k_nope storage exceeds uint16 permutation range");
-        constexpr int K_ROPE_STORAGE = cosize_v<SmemLayoutKRoPE>;
-        static_assert(K_ROPE_STORAGE <= 65535, "k_rope storage exceeds uint16 permutation range");
+        constexpr int N_COLS = 256;
+        constexpr int K_ROWS = B_TOPK;  // 64
+        constexpr int HALF_ROWS = B_TOPK / 2;  // 32
+        const int nope_elements = N_COLS * K_ROWS;
+        const int nope_elements_per_thread = (nope_elements + NUM_THREADS - 1) / NUM_THREADS;
 
-        if (tid == 0) {
-            uint16_t perm[K_NOPE_STORAGE];
-            uint8_t visited[K_NOPE_STORAGE];
-            uint8_t used[K_NOPE_STORAGE];
-
-            for (int i = 0; i < K_NOPE_STORAGE; ++i) {
-                perm[i] = static_cast<uint16_t>(i);
-                visited[i] = 0;
-                used[i] = 0;
+        for (int i = 0; i < nope_elements_per_thread; ++i) {
+            const int flat_idx = tid * nope_elements_per_thread + i;
+            if (flat_idx < nope_elements) {
+                const int n = flat_idx / K_ROWS;  // 0..255
+                const int k = flat_idx % K_ROWS;  // 0..63
+                const int src_row = k % HALF_ROWS;
+                const int src_col = n + (k / HALF_ROWS) * N_COLS;
+                sK_nope_dst(n, k) = sK_nope_src(src_row, src_col);
             }
+        }
 
-            constexpr int N_COLS = 256;
-            constexpr int K_ROWS = B_TOPK;        // 64
-            constexpr int HALF_ROWS = B_TOPK / 2; // 32
+        constexpr int N_COLS_ROPE = D_ROPE / 2;  // 32
+        constexpr int K_ROWS_ROPE = B_TOPK;      // 64
+        constexpr int HALF_ROWS_ROPE = B_TOPK / 2;  // 32
+        const int rope_elements = N_COLS_ROPE * K_ROWS_ROPE;
+        const int rope_elements_per_thread = (rope_elements + NUM_THREADS - 1) / NUM_THREADS;
 
-            // Build physical-address permutation: source(slot in K layout) -> destination(slot in MN layout).
-            for (int n = 0; n < N_COLS; ++n) {
-                for (int k = 0; k < K_ROWS; ++k) {
-                    const int src_row = k % HALF_ROWS;
-                    const int src_col = n + (k / HALF_ROWS) * 256;
-                    bf16* src_ptr = &sK_nope_src(src_row, src_col);
-                    bf16* dst_ptr = &sK_nope_dst(n, k);
-                    const int src_off = static_cast<int>(src_ptr - smem.k_nope.data());
-                    const int dst_off = static_cast<int>(dst_ptr - smem.k_nope.data());
-                    perm[src_off] = static_cast<uint16_t>(dst_off);
-                    used[src_off] = 1;
-                    used[dst_off] = 1;
-                }
-            }
-
-            bf16* base = smem.k_nope.data();
-            for (int i = 0; i < K_NOPE_STORAGE; ++i) {
-                if (!used[i] || visited[i]) {
-                    continue;
-                }
-                if (perm[i] == i) {
-                    visited[i] = 1;
-                    continue;
-                }
-
-                int cur = i;
-                bf16 carry = base[cur];
-                while (true) {
-                    const int next = static_cast<int>(perm[cur]);
-                    visited[cur] = 1;
-                    bf16 next_val = base[next];
-                    base[next] = carry;
-                    carry = next_val;
-                    cur = next;
-                    if (cur == i) {
-                        break;
-                    }
-                }
-            }
-
-            uint16_t perm_rope[K_ROPE_STORAGE];
-            uint8_t visited_rope[K_ROPE_STORAGE];
-            uint8_t used_rope[K_ROPE_STORAGE];
-
-            for (int i = 0; i < K_ROPE_STORAGE; ++i) {
-                perm_rope[i] = static_cast<uint16_t>(i);
-                visited_rope[i] = 0;
-                used_rope[i] = 0;
-            }
-
-            constexpr int N_COLS_ROPE = D_ROPE / 2;  // 32
-            constexpr int K_ROWS_ROPE = B_TOPK;       // 64
-            constexpr int HALF_ROWS_ROPE = B_TOPK / 2;  // 32
-
-            // Build physical-address permutation for k_rope:
-            // dst(n,k) <- src(k%32, n + (k/32)*32)
-            for (int n = 0; n < N_COLS_ROPE; ++n) {
-                for (int k = 0; k < K_ROWS_ROPE; ++k) {
-                    const int src_row = k % HALF_ROWS_ROPE;
-                    const int src_col = n + (k / HALF_ROWS_ROPE) * N_COLS_ROPE;
-                    bf16* src_ptr = &sK_rope_src(src_row, src_col);
-                    bf16* dst_ptr = &sK_rope_dst(n, k);
-                    const int src_off = static_cast<int>(src_ptr - smem.k_rope.data());
-                    const int dst_off = static_cast<int>(dst_ptr - smem.k_rope.data());
-                    perm_rope[src_off] = static_cast<uint16_t>(dst_off);
-                    used_rope[src_off] = 1;
-                    used_rope[dst_off] = 1;
-                }
-            }
-
-            bf16* base_rope = smem.k_rope.data();
-            for (int i = 0; i < K_ROPE_STORAGE; ++i) {
-                if (!used_rope[i] || visited_rope[i]) {
-                    continue;
-                }
-                if (perm_rope[i] == i) {
-                    visited_rope[i] = 1;
-                    continue;
-                }
-
-                int cur = i;
-                bf16 carry = base_rope[cur];
-                while (true) {
-                    const int next = static_cast<int>(perm_rope[cur]);
-                    visited_rope[cur] = 1;
-                    bf16 next_val = base_rope[next];
-                    base_rope[next] = carry;
-                    carry = next_val;
-                    cur = next;
-                    if (cur == i) {
-                        break;
-                    }
-                }
+        for (int i = 0; i < rope_elements_per_thread; ++i) {
+            const int flat_idx = tid * rope_elements_per_thread + i;
+            if (flat_idx < rope_elements) {
+                const int n = flat_idx / K_ROWS_ROPE;  // 0..31
+                const int k = flat_idx % K_ROWS_ROPE;  // 0..63
+                const int src_row = k % HALF_ROWS_ROPE;
+                const int src_col = n + (k / HALF_ROWS_ROPE) * N_COLS_ROPE;
+                sK_rope_dst(n, k) = sK_rope_src(src_row, src_col);
             }
         }
     }
@@ -544,8 +462,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_2sm_mma_kernel(
 
         // Prepare tensors
         Tensor sDS_t = make_tensor(make_smem_ptr(smem.ds_t.data()), SmemLayoutdSTransposed{});
-        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope.data()), SmemLayoutKCalcDQNoPE{});
-        Tensor sK_rope_t = make_tensor(make_smem_ptr(smem.k_rope.data()), SmemLayoutKCalcDQRoPE{});
+        Tensor sK_nope_t = make_tensor(make_smem_ptr(smem.k_nope_dq.data()), SmemLayoutKCalcDQNoPE{});
+        Tensor sK_rope_t = make_tensor(make_smem_ptr(smem.k_rope_dq.data()), SmemLayoutKCalcDQRoPE{});
 
         // Allocate TMEM for dQ
         TiledMMA_dQ_2cta tiled_mma_dQ{};
