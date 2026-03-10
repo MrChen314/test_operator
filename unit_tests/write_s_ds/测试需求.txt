@@ -1,0 +1,7 @@
+目标：验证 FlashMLA `64daee0` 回归到底出在 `S/dS` 向量化写 shared memory 的地址公式，还是出在写入前的 mask 处理。
+
+要求：
+1. 复现 `SmemLayoutS` 的标量写路径。
+2. 复现 `64daee0` 的 128-bit 向量化写路径。
+3. 增加一个“buggy mask”路径，保留 `float2[16] -> float*` 后只循环 16 次的行为。
+4. Python 侧输出结论：标量写和向量化写一致；错误只出现在每个 half-tile 的后 16 列，即全局列 `16:32` 和 `48:64`。
