@@ -1,0 +1,70 @@
+root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/test_operator/dq_test# rm -rf build *.so && MAX_JOBS=192 python setup.py build_ext --inplace 2>&1 | tail -n 100
+running build_ext
+building 'dq_phase_cuda' extension
+creating /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312
+Emitting ninja build file /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/build.ninja...
+Compiling objects...
+Using envvar MAX_JOBS (192) as the number of workers...
+[1/1] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/dq_phase_test.o.d -I/home/users/chenquanlin/workspace/operator/test_operator/dq_test -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/tools/util/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/users/chenquanlin/workspace/operator/test_operator/dq_test/dq_phase_test.cu -o /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/dq_phase_test.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -DNDEBUG -D_USE_MATH_DEFINES -Wno-deprecated-declarations -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v -lineinfo -gencode=arch=compute_100a,code=sm_100a --threads 192 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=dq_phase_cuda
+FAILED: /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/dq_phase_test.o 
+/usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/dq_phase_test.o.d -I/home/users/chenquanlin/workspace/operator/test_operator/dq_test -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/kerutils/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/include -I/home/users/chenquanlin/workspace/operator/FlashMLA/csrc/cutlass/tools/util/include -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/users/chenquanlin/workspace/operator/test_operator/dq_test/dq_phase_test.cu -o /home/users/chenquanlin/workspace/operator/test_operator/dq_test/build/temp.linux-x86_64-cpython-312/dq_phase_test.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -DNDEBUG -D_USE_MATH_DEFINES -Wno-deprecated-declarations -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math --ptxas-options=-v -lineinfo -gencode=arch=compute_100a,code=sm_100a --threads 192 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=dq_phase_cuda
+/home/users/chenquanlin/workspace/operator/test_operator/dq_test/dq_phase_test.cu:3:10: fatal error: ATen/cuda/CUDAGuard.h: No such file or directory
+    3 | #include <ATen/cuda/CUDAGuard.h>
+      |          ^~~~~~~~~~~~~~~~~~~~~~~
+compilation terminated.
+/home/users/chenquanlin/workspace/operator/test_operator/dq_test/dq_phase_test.cu:3:10: fatal error: ATen/cuda/CUDAGuard.h: No such file or directory
+    3 | #include <ATen/cuda/CUDAGuard.h>
+      |          ^~~~~~~~~~~~~~~~~~~~~~~
+compilation terminated.
+fatal   : Could not open input file /tmp/tmpxft_003140d4_00000000-7_dq_phase_test.cpp1.ii
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2557, in _run_ninja_build
+    subprocess.run(
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v', '-j', '192']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/users/chenquanlin/workspace/operator/test_operator/dq_test/setup.py", line 72, in <module>
+    setup(
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
+    return distutils.core.setup(**attrs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
+    return run_commands(dist)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
+    dist.run_commands()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+    self.run_command(cmd)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1104, in run_command
+    super().run_command(command)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+    cmd_obj.run()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 99, in run
+    _build_ext.run(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+    self.build_extensions()
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1052, in build_extensions
+    build_ext.build_extensions(self)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
+    self._build_extensions_serial()
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
+    self.build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 264, in build_extension
+    _build_ext.build_extension(self, ext)
+  File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
+    super().build_extension(ext)
+  File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
+    objects = self.compiler.compile(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 836, in unix_wrap_ninja_compile
+    _write_ninja_file_and_compile_objects(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2209, in _write_ninja_file_and_compile_objects
+    _run_ninja_build(
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2574, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error compiling objects for extension
