@@ -52,8 +52,6 @@ static constexpr int kNumAssignedWarps =
     kNumSoftmaxAndDQTransferWarps + kNumKvTileTransferWarps +
     kNumMmaWarps + kNumKvValidLoadWarps;
 
-static constexpr uint32_t kTmemBase = 0;
-
 static_assert(kNumAssignedWarps == 8, "Warp assignment must cover exactly 8 warps");
 static_assert(kKvValidLoadFirstWarp + kNumKvValidLoadWarps == kNumAssignedWarps, "Warp role ranges must be contiguous");
 static_assert(NUM_THREADS == kNumAssignedWarps * kThreadsPerWarp, "NUM_THREADS must match warp assignment");
@@ -194,14 +192,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         }
 
         TMEM::Allocator2Sm().allocate(tmem_cols::kNumUsedCols, plan.tmem_start_addr.data());
-        KU_TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         TMEM::Allocator2Sm().release_allocation_lock();
     }
     __syncthreads();
 
+    const uint32_t tmem_base = plan.tmem_start_addr.data()[0];
+
     if (dbg_thread0) {
         printf("[DBG][B%d SQ%d CTA%d] prologue_ready tmem_base=%u\n",
-               (int)blockIdx.x, s_q_idx, cta_idx, plan.tmem_start_addr.data()[0]);
+               (int)blockIdx.x, s_q_idx, cta_idx, tmem_base);
     }
 
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
@@ -218,8 +217,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         const float2 sm_scale_f2 = make_float2(sm_scale, sm_scale);
 
         const uint32_t tmem_lane = idx_in_softmax % S_DS_ROWS_PER_CTA;
-        const uint32_t tmem_p_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::P;
-        const uint32_t tmem_dp_addr = kTmemBase + (tmem_lane << 16) + tmem_cols::dP;
+        const uint32_t tmem_p_addr = tmem_base + (tmem_lane << 16) + tmem_cols::P;
+        const uint32_t tmem_dp_addr = tmem_base + (tmem_lane << 16) + tmem_cols::dP;
         const int row_in_tile = idx_in_softmax % S_DS_ROWS_PER_CTA;
         const int col_half = idx_in_softmax / S_DS_ROWS_PER_CTA;
         bf16* sS_base = plan.s_ds.s.data() +
@@ -426,8 +425,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             const int row_in_cta = idx_in_softmax % dQ_ROWS;
             const int col_half = idx_in_softmax / dQ_ROWS;
 
-            const uint32_t tmem_addr_dq0 = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ;
-            const uint32_t tmem_addr_dq1 = kTmemBase + (row_in_cta << 16) + (tmem_cols::dQ + 128);
+            const uint32_t tmem_addr_dq0 = tmem_base + (row_in_cta << 16) + tmem_cols::dQ;
+            const uint32_t tmem_addr_dq1 = tmem_base + (row_in_cta << 16) + (tmem_cols::dQ + 128);
 
             CUTE_UNROLL
             for (int chunk = 0; chunk < NOPE_CHUNKS; ++chunk) {
@@ -463,7 +462,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             constexpr int ROPE_F2_CHUNK = 8;
             constexpr int ROPE_NUM_CHUNKS = ROPE_FLOAT2_PER_ROW / ROPE_F2_CHUNK;
-            const uint32_t tmem_addr_dq_rope = kTmemBase + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
+            const uint32_t tmem_addr_dq_rope = tmem_base + (row_in_cta << 16) + tmem_cols::dQ_RoPE;
             CUTE_UNROLL
             for (int rch = 0; rch < ROPE_NUM_CHUNKS; ++rch) {
                 float2 dq_rope_chunk[ROPE_F2_CHUNK];
@@ -625,7 +624,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         if (elect_one_sync()) {
             if (dbg_block) {
                 printf("[DBG][B%d SQ%d CTA%d W%d MMA] enter tmem_base=%u\n",
-                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, plan.tmem_start_addr.data()[0]);
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, tmem_base);
             }
             if (cta_idx == 0) {
                 plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
@@ -801,7 +800,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     }
 
     if (warp_idx == 0 && elect_one_sync()) {
-        TMEM::Allocator2Sm().free(kTmemBase, tmem_cols::kNumUsedCols);
+        TMEM::Allocator2Sm().free(tmem_base, tmem_cols::kNumUsedCols);
     }
 #endif
 }
