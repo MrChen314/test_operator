@@ -2,6 +2,18 @@ root@tjzj-inf-sci-k8s-bzz2-0000:/home/users/chenquanlin/workspace/operator/test_
 CUDA Device: CF-NG-BZZ2-O
 CUDA Capability: (10, 0)
 Fixed TOPK=64, B_H=128, D_QK=576, D_V=512
+[DBG][B0 SQ0 CTA0 W7 KVALID] role_enter
+[DBG][B1 SQ0 CTA1 W7 KVALID] role_enter
+[DBG][B0 SQ0 CTA0 W6 MMA] role_enter
+[DBG][B1 SQ0 CTA1 W6 MMA] role_enter
+[DBG][B0 SQ0 CTA0 W4 KV_COPY] role_enter
+[DBG][B1 SQ0 CTA1 W4 KV_COPY] role_enter
+[DBG][B0 SQ0 CTA0] enter topk=64 num_k=1 max_kv=63
+[DBG][B1 SQ0 CTA1] enter topk=64 num_k=1 max_kv=63
+[DBG][B1 SQ0 CTA1 W0 SOFTMAX] role_enter
+[DBG][B0 SQ0 CTA0 W0 SOFTMAX] role_enter
+[DBG][B1 SQ0 CTA1] post_init cluster_sync_done
+[DBG][B0 SQ0 CTA0] post_init cluster_sync_done
 Traceback (most recent call last):
   File "/home/users/chenquanlin/workspace/operator/test_operator/dq_test/test_dq_phase.py", line 109, in <module>
     main()
