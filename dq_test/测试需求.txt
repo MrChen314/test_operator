@@ -1,0 +1,5 @@
+/Users/chenql/Desktop/workspace/operator/FlashMLA/csrc/sm100/prefill/sparse/bwd/head128_2kernels/dq_phase.cuh
+对dq进行单测
+
+算子输出：dq、s、ds
+要求dq、s、ds对比cuda和torch_ref精度
