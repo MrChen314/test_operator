@@ -4,6 +4,7 @@
 
 #include "dq_config_local.h"
 
+#include <cstdio>
 #include <cstring>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
@@ -71,6 +72,21 @@ WarpRole warp_idx_to_role(int warp_idx) {
     return WarpRole::KvValidLoad;
 }
 
+CUTE_DEVICE
+const char* warp_role_name(WarpRole role) {
+    switch (role) {
+        case WarpRole::SoftmaxAndDQTransfer:
+            return "SOFTMAX";
+        case WarpRole::KvTileTransfer:
+            return "KV_COPY";
+        case WarpRole::Mma:
+            return "MMA";
+        case WarpRole::KvValidLoad:
+            return "KVALID";
+    }
+    return "UNKNOWN";
+}
+
 template<typename TmaParamsType>
 __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     __grid_constant__ const SparseAttnBwdParams params,
@@ -97,6 +113,22 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     const float* lse_s = params.lse + (int64_t)s_q_idx * params.h_q;
     const float* delta_s = params.delta + (int64_t)s_q_idx * params.stride_delta_s_q;
     const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);
+    const bool dbg_block = blockIdx.x < 2;
+    const bool dbg_thread0 = dbg_block && tid == 0;
+    const bool dbg_role_thread = dbg_block && lane_idx == 0;
+    const bool dbg_softmax = dbg_role_thread && warp_idx == kSoftmaxAndDQTransferFirstWarp;
+    const bool dbg_kv_transfer = dbg_role_thread && warp_idx == kKvTileTransferFirstWarp;
+    const bool dbg_mma = dbg_role_thread && warp_idx == kMmaFirstWarp;
+    const bool dbg_kv_valid = dbg_role_thread && warp_idx == kKvValidLoadFirstWarp;
+
+    if (dbg_thread0) {
+        printf("[DBG][B%d SQ%d CTA%d] enter topk=%d num_k=%d max_kv=%d\n",
+               (int)blockIdx.x, s_q_idx, cta_idx, topk_length, num_k_blocks, max_kv_i);
+    }
+    if (dbg_softmax || dbg_kv_transfer || dbg_mma || dbg_kv_valid) {
+        printf("[DBG][B%d SQ%d CTA%d W%d %s] role_enter\n",
+               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, warp_role_name(warp_role));
+    }
 
     if (tid == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
@@ -126,6 +158,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     }
 
     cluster_sync();
+
+    if (dbg_thread0) {
+        printf("[DBG][B%d SQ%d CTA%d] post_init cluster_sync_done\n",
+               (int)blockIdx.x, s_q_idx, cta_idx);
+    }
 
     Tensor sQNoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_nope.data()), SmemLayoutQNoPE{});
     Tensor sQRoPE = make_tensor(make_smem_ptr(plan.u.q_kv.q_rope.data()), SmemLayoutQRoPE{});
@@ -162,6 +199,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
     }
     __syncthreads();
 
+    if (dbg_thread0) {
+        printf("[DBG][B%d SQ%d CTA%d] prologue_ready tmem_base=%u\n",
+               (int)blockIdx.x, s_q_idx, cta_idx, plan.tmem_start_addr.data()[0]);
+    }
+
     if (warp_role == WarpRole::SoftmaxAndDQTransfer) {
         const int idx_in_softmax = (warp_idx - kSoftmaxAndDQTransferFirstWarp) * kThreadsPerWarp + lane_idx;
         const int global_row_idx = cta_idx * (B_H / 2) + idx_in_softmax % (B_H / 2);
@@ -190,9 +232,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int SMEM_VEC_STRIDE = S_DS_ROWS_PER_CTA * S_DS_VEC_ELEMS;
         static_assert(SMEM_VEC_F2 == 4, "Softmax vectorized write path expects 4 float2 per 128-bit store.");
 
+        if (dbg_softmax) {
+            printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] enter row=%d row_lse=%f neg_delta=%f tmem_p=0x%x tmem_dp=0x%x\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, global_row_idx, row_lse, neg_delta_val,
+                   tmem_p_addr, tmem_dp_addr);
+        }
+
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
+            const bool dbg_edge_k = dbg_softmax && (k_block == 0 || k_block + 1 == num_k_blocks);
+
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] k=%d phase=%d wait_p_ready\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             plan.bar_p_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
@@ -205,6 +259,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             plan.bar_k_valid_ready.wait(phase);
             const uint32_t is_k_valid_lo =
                 *(uint32_t*)(plan.is_k_valid + (idx_in_softmax >= S_DS_ROWS_PER_CTA ? B_TOPK / 8 / 2 : 0));
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] k=%d phase=%d k_valid_mask=0x%08x\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase, is_k_valid_lo);
+            }
             float* p_float = (float*)p;
             CUTE_UNROLL
             for (int i = 0; i < B_TOPK / 2; ++i) {
@@ -249,6 +307,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             plan.bar_s_ready.arrive(static_cast<uint32_t>(cta_idx));
             NamedBarrier::arrive_and_wait(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp, 2);
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] k=%d phase=%d s_ready\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             if (warp_idx == 0 && elect_one_sync()) {
                 Tensor gS = flat_divide(
@@ -267,6 +329,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             plan.bar_dp_ready.wait(phase);
             ku::tcgen05_after_thread_sync();
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] k=%d phase=%d dp_ready\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             constexpr int DP_CHUNK_F2 = SMEM_VEC_F2;
             constexpr int NUM_DP_CHUNKS = (B_TOPK / 2) / 2 / DP_CHUNK_F2;
@@ -314,6 +380,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             plan.bar_ds_ready.arrive(static_cast<uint32_t>(cta_idx));
             NamedBarrier::arrive_and_wait(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp, 3);
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] k=%d phase=%d ds_ready\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             if (warp_idx == 0 && elect_one_sync()) {
                 Tensor gdS = flat_divide(
@@ -332,8 +402,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         }
 
         const int final_phase = (num_k_blocks - 1) & 1;
+        if (dbg_softmax) {
+            printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] wait_dq_ready final_phase=%d\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, final_phase);
+        }
         plan.bar_dq_ready.wait(final_phase);
         ku::tcgen05_after_thread_sync();
+        if (dbg_softmax) {
+            printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] dq_ready final_phase=%d\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, final_phase);
+        }
 
         {
             constexpr int dQ_ROWS = B_H / 2;
@@ -407,6 +485,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             NamedBarrier::arrive_and_wait(kNumSoftmaxAndDQTransferWarps * kThreadsPerWarp, 0);
 
             if (warp_idx == 0 && elect_one_sync()) {
+                if (dbg_block) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] dQ_tma_store_begin\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
+                }
                 Tensor gdQ = flat_divide(
                     tma_params.tma_dQ.get_tma_tensor(tma_params.shape_dQ)(_, _, s_q_idx),
                     Tile<Int<B_H / 2>>{}
@@ -419,7 +501,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 );
                 cute::tma_store_arrive();
                 cute::tma_store_wait<0>();
+                if (dbg_block) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] dQ_tma_store_done\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
+                }
             }
+        }
+        if (dbg_softmax) {
+            printf("[DBG][B%d SQ%d CTA%d W%d SOFTMAX] exit\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
         }
     }
 
@@ -430,9 +520,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         constexpr int KV_PEER_ELEMENTS = (B_TOPK / 2) * D_K;
         const int local_warp_idx = warp_idx - kKvTileTransferFirstWarp;
 
+        if (dbg_kv_transfer) {
+            printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] enter local_warp=%d\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, local_warp_idx);
+        }
+
         CUTE_NO_UNROLL
         for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
             const int phase = k_block & 1;
+            const bool dbg_edge_k = dbg_kv_transfer && (k_block == 0 || k_block + 1 == num_k_blocks);
 
             if (k_block > 0) {
                 plan.bar_dq_ready.wait((k_block - 1) & 1);
@@ -447,6 +543,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                         (const int4*)(gIndices_s + k_block * B_TOPK + cta_idx * (B_TOPK / 2)) +
                         local_row * NUM_WARPS + local_warp_idx
                     );
+                }
+                if (dbg_block && local_warp_idx == 0 && (k_block == 0 || k_block + 1 == num_k_blocks)) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] k=%d phase=%d gather indices4={%d,%d,%d,%d}\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase,
+                           indices4[0].x, indices4[0].y, indices4[0].z, indices4[0].w);
                 }
 
                 CUTE_UNROLL
@@ -467,6 +568,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
 
             plan.bar_p_ready.wait(phase);
             NamedBarrier::arrive_and_wait(NUM_WARPS * kThreadsPerWarp, 1);
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] k=%d phase=%d p_ready\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             if (local_warp_idx == 0 && elect_one_sync()) {
                 plan.bar_kv_peer_cp_async.arrive_and_expect_tx(sizeof(bf16) * KV_PEER_ELEMENTS);
@@ -479,14 +584,31 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     *peer_bar_ptr
                 );
                 fence_view_async_shared();
+                if (dbg_block && (k_block == 0 || k_block + 1 == num_k_blocks)) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] k=%d phase=%d peer_cp_async_launched bytes=%d\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase,
+                           (int)(sizeof(bf16) * KV_PEER_ELEMENTS));
+                }
             }
 
             NamedBarrier::arrive_and_wait(NUM_WARPS * kThreadsPerWarp, 1);
             plan.bar_kv_peer_cp_async.wait(phase);
+            if (dbg_edge_k) {
+                printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] k=%d phase=%d peer_cp_async_done\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+            }
 
             if (local_warp_idx == 0 && elect_one_sync()) {
                 plan.bar_kv_peer_ready.arrive(static_cast<uint32_t>(cta_idx));
+                if (dbg_block && (k_block == 0 || k_block + 1 == num_k_blocks)) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] k=%d phase=%d peer_ready_arrive\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                }
             }
+        }
+        if (dbg_kv_transfer) {
+            printf("[DBG][B%d SQ%d CTA%d W%d KV_COPY] exit\n",
+                   (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
         }
     }
 
@@ -501,6 +623,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
         Tensor sV = make_tensor(make_smem_ptr(plan.u.q_kv.k_nope.data()), SmemLayoutV{});
 
         if (elect_one_sync()) {
+            if (dbg_block) {
+                printf("[DBG][B%d SQ%d CTA%d W%d MMA] enter tmem_base=%u\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, plan.tmem_start_addr.data()[0]);
+            }
             if (cta_idx == 0) {
                 plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H * D_V * sizeof(bf16));
                 plan.bar_prologue_q_rope.arrive_and_expect_tx(B_H * D_ROPE * sizeof(bf16));
@@ -509,6 +635,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                 plan.bar_prologue_q_rope.wait(0);
                 plan.bar_prologue_dO.wait(0);
                 ku::tcgen05_after_thread_sync();
+                if (dbg_block) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d MMA] q_dO_prologue_done\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
+                }
             }
 
             TiledMMA_dQ tiled_mma_dQ{};
@@ -538,8 +668,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
             for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
                 const int phase = k_block & 1;
                 const bool dq_clear = (k_block == 0);
+                const bool dbg_edge_k = dbg_block && (k_block == 0 || k_block + 1 == num_k_blocks);
 
                 if (cta_idx == 0) {
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d begin_p_dp dq_clear=%d\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase, dq_clear ? 1 : 0);
+                    }
                     plan.bar_prologue_kv.arrive_and_expect_tx(B_TOPK * D_K * sizeof(bf16));
                     plan.bar_prologue_kv.wait(phase);
                     ku::tcgen05_after_thread_sync();
@@ -551,12 +686,28 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     ku::utcmma_ss(tiled_mma_dP, sdO, sV, tdP, true);
                     ku::umma_arrive_multicast_2x1SM_noelect(plan.bar_dp_ready, 1 | 2);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d p_dp_done\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                    }
                 }
 
+                if (dbg_edge_k) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d dq_begin branch=%d\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase, cta_idx);
+                }
                 if (cta_idx == 0) {
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d dq_part0_local_done\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                    }
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d kv_peer_ready\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                    }
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
 
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
@@ -566,8 +717,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_peer_rope_t, tdQ_RoPE, false);
                 } else {
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, dq_clear);
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d dq_part0_local_done\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                    }
                     plan.bar_kv_peer_ready.wait(phase);
                     ku::tcgen05_after_thread_sync();
+                    if (dbg_edge_k) {
+                        printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d kv_peer_ready\n",
+                               (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                    }
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _0{}), sK_peer_nope_t_div(_, _, _0{}, _0{}), tdQ_part0, false);
 
                     ku::utcmma_ss(tiled_mma_dQ, sDS_t_div(_, _, _0{}, _1{}), sK_nope_t_div(_, _, _1{}, _0{}), tdQ_part1, dq_clear);
@@ -576,14 +735,30 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _1{}), sK_rope_t, tdQ_RoPE, dq_clear);
                     ku::utcmma_ss(tiled_mma_dQ_RoPE, sDS_t_div(_, _, _0{}, _0{}), sK_peer_rope_t, tdQ_RoPE, false);
                 }
+                if (dbg_edge_k) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d dq_done\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                }
                 ku::umma_arrive_noelect(plan.bar_dq_ready);
                 ku::tcgen05_after_thread_sync();
+                if (dbg_edge_k) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d MMA] k=%d phase=%d dq_ready_arrive\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k_block, phase);
+                }
+            }
+            if (dbg_block) {
+                printf("[DBG][B%d SQ%d CTA%d W%d MMA] exit\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
             }
         }
     }
 
     if (warp_role == WarpRole::KvValidLoad) {
         if (lane_idx < B_TOPK / 8) {
+            if (dbg_kv_valid) {
+                printf("[DBG][B%d SQ%d CTA%d W%d KVALID] enter\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
+            }
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
                 int32x8_t indices = ldg_256_indices((void*)(gIndices_s + k * B_TOPK + lane_idx * 8));
@@ -600,15 +775,30 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void dq_phase_kernel(
                     is_valid(2, indices.a2) << 2 |
                     is_valid(1, indices.a1) << 1 |
                     is_valid(0, indices.a0) << 0;
+                if (dbg_kv_valid && (k == 0 || k + 1 == num_k_blocks)) {
+                    printf("[DBG][B%d SQ%d CTA%d W%d KVALID] k=%d mask=0x%02x idx0=%d idx7=%d\n",
+                           (int)blockIdx.x, s_q_idx, cta_idx, warp_idx, k,
+                           static_cast<unsigned int>(static_cast<unsigned char>(is_ks_valid_mask)),
+                           indices.a0, indices.a7);
+                }
 
                 plan.bar_k_valid_free.wait((k & 1) ^ 1);
                 plan.is_k_valid[lane_idx] = is_ks_valid_mask;
                 plan.bar_k_valid_ready.arrive();
             }
+            if (dbg_kv_valid) {
+                printf("[DBG][B%d SQ%d CTA%d W%d KVALID] exit\n",
+                       (int)blockIdx.x, s_q_idx, cta_idx, warp_idx);
+            }
         }
     }
 
     cluster_sync();
+
+    if (dbg_thread0) {
+        printf("[DBG][B%d SQ%d CTA%d] kernel_exit cluster_sync_done\n",
+               (int)blockIdx.x, s_q_idx, cta_idx);
+    }
 
     if (warp_idx == 0 && elect_one_sync()) {
         TMEM::Allocator2Sm().free(kTmemBase, tmem_cols::kNumUsedCols);
