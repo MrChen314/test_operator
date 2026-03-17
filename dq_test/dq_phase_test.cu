@@ -1,7 +1,7 @@
 #include "dq_phase_test.cuh"
 
-#include <ATen/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <limits>
 #include <torch/extension.h>
 
@@ -82,7 +82,7 @@ std::vector<torch::Tensor> run_dq_phase(
     TORCH_CHECK(indices.size(0) == s_q && indices.size(1) == h_kv, "indices shape mismatch");
     TORCH_CHECK(lse.size(0) == s_q && lse.size(1) == h_q, "lse shape mismatch");
 
-    at::cuda::CUDAGuard device_guard{q.device()};
+    c10::cuda::CUDAGuard device_guard{q.device()};
     auto opts_bf16 = q.options().dtype(torch::kBFloat16);
     auto opts_f32 = q.options().dtype(torch::kFloat32);
 
@@ -126,7 +126,7 @@ std::vector<torch::Tensor> run_dq_phase(
         as_int(delta.stride(1), "delta.stride(1)"),
 
         0,
-        at::cuda::getCurrentCUDAStream().stream(),
+        c10::cuda::getCurrentCUDAStream().stream(),
     };
 
     sm100::bwd::head128_2kernels::dq::run_bwd_dq_phase_capture_kernel<576>(
