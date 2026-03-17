@@ -14,15 +14,18 @@ namespace sm100::bwd::head128_2kernels::dq {
 using namespace cute;
 
 template<
-    typename Shape_Q, typename TMA_Q,
+    typename Shape_QNoPE, typename TMA_QNoPE,
+    typename Shape_QRoPE, typename TMA_QRoPE,
     typename Shape_dO, typename TMA_dO,
     typename Shape_dQ, typename TMA_dQ,
     typename Shape_S, typename TMA_S,
     typename Shape_dS, typename TMA_dS
 >
 struct TmaParams {
-    Shape_Q shape_Q;
-    TMA_Q tma_Q;
+    Shape_QNoPE shape_Q_nope;
+    TMA_QNoPE tma_Q_nope;
+    Shape_QRoPE shape_Q_rope;
+    TMA_QRoPE tma_Q_rope;
     Shape_dO shape_dO;
     TMA_dO tma_dO;
     Shape_dQ shape_dQ;
@@ -40,31 +43,14 @@ static constexpr int D_K = D_QK;
 static constexpr int D_V = 512;
 static constexpr int D_ROPE = D_Q - D_V;
 static constexpr int B_H = 128;
-static constexpr int B_TOPK = 128;
-static constexpr int NUM_THREADS = 6 * 32;
+static constexpr int B_TOPK = 64;
+static constexpr int NUM_THREADS = 8 * 32;
 static constexpr int S_DS_VEC_ELEMS = 8;
 static constexpr int S_DS_ROWS_PER_CTA = B_H / 2;
 static constexpr int S_DS_COLS_PER_THREAD = B_TOPK / 2;
 
-static_assert(S_DS_ROWS_PER_CTA == B_TOPK / 2, "S/dS writer mapping assumes a 64x128 tile per CTA.");
+static_assert(S_DS_ROWS_PER_CTA == B_TOPK, "S/dS writer mapping assumes a 64x64 softmax tile per CTA.");
 static_assert(S_DS_COLS_PER_THREAD % S_DS_VEC_ELEMS == 0, "S/dS vectorized stores require B_TOPK/2 to be a multiple of 8.");
-
-static constexpr int D_tQ = 384, NUM_tQ_TILES = D_tQ / 64;
-static constexpr int D_sQ = D_QK - D_tQ, NUM_sQ_TILES = D_sQ / 64;
-static_assert(D_sQ % 64 == 0 && D_tQ % 64 == 0 && D_sQ + D_tQ == D_Q);
-
-struct tmem_cols {
-    static constexpr int dQ = 0;
-    static constexpr int P = 288;
-    static constexpr int dP = 352;
-    static constexpr int tQ = 416;
-    static constexpr int kNumUsedCols = 512;
-};
-
-static_assert(tmem_cols::P == tmem_cols::dQ + D_Q / 2);
-static_assert(tmem_cols::dP == tmem_cols::P + B_TOPK / 2);
-static_assert(tmem_cols::tQ == tmem_cols::dP + B_TOPK / 2);
-static_assert(tmem_cols::kNumUsedCols == tmem_cols::tQ + D_tQ / 4);
 
 template<int NUM_TILES>
 using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
@@ -73,8 +59,9 @@ using SmemLayoutQTiles = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutQ = SmemLayoutQTiles<D_Q / 64>;
-using SmemLayoutSQ = SmemLayoutQTiles<NUM_sQ_TILES>;
+using SmemLayoutQNoPE = SmemLayoutQTiles<8>;
+using SmemLayoutQRoPE = SmemLayoutQTiles<1>;
+using SmemLayoutQ = SmemLayoutQTiles<9>;
 using SmemLayoutdO = SmemLayoutQTiles<D_V / 64>;
 
 template<int NUM_TILES>
@@ -84,19 +71,20 @@ using SmemLayoutQTilesTransposed = decltype(coalesce(tile_to_shape(
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutdOTransposed = SmemLayoutQTilesTransposed<D_V / 64>;
+using SmemLayoutQNoPETransposed = SmemLayoutQTilesTransposed<4>;
+using SmemLayoutQRoPETransposed = SmemLayoutQTilesTransposed<1>;
 
 template<int NUM_TILES>
-using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
+using SmemLayoutKVTiles = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
     Shape<Int<B_TOPK / 2>, Int<64 * NUM_TILES>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutK = SmemLayoutKTiles<D_K / 64>;
-using SmemLayoutKSQ = SmemLayoutKTiles<NUM_sQ_TILES>;
-using SmemLayoutKTQ = SmemLayoutKTiles<NUM_tQ_TILES>;
-using SmemLayoutV = SmemLayoutKTiles<D_V / 64>;
+using SmemLayoutKNoPE = SmemLayoutKVTiles<8>;
+using SmemLayoutKRoPE = SmemLayoutKVTiles<1>;
+using SmemLayoutKV = SmemLayoutKVTiles<9>;
+using SmemLayoutV = SmemLayoutKNoPE;
 
 template<int NUM_TILES>
 using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
@@ -105,8 +93,8 @@ using SmemLayoutKVTilesTransposed = decltype(coalesce(tile_to_shape(
     Step<_2, _1>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKSQTransposed = SmemLayoutKVTilesTransposed<NUM_sQ_TILES>;
-using SmemLayoutKTQTransposed = SmemLayoutKVTilesTransposed<NUM_tQ_TILES>;
+using SmemLayoutKNoPETransposed = SmemLayoutKVTilesTransposed<4>;
+using SmemLayoutKRoPETransposed = SmemLayoutKVTilesTransposed<1>;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
     UMMA::Layout_MN_INTER_Atom<bf16>{},
@@ -122,35 +110,44 @@ using SmemLayoutdSTransposed = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using TiledMMA_P_tQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, B_H, B_TOPK / 2, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-using TiledMMA_P_sQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK / 2, UMMA::Major::K, UMMA::Major::K>{}
+using TiledMMA_P = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
 using TiledMMA_dP = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK / 2, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F16BF16_2x1SM_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 ));
 
-using TiledMMA_dQ_sQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_sQ, UMMA::Major::K, UMMA::Major::MN>{}
+using TiledMMA_dQ = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
-using TiledMMA_dQ_tQ = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_tQ, UMMA::Major::K, UMMA::Major::MN>{}
+using TiledMMA_dQ_RoPE = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H / 2, D_ROPE, UMMA::Major::K, UMMA::Major::MN>{}
 ));
+
+struct tmem_cols {
+    static constexpr int dQ = 0;
+    static constexpr int dQ_RoPE = 256;
+    static constexpr int P = 288;
+    static constexpr int dP = 320;
+    static constexpr int kNumUsedCols = 352;
+};
+
+static_assert(tmem_cols::dQ_RoPE == tmem_cols::dQ + D_V / 2);
+static_assert(tmem_cols::P == tmem_cols::dQ_RoPE + D_ROPE / 2);
+static_assert(tmem_cols::dP == tmem_cols::P + B_TOPK / 2);
+static_assert(tmem_cols::kNumUsedCols == tmem_cols::dP + B_TOPK / 2);
 
 struct alignas(128) SharedMemoryPlan {
     union {
-        // Prologue first lands the full local Q tile here, then reuses the tail
-        // region for the streamed K half-tiles once tQ has been copied to TMEM.
-        array_aligned<bf16, cosize_v<SmemLayoutQ>> q_full;
         struct {
-            array_aligned<bf16, cosize_v<SmemLayoutSQ>> sQ;
-            array_aligned<bf16, cosize_v<SmemLayoutK>> k;
-        } q_k;
+            array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> k_nope;
+            array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> k_rope;
+            array_aligned<bf16, cosize_v<SmemLayoutKV>> kv_peer;
+            array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;
+            array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
+        } q_kv;
         array_aligned<bf16, cosize_v<SmemLayoutQ>> dq;
     } u;
 
@@ -161,9 +158,9 @@ struct alignas(128) SharedMemoryPlan {
     } s_ds;
     char is_k_valid[B_TOPK / 8];
 
-    transac_bar_t bar_prologue_q;
-    transac_bar_t bar_prologue_tQ;
-    transac_bar_t bar_prologue_k;
+    transac_bar_t bar_prologue_q_nope;
+    transac_bar_t bar_prologue_q_rope;
+    transac_bar_t bar_prologue_kv;
     transac_bar_t bar_prologue_dO;
     transac_bar_t bar_p_ready;
     transac_bar_t bar_dp_ready;
@@ -171,6 +168,8 @@ struct alignas(128) SharedMemoryPlan {
     transac_bar_t bar_ds_ready;
     transac_bar_t bar_k_valid_free;
     transac_bar_t bar_k_valid_ready;
+    transac_bar_t bar_kv_peer_cp_async;
+    transac_bar_t bar_kv_peer_ready;
     transac_bar_t bar_dq_ready;
 
     array_aligned<uint32_t, 1> tmem_start_addr;

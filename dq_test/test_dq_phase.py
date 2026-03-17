@@ -10,7 +10,7 @@ import dq_phase_cuda
 B_H = 128
 D_QK = 576
 D_V = 512
-TOPK = 128
+TOPK = 64
 
 
 def calc_diff(a: torch.Tensor, b: torch.Tensor):
@@ -97,7 +97,7 @@ def main():
     print(f"Fixed TOPK={TOPK}, B_H={B_H}, D_QK={D_QK}, D_V={D_V}")
 
     torch.manual_seed(42)
-    ok_full = run_case("full_topk_window", s_q=32, s_kv=256, q_start_index_s=127)
+    ok_full = run_case("full_topk_window", s_q=32, s_kv=256, q_start_index_s=63)
     ok_partial = run_case("partial_causal_window", s_q=32, s_kv=256, q_start_index_s=0)
 
     all_ok = ok_full and ok_partial
